@@ -10,6 +10,8 @@ import org.springframework.context.event.EventListener;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.event.TransactionPhase;
+import org.springframework.transaction.event.TransactionalEventListener;
 
 import java.time.Clock;
 import java.time.Duration;
@@ -37,6 +39,13 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>The listener never throws: an exception from an {@code @EventListener} on {@code CommitEvent}
  * would propagate into Yaci Store's event publisher mid-sync. A failure is logged at WARN and leaves
  * the flag unchanged; an event whose slot cannot be read leaves {@link #lastAppliedSlot} unchanged too.
+ *
+ * <p><b>Two slots, written at two moments</b> (FAB-183). {@link #lastAppliedSlot} is written by
+ * {@link #processBlock} during Yaci's publish — at the chain tip that is INSIDE the block's database
+ * transaction, before it commits. {@link #lastCommittedSlot} is written by {@link #processCommittedBlock}
+ * only once that transaction has committed (or immediately, on the publish path that has none — see
+ * {@code WalletPipelineService}'s class javadoc for both paths). The liquidation window is anchored to the
+ * committed one.
  */
 @Service
 @Slf4j
@@ -70,6 +79,21 @@ public class BlockEventListener {
      */
     @Getter
     private final AtomicLong lastAppliedSlot = new AtomicLong(0L);
+
+    /**
+     * <b>The slot of the last block whose database transaction has COMMITTED</b> — what the liquidation
+     * window's start is anchored to (FAB-183).
+     *
+     * <p>{@link #lastAppliedSlot} is written while the block's transaction is still open, so a reader
+     * can see a block the index has not finished storing. This one is written after the commit, by
+     * {@link #processCommittedBlock}, so a cycle anchored to it never anchors ahead of what the node
+     * has stored.
+     *
+     * <p>⚠ Zero until the first committed block. Zero means "unknown", exactly as for
+     * {@link #lastAppliedSlot}: a caller falls back to wall clock.
+     */
+    @Getter
+    private final AtomicLong lastCommittedSlot = new AtomicLong(0L);
 
     @Autowired
     public BlockEventListener(CardanoConverters cardanoConverters,
@@ -105,6 +129,32 @@ public class BlockEventListener {
         } catch (RuntimeException e) {
             log.warn("[SYNC] could not process a CommitEvent; syncing={} left unchanged, lastAppliedSlot={}",
                     isSyncing.get(), lastAppliedSlot.get(), e);
+        }
+    }
+
+    /**
+     * Records the slot of a block once its database transaction has committed.
+     *
+     * <p>{@code AFTER_COMMIT} with {@code fallbackExecution = true}: Yaci Store 2.0.7 publishes
+     * {@code CommitEvent} inside the block's transaction, and this runs once it commits (not at all on
+     * a rollback). Only its parallel-processing path publishes with no transaction open, on the fetcher
+     * thread; there the fallback runs this inline instead of dropping the event. The node pins parallel
+     * processing off, so in production every {@code CommitEvent} arrives inside the block's transaction,
+     * initial sync included — see {@link WalletPipelineService}. {@link Ordered#HIGHEST_PRECEDENCE}, so
+     * among the after-commit listeners this slot is current before any other one reads it.
+     *
+     * <p>Never throws, for the same reason {@link #processBlock} never does: on the fallback path an
+     * exception would reach Yaci's publisher. A failure is logged at WARN and leaves
+     * {@link #lastCommittedSlot} unchanged.
+     */
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT, fallbackExecution = true)
+    @Order(Ordered.HIGHEST_PRECEDENCE)
+    public void processCommittedBlock(CommitEvent<?> commitEvent) {
+        try {
+            lastCommittedSlot.set(commitEvent.getMetadata().getSlot());
+        } catch (RuntimeException e) {
+            log.warn("[SYNC] could not read a committed CommitEvent's slot; lastCommittedSlot={} left unchanged",
+                    lastCommittedSlot.get(), e);
         }
     }
 

@@ -28,9 +28,8 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * FAB-174: the readiness page's one shadow-oracle-stream line, RENDERED through the same Thymeleaf setup as
- * {@link ReadinessTemplateRendersRowsTest} — one text per state, each saying that no decision reads it — and
- * the wiring that puts it there: a REQUIRED setter (optional injection would leave the line silently absent)
+ * FAB-174: the readiness page's one oracle-stream line, RENDERED through the same Thymeleaf setup as
+ * {@link ReadinessTemplateRendersRowsTest} — one text per state — and the wiring that puts it there: a REQUIRED setter (optional injection would leave the line silently absent)
  * on a launcher the container can find. And {@code /healthcheck} does not know the stream exists.
  */
 class ReadinessOracleStreamLineTest {
@@ -38,15 +37,14 @@ class ReadinessOracleStreamLineTest {
     private static final Instant SINCE = Instant.parse("2026-10-29T12:00:00Z");
     private static final Instant PUSHED = Instant.parse("2026-10-29T12:04:59Z");
     private static final Instant NEXT = Instant.parse("2026-10-29T12:01:00Z");
-    private static final String NOTE = " · no decision reads it";
 
     /** The words that tell each state apart; every other state's must be absent from a state's line. */
     private static final Map<OracleStreamClient.Status.State, String> MARKER = Map.of(
-            OracleStreamClient.Status.State.OFF, "(shadow): off",
-            OracleStreamClient.Status.State.CONNECTING, "(shadow): connecting",
-            OracleStreamClient.Status.State.CONNECTED, "(shadow): connected",
-            OracleStreamClient.Status.State.RETRYING, "(shadow): disconnected",
-            OracleStreamClient.Status.State.REFUSED, "(shadow): refused");
+            OracleStreamClient.Status.State.OFF, "Oracle stream: off",
+            OracleStreamClient.Status.State.CONNECTING, "Oracle stream: connecting",
+            OracleStreamClient.Status.State.CONNECTED, "Oracle stream: connected",
+            OracleStreamClient.Status.State.RETRYING, "Oracle stream: disconnected",
+            OracleStreamClient.Status.State.REFUSED, "Oracle stream: refused");
 
     /** The engine Boot builds for this app: classpath templates, HTML mode, same resolver. */
     private static TemplateEngine engine() {
@@ -65,26 +63,26 @@ class ReadinessOracleStreamLineTest {
     void eachStateReadsAsItsOwnLine() {
         Map<OracleStreamClient.Status, String> expected = new LinkedHashMap<>();
         expected.put(OracleStreamClient.Status.off("disabled (loans.oracle.stream.enabled=false)", SINCE),
-                "Oracle stream (shadow): off — disabled (loans.oracle.stream.enabled=false)" + NOTE);
+                "Oracle stream: off — disabled (loans.oracle.stream.enabled=false)");
         expected.put(status(OracleStreamClient.Status.State.CONNECTING, null, null, 0, null, null, null),
-                "Oracle stream (shadow): connecting…" + NOTE);
+                "Oracle stream: connecting…");
         expected.put(status(OracleStreamClient.Status.State.CONNECTED, null, null, 0, null, null, null),
-                "Oracle stream (shadow): connected 2026-10-29T12:00:00Z — no push yet (pushes arrive only when a "
-                        + "price changes)" + NOTE);
+                "Oracle stream: connected 2026-10-29T12:00:00Z — no push yet (pushes arrive only when a "
+                        + "price changes)");
         expected.put(status(OracleStreamClient.Status.State.CONNECTED, null, PUSHED, 7, null, null, null),
-                "Oracle stream (shadow): connected 2026-10-29T12:00:00Z · last push 2026-10-29T12:04:59Z · 7 pushes"
-                        + NOTE);
+                "Oracle stream: connected 2026-10-29T12:00:00Z · last push 2026-10-29T12:04:59Z · 7 pushes");
         expected.put(status(OracleStreamClient.Status.State.RETRYING, "no-pong", PUSHED, 7, null, null, NEXT),
-                "Oracle stream (shadow): disconnected (no-pong) — retrying at 2026-10-29T12:01:00Z" + NOTE);
+                "Oracle stream: disconnected (no-pong) — retrying at 2026-10-29T12:01:00Z");
         expected.put(status(OracleStreamClient.Status.State.REFUSED, null, null, 0, 429,
                         "connection limit reached: 1 per bond held", NEXT),
-                "Oracle stream (shadow): refused 429 — connection limit reached: 1 per bond held — retrying at "
-                        + "2026-10-29T12:01:00Z" + NOTE);
+                "Oracle stream: refused 429 — connection limit reached: 1 per bond held — retrying at "
+                        + "2026-10-29T12:01:00Z");
 
         expected.forEach((status, text) -> {
             String line = line(render(ctx -> ctx.setVariable("oracleStream", status)));
             assertEquals(text, text(line), status.toString());
-            assertTrue(line.contains("title=\"shadow only — no decision reads it\""), line);
+            assertTrue(line.contains("title=\"prices come from the stream and the API merged, newest per oracle wins; "
+                    + "LOANS_ORACLE_SOURCE=api uses the API only\""), line);
             MARKER.forEach((state, marker) -> {
                 if (state != status.state()) {
                     assertFalse(text(line).contains(marker), status.state() + " reads as " + state + ": " + line);
@@ -108,7 +106,7 @@ class ReadinessOracleStreamLineTest {
     @Test
     void withNoAttributeNoLineRenders() {
         String html = render(ctx -> { });
-        assertFalse(html.contains("Oracle stream (shadow)"), "no line without the attribute");
+        assertFalse(html.contains("Oracle stream"), "no line without the attribute");
         assertFalse(html.contains("oracle-stream"), "not even an empty element");
     }
 
@@ -132,7 +130,7 @@ class ReadinessOracleStreamLineTest {
         assertEquals("disabled (loans.oracle.stream.enabled=false)", shown.detail());
         var context = new Context();
         context.setVariables(model.asMap());
-        assertEquals("Oracle stream (shadow): off — disabled (loans.oracle.stream.enabled=false)" + NOTE,
+        assertEquals("Oracle stream: off — disabled (loans.oracle.stream.enabled=false)",
                 text(line(engine().process("readiness", context))));
 
         var without = new org.springframework.ui.ConcurrentModel();
@@ -140,7 +138,7 @@ class ReadinessOracleStreamLineTest {
         assertNull(without.getAttribute("oracleStream"), "no status without a launcher");
         var withoutContext = new Context();
         withoutContext.setVariables(without.asMap());
-        assertFalse(engine().process("readiness", withoutContext).contains("Oracle stream (shadow)"), "and no line");
+        assertFalse(engine().process("readiness", withoutContext).contains("Oracle stream"), "and no line");
     }
 
     /** ⛔ Optional injection fails SILENT: the container would hand no launcher and the line would never show. */

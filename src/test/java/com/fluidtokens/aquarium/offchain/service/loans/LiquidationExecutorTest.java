@@ -30,6 +30,11 @@ import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
+import com.fluidtokens.aquarium.offchain.service.StageTally;
+import com.fluidtokens.aquarium.offchain.service.SubmitFence;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletRoles;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletShape;
+import com.fluidtokens.aquarium.offchain.util.LedgerCeilings;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.micrometer.prometheusmetrics.PrometheusConfig;
 import io.micrometer.prometheusmetrics.PrometheusMeterRegistry;
@@ -42,6 +47,9 @@ import org.springframework.beans.factory.ObjectProvider;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.math.RoundingMode;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -59,6 +67,7 @@ import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.when;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -194,6 +203,14 @@ class LiquidationExecutorTest {
     /** The same hazard in its hashed-datum form. */
     private static final Utxo WALLET_UTXO_WITH_DATUM_HASH = dataHashed(
             LoanFixtures.adaUtxo(TX_WALLET_HASHED, 0, ACCOUNT.baseAddress(), 200_000_000L));
+
+    /**
+     * FAB-185 — a wallet the stage can resolve its roles from: {@code others} (the largest ada-only one is U)
+     * plus role C, sized from {@link LoanFixtures#protocolParams()} — the parameters these executors read.
+     */
+    private static List<Utxo> shaped(Utxo... others) {
+        return LoanFixtures.shapedWallet(LoanFixtures.protocolParams(), ACCOUNT.baseAddress(), others);
+    }
 
     private static Utxo dataHashed(Utxo utxo) {
         utxo.setDataHash("ab".repeat(32));
@@ -351,6 +368,7 @@ class LiquidationExecutorTest {
         public Transaction buildConvertLiquidation(LiquidationAssessment assessment, Utxo loanUtxo,
                                                     Utxo bondUtxo, Utxo configUtxo, Utxo lmConfigUtxo,
                                                     Function<BigInteger, Optional<Utxo>> walletSelector,
+                                                    Utxo collateralUtxo,
                                                     Map<String, OracleEntry> oraclesByOracleTokenUnit,
                                                     String changeAddress, long validFromMillis,
                                                     long validToMillis) {
@@ -692,7 +710,7 @@ class LiquidationExecutorTest {
     private static Wiring wiring(AppConfig.LiquidationConfiguration configuration, Scenario scenario,
                                  boolean syncing) {
         return wiring(configuration, List.of(scenario.assessment()), List.of(scenario),
-                allUnspent(List.of(scenario)), List.of(WALLET_UTXO), noOracle(), syncing);
+                allUnspent(List.of(scenario)), shaped(WALLET_UTXO), noOracle(), syncing);
     }
 
     /**
@@ -702,7 +720,7 @@ class LiquidationExecutorTest {
     private static Wiring wiring(AppConfig.LiquidationConfiguration configuration, Scenario scenario,
                                  boolean syncing, MarketCoverageReporter marketCoverage) {
         return wiring(configuration, List.of(scenario.assessment()), List.of(scenario),
-                allUnspent(List.of(scenario)), List.of(WALLET_UTXO), noOracle(), syncing, false,
+                allUnspent(List.of(scenario)), shaped(WALLET_UTXO), noOracle(), syncing, false,
                 LoanFixtures.protocolParams(), null, null, marketCoverage);
     }
 
@@ -710,7 +728,7 @@ class LiquidationExecutorTest {
     private static Wiring wiring(AppConfig.LiquidationConfiguration configuration,
                                  List<LiquidationAssessment> scanned, List<Scenario> onChain,
                                  boolean syncing) {
-        return wiring(configuration, scanned, onChain, allUnspent(onChain), List.of(WALLET_UTXO),
+        return wiring(configuration, scanned, onChain, allUnspent(onChain), shaped(WALLET_UTXO),
                 noOracle(), syncing);
     }
 
@@ -948,10 +966,20 @@ class LiquidationExecutorTest {
      */
     private static Wiring convertWiring(ProtocolParamsSupplier payInAdvanceParams,
                                         LiquidationAssessment assessment) {
-        AppConfig.LiquidationConfiguration configuration = shadow(SMALL_MARGIN);
+        return convertWiring(payInAdvanceParams, assessment, shadow(SMALL_MARGIN), shaped(WALLET_UTXO));
+    }
 
-        List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO,
-                F855.loanUtxo(), F855.bondUtxo()));
+    /**
+     * As above, with the configuration and the executor's wallet list made explicit too — FAB-185-3 (g) runs
+     * the f855 ada-principal loan against a DISABLED {@code lovelace} market and a wallet of {C} alone.
+     */
+    private static Wiring convertWiring(ProtocolParamsSupplier payInAdvanceParams, LiquidationAssessment assessment,
+                                        AppConfig.LiquidationConfiguration configuration, List<Utxo> walletUtxos) {
+        // FAB-185: ONE wallet list, read by the executor and resolvable by the builders — the pay-in-advance
+        // builder pins the executor's role C as collateral, and CCL resolves a pinned collateral input by out-ref.
+        List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO));
+        universe.addAll(walletUtxos);
+        universe.addAll(List.of(F855.loanUtxo(), F855.bondUtxo()));
         universe.addAll(F855.oracleUniverse());
 
         LiquidateTransactionBuilder builder = new LiquidateTransactionBuilder(LoanFixtures.registry(),
@@ -978,7 +1006,7 @@ class LiquidationExecutorTest {
                         LoanFixtures.utxoSupplier(universe), payInAdvanceParams));
 
         LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
-                new FakeAppUtxoService(List.of(WALLET_UTXO)), ACCOUNT, scanner, resolver, builder,
+                new FakeAppUtxoService(walletUtxos), ACCOUNT, scanner, resolver, builder,
                 router, LoanFixtures.registry(), log, metrics(), oracles, previewNetwork(),
                 LoanFixtures.protocolParams(), LoanFixtures.converters(), EXPLODING_SUBMITTER);
         return new Wiring(executor, log, scanner, resolver, oracles, blockEventListener);
@@ -1020,7 +1048,7 @@ class LiquidationExecutorTest {
                         LoanFixtures.utxoSupplier(universe), LoanFixtures.protocolParams()));
 
         LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
-                new FakeAppUtxoService(List.of(WALLET_UTXO)), ACCOUNT, scanner, resolver, plainBuilder,
+                new FakeAppUtxoService(shaped(WALLET_UTXO)), ACCOUNT, scanner, resolver, plainBuilder,
                 payInAdvanceRouter, new FakeConvertRouter(canned), LoanFixtures.registry(), log, metrics(), oracles,
                 previewNetwork(), LoanFixtures.protocolParams(), LoanFixtures.converters(),
                 EXPLODING_SUBMITTER);
@@ -1252,7 +1280,7 @@ class LiquidationExecutorTest {
         Map<String, Utxo> loanOnly = Map.of(scenario.loan().loan().utxoRef(), scenario.loan().utxo());
 
         Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(scenario.assessment()), List.of(scenario),
-                loanOnly, List.of(WALLET_UTXO), noOracle(), false);
+                loanOnly, shaped(WALLET_UTXO), noOracle(), false);
         wiring.executor().cycle(NOW);
 
         LiquidationDecision decision = onlyDecision(wiring);
@@ -1274,7 +1302,7 @@ class LiquidationExecutorTest {
         Map<String, Utxo> loanOnly = Map.of(scenario.loan().loan().utxoRef(), scenario.loan().utxo());
 
         Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(scenario.assessment()), List.of(scenario),
-                loanOnly, List.of(WALLET_UTXO), noOracle(), false);
+                loanOnly, shaped(WALLET_UTXO), noOracle(), false);
 
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
@@ -1463,7 +1491,7 @@ class LiquidationExecutorTest {
         });
         Scenario scenario = scenario(FAT_FEE_PER_MILLE);
         Wiring wiring = wiring(configuration, List.of(scenario.assessment()), List.of(scenario),
-                allUnspent(List.of(scenario)), List.of(WALLET_UTXO), noOracle(), false, false,
+                allUnspent(List.of(scenario)), shaped(WALLET_UTXO), noOracle(), false, false,
                 LoanFixtures.protocolParams(), null, recording, metrics());
 
         LiquidateTransactionBuilder.ReferenceScripts all = configuration.getConfiguredReferenceScripts();
@@ -1567,7 +1595,7 @@ class LiquidationExecutorTest {
                 "principal leg: no oracle entry for " + USDM_UNIT);
 
         Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(blind), List.of(), Map.of(),
-                List.of(WALLET_UTXO), noOracle(), false, false, LoanFixtures.protocolParams(),
+                shaped(WALLET_UTXO), noOracle(), false, false, LoanFixtures.protocolParams(),
                 null, null, new MarketCoverageReporter(prometheus));
         wiring.executor().cycle(NOW);
 
@@ -1712,7 +1740,7 @@ class LiquidationExecutorTest {
     private static Wiring wiringWithHonestExUnits(AppConfig.LiquidationConfiguration configuration,
                                                   Scenario scenario) {
         return wiring(configuration, List.of(scenario.assessment()), List.of(scenario),
-                allUnspent(List.of(scenario)), List.of(WALLET_UTXO), noOracle(), false, true);
+                allUnspent(List.of(scenario)), shaped(WALLET_UTXO), noOracle(), false, true);
     }
 
     private static double percent(BigInteger part, BigInteger whole) {
@@ -1734,9 +1762,13 @@ class LiquidationExecutorTest {
      * refund or an airdrop claim arrives exactly like this.
      */
     @Test
-    void aDatumCarryingWalletUtxoIsSkippedInFavourOfACleanOne() throws Exception {
+    void aDatumCarryingWalletUtxoIsNeverUEvenWhenItIsTheLargest() throws Exception {
+        // FAB-185: the datum-carrying output is made the LARGEST, so only the ada-only rule keeps it from U.
+        Utxo largerWithDatum = LoanFixtures.utxo(TX_WALLET_DIRTY, 0, ACCOUNT.baseAddress(),
+                List.of(Amount.lovelace(BigInteger.valueOf(900_000_000))),
+                LiquidateTransactionBuilder.GENERAL_SPEND_REDEEMER.serializeToHex());
         Wiring wiring = wiringWithWallet(shadow(SMALL_MARGIN), scenario(FAT_FEE_PER_MILLE),
-                List.of(WALLET_UTXO_WITH_DATUM, WALLET_UTXO));
+                shaped(largerWithDatum, WALLET_UTXO));
 
         wiring.executor().cycle(NOW);
 
@@ -1757,7 +1789,7 @@ class LiquidationExecutorTest {
     @Test
     void aWalletUtxoCarryingOnlyADataHashIsAlsoSkipped() throws Exception {
         Wiring wiring = wiringWithWallet(shadow(SMALL_MARGIN), scenario(FAT_FEE_PER_MILLE),
-                List.of(WALLET_UTXO_WITH_DATUM_HASH, WALLET_UTXO));
+                shaped(WALLET_UTXO_WITH_DATUM_HASH, WALLET_UTXO));
 
         wiring.executor().cycle(NOW);
 
@@ -1769,42 +1801,40 @@ class LiquidationExecutorTest {
     }
 
     /**
-     * A wallet with nothing usable in it still scans, prices and records the run — it just cannot
-     * build.
+     * A wallet with no role C still scans, prices and records the run — it just cannot build (FAB-185,
+     * replacing "no clean ada utxo": the gate is now C, the exact-collateral output, because without it no
+     * role can be told apart).
      *
-     * <h2>Why this reversed</h2>
-     * This test previously asserted the opposite: that the loop stopped <em>before</em> the scan and
-     * recorded nothing. The stated reason was sound as far as it went — better one warning an
-     * operator can act on than a decision log full of misleading per-candidate refusals — but the
-     * position it defended made an unfunded wallet indistinguishable from a quiet market. Nothing
-     * scanned, nothing priced, no run recorded: the blind-bot shape this repo has now been bitten by
-     * three times.
+     * <h2>Why the scan still runs</h2>
+     * An unfunded wallet must not be indistinguishable from a quiet market: nothing scanned, nothing priced,
+     * no run recorded is the blind-bot shape this repo has been bitten by three times, and it bites hardest
+     * in SHADOW mode, whose purpose is to prove the bot can see and price real loans before anyone funds it.
      * <p>
-     * It bites hardest in SHADOW mode, whose entire purpose is to prove the bot can see and price
-     * real loans <em>before</em> anyone funds a wallet or arms it. A gate that refuses to observe the
-     * world until it could act on it makes the observation-only mode useless exactly when it is
-     * wanted.
-     * <p>
-     * <b>The old concern is still honoured, and that is the point of the assertions below.</b> The
-     * cycle records the aggregate run and returns before the per-candidate build loop, so the
-     * decision log gains a run with counts — evidence the loans were seen and priced — and gains
-     * <em>zero</em> per-candidate decisions. Observability without the flood.
+     * <b>The old concern is still honoured.</b> The cycle records the aggregate run and returns before the
+     * per-candidate loop, so the log gains a run and ZERO per-candidate decisions — and exactly ONE WARN,
+     * naming role C, C's lovelace, and what the rebalancer last did (here: it is not wired).
      */
     @Test
-    void aWalletWithNoCleanAdaUtxoStillScansAndRecordsTheRun() {
+    void aWalletWithNoRoleCStillScansAndRecordsTheRunAndWarnsOnceNamingC() {
+        // Ada-only outputs, but none of exactly C — and the two datum-carrying ones, which are never C.
+        Utxo notC = LoanFixtures.adaUtxo("71".repeat(32), 0, ACCOUNT.baseAddress(), 5_000_001L);
         Wiring wiring = wiringWithWallet(shadow(SMALL_MARGIN), scenario(FAT_FEE_PER_MILLE),
-                List.of(WALLET_UTXO_WITH_DATUM, WALLET_UTXO_WITH_DATUM_HASH));
+                List.of(WALLET_UTXO, notC, WALLET_UTXO_WITH_DATUM, WALLET_UTXO_WITH_DATUM_HASH));
 
-        wiring.executor().cycle(NOW);
+        List<ILoggingEvent> events = cyclesLogged(wiring, 1);
 
         // The world WAS observed: scanned once, and the run recorded with its counts.
         assertEquals(1, wiring.scanner().scans, "an unfunded wallet must not suppress the scan");
         assertNotNull(wiring.log().lastRun().at(), "the run must be recorded even when nothing builds");
-
-        // But no candidate was built, and no per-candidate refusal was logged.
         assertEquals(0, wiring.log().size(),
-                "the build loop must not run, so the decision log must not fill with refusals that "
-                        + "say nothing except 'the wallet is empty'");
+                "the build loop must not run, so the decision log must not fill with refusals");
+        BigInteger c = WalletShape.collateralLovelace(LoanFixtures.protocolParams().getProtocolParams());
+        List<ILoggingEvent> warns = events.stream().filter(event -> event.getLevel() == Level.WARN).toList();
+        assertEquals(1, warns.size(), "exactly one WARN: " + warns);
+        String warn = warns.getFirst().getFormattedMessage();
+        assertTrue(warn.contains("role C") && warn.contains(c + " lovelace")
+                        && warn.contains("the wallet rebalancer is not wired"),
+                "it names role C, C's lovelace and the rebalancer: " + warn);
     }
 
     // ======================================================================================
@@ -1839,7 +1869,7 @@ class LiquidationExecutorTest {
                 new FakeOracleClient(List.of()));
 
         Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(scenario.assessment()),
-                List.of(scenario), allUnspent(List.of(scenario)), List.of(WALLET_UTXO), oracles, false);
+                List.of(scenario), allUnspent(List.of(scenario)), shaped(WALLET_UTXO), oracles, false);
         wiring.executor().cycle(NOW);
 
         LiquidationDecision decision = onlyDecision(wiring);
@@ -1886,6 +1916,30 @@ class LiquidationExecutorTest {
         return appender.list;
     }
 
+    /**
+     * FAB-195: {@link #cyclesLogged} with the executor's logger at DEBUG for the duration, so the DEBUG line that
+     * carries a failure's stack trace is captured too. The previous level is restored.
+     */
+    private static List<ILoggingEvent> cyclesLoggedAtDebug(Wiring wiring, int cycles) {
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        Level previousLevel = logger.getLevel();
+        logger.setLevel(Level.DEBUG);
+        try {
+            return cyclesLogged(wiring, cycles);
+        } finally {
+            logger.setLevel(previousLevel);
+        }
+    }
+
+    /** FAB-195: the DEBUG events carrying a throwable whose message contains {@code text} — where a stack trace goes. */
+    private static List<ILoggingEvent> stackTracesAtDebug(List<ILoggingEvent> events, String text) {
+        return events.stream()
+                .filter(event -> event.getLevel() == Level.DEBUG)
+                .filter(event -> event.getThrowableProxy() != null)
+                .filter(event -> event.getFormattedMessage().contains(text))
+                .toList();
+    }
+
     private static List<ILoggingEvent> errorsContaining(List<ILoggingEvent> events, String text) {
         return events.stream()
                 .filter(event -> event.getLevel() == Level.ERROR)
@@ -1908,10 +1962,10 @@ class LiquidationExecutorTest {
         when(brokenBuilder.build(any(LiquidateTransactionBuilder.Request.class))).thenThrow(boom);
         Scenario honest = scenario(FAT_FEE_PER_MILLE);
         Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
-                allUnspent(List.of(honest)), List.of(WALLET_UTXO), noOracle(), false, false,
+                allUnspent(List.of(honest)), shaped(WALLET_UTXO), noOracle(), false, false,
                 LoanFixtures.protocolParams(), null, brokenBuilder, metrics());
 
-        List<ILoggingEvent> events = cyclesLogged(wiring, 2);
+        List<ILoggingEvent> events = cyclesLoggedAtDebug(wiring, 2);
 
         verify(brokenBuilder, times(2)).build(any(LiquidateTransactionBuilder.Request.class));
         List<LiquidationDecision> decisions = wiring.log().newestFirst(10);
@@ -1928,8 +1982,11 @@ class LiquidationExecutorTest {
         for (ILoggingEvent error : errors) {
             assertTrue(error.getFormattedMessage().contains(BLOCKFROST_TIMEOUT),
                     "each ERROR carries the root cause: " + error.getFormattedMessage());
-            assertNotNull(error.getThrowableProxy(), "and the exception itself");
+            // FAB-195: the stack trace goes to DEBUG, never on the ERROR line.
+            assertNull(error.getThrowableProxy(), "the ERROR line carries no throwable");
         }
+        assertEquals(2, stackTracesAtDebug(events, "building the liquidation of").size(),
+                "one DEBUG event per failure carries the exception itself: " + events);
     }
 
     /**
@@ -1967,7 +2024,7 @@ class LiquidationExecutorTest {
     private static final String LOAN_ID_2 = "b1b2c3d4e5f6a1b2";
     private static final String TX_WALLET_SMALL = "e3".repeat(32);
 
-    /** A wallet utxo the fee-only selector prefers to {@link #WALLET_UTXO}: smaller, still ample. */
+    /** A second ada-only wallet utxo, smaller than {@link #WALLET_UTXO} — so never U beside it — and still ample. */
     private static final Utxo WALLET_UTXO_SMALL = LoanFixtures.adaUtxo(TX_WALLET_SMALL, 0,
             ACCOUNT.baseAddress(), 20_000_000L);
 
@@ -1987,8 +2044,10 @@ class LiquidationExecutorTest {
     }
 
     /**
-     * Two candidates in one cycle; the first one's build fails with {@code failure}. Returns the
-     * wallet utxo each build was handed, in order, and the events logged.
+     * Two candidates in one cycle, on a wallet of C, U = {@link #WALLET_UTXO} and the smaller
+     * {@link #WALLET_UTXO_SMALL}; the first one's build fails with {@code failure}. Returns the wallet utxo
+     * each build was handed, in order — one entry when the second candidate was skipped unbuilt — and the
+     * events logged.
      */
     private static Map.Entry<List<Utxo>, List<ILoggingEvent>> twoCandidatesFirstFailing(
             RuntimeException failure) {
@@ -2002,68 +2061,73 @@ class LiquidationExecutorTest {
         Scenario second = secondScenario();
         List<Scenario> both = List.of(first, second);
         Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(first.assessment(), second.assessment()),
-                both, allUnspent(both), List.of(WALLET_UTXO, WALLET_UTXO_SMALL), noOracle(), false, false,
+                both, allUnspent(both), shaped(WALLET_UTXO, WALLET_UTXO_SMALL), noOracle(), false, false,
                 LoanFixtures.protocolParams(), null, builder, metrics());
         List<ILoggingEvent> events = cyclesLogged(wiring, 1);
-        assertEquals(2, nominated.size(), "both candidates were built: " + events);
         return Map.entry(nominated, events);
     }
 
+    /** The INFO line a candidate designated to an output that already went out in this check is skipped with. */
+    private static boolean skippedOnUsedOutput(List<ILoggingEvent> events, String loanRef, String outputRef,
+                                               String role) {
+        return events.stream().anyMatch(event -> event.getLevel() == Level.INFO
+                && event.getFormattedMessage().equals("liquidation of " + loanRef + " skipped: wallet output "
+                + outputRef + " (role " + role + ") already went out in this check"));
+    }
+
+    /** Whether any line still says a wallet utxo was dropped — the text FAB-186 retired. */
+    private static boolean saysDropped(List<ILoggingEvent> events) {
+        return events.stream().anyMatch(event -> event.getFormattedMessage().contains("dropped wallet utxo"));
+    }
+
     /**
-     * FAB-134 NQ task 4. A {@code BadInputsUTxO} says an input the bot nominated no longer exists,
-     * while the index — which answers "unspent" from {@code tx_input} — still lists it. The nominated
-     * wallet utxo leaves the cycle's list, so the next candidate nominates another rather than failing
-     * on the same spent input.
+     * FAB-134 NQ task 4, under FAB-185's role rules — rewritten by FAB-186. A {@code BadInputsUTxO} in a
+     * build failure used to mark U used, so the next candidate was skipped. That text decides nothing any
+     * more: it names an input, often the LOAN one another bot just spent, never reliably U. U stays free and
+     * the next candidate, also designated to U, is handed the SAME U — never the smaller output beside it.
      */
     @Test
-    void aBadInputsFailureDropsTheNominatedWalletUtxoAndTheNextCandidateNominatesAnother() {
+    void aBadInputsFailureMarksNothingAndTheNextCandidateIsHandedTheSameU() {
         var result = twoCandidatesFirstFailing(new IllegalStateException("submit-time evaluation failed",
                 new RuntimeException("ConwayUtxoFailure (BadInputsUTxO (fromList [TxIn ...]))")));
         List<Utxo> nominated = result.getKey();
 
-        assertEquals(WALLET_UTXO_SMALL, nominated.get(0), "the fee-only selector prefers the smaller");
-        assertEquals(WALLET_UTXO, nominated.get(1),
-                "the second candidate nominated the wallet utxo the first one's failure named as spent");
-        List<ILoggingEvent> warns = result.getValue().stream()
-                .filter(event -> event.getLevel() == Level.WARN)
-                .filter(event -> event.getFormattedMessage().equals("dropped wallet utxo "
-                        + TX_WALLET_SMALL + "#0 from this cycle: BadInputsUTxO"))
-                .toList();
-        assertEquals(1, warns.size(), "the drop is logged once, naming the utxo and the marker: "
-                + result.getValue());
+        assertEquals(List.of(WALLET_UTXO, WALLET_UTXO), nominated,
+                "U funds both candidates — never the smaller utxo");
+        assertFalse(saysDropped(result.getValue()), result.getValue().toString());
+        assertFalse(skippedOnUsedOutput(result.getValue(), TX_LOAN_2 + "#0", TX_WALLET + "#0", "U"),
+                "the second candidate is not skipped: " + result.getValue());
     }
 
-    /** The same drop for Blockfrost's empty-failures evaluation — CCL trap 13's spent-input shape. */
+    /** FAB-186: the same for Blockfrost's empty-failures evaluation — it marks nothing either. */
     @Test
-    void anEmptyScriptFailuresEvaluationAlsoDropsTheNominatedWalletUtxo() {
+    void anEmptyScriptFailuresEvaluationMarksNothingEither() {
         var result = twoCandidatesFirstFailing(new IllegalStateException("evaluation failed",
                 new RuntimeException("{\"ScriptFailures\": {}}")));
 
-        assertEquals(WALLET_UTXO, result.getKey().get(1),
-                "the second candidate must not nominate the utxo the first one's evaluation named spent");
+        assertEquals(List.of(WALLET_UTXO, WALLET_UTXO), result.getKey(),
+                "the second candidate is handed the same U");
+        assertFalse(skippedOnUsedOutput(result.getValue(), TX_LOAN_2 + "#0", TX_WALLET + "#0", "U"),
+                result.getValue().toString());
     }
 
     /**
-     * FAB-134 NQ r2 (RC). The plain route's OTHER spent-input site: the builder wraps Blockfrost's
-     * empty-failures evaluation as {@code RefusedException(SCRIPT_COST_EVALUATION_FAILED, cause)} —
-     * a refusal WITH a cause, which takes its own branch rather than the machinery catch. That exact
-     * shape must drop the nominated wallet utxo too.
+     * FAB-134 NQ r2 (RC), rewritten by FAB-186. The plain route's OTHER former spent-input site: the builder
+     * wraps Blockfrost's empty-failures evaluation as {@code RefusedException(SCRIPT_COST_EVALUATION_FAILED,
+     * cause)} — a refusal WITH a cause, which takes its own branch rather than the machinery catch. That
+     * exact shape marks nothing now either.
      */
     @Test
-    void aScriptCostEvaluationRefusalWithEmptyScriptFailuresDropsTheNominatedWalletUtxo() {
+    void aScriptCostEvaluationRefusalWithEmptyScriptFailuresMarksNothing() {
         var result = twoCandidatesFirstFailing(new LiquidateTransactionBuilder.RefusedException(
                 LiquidateTransactionBuilder.Refusal.SCRIPT_COST_EVALUATION_FAILED,
                 "script cost evaluation failed",
                 new IllegalStateException("evaluate rejected",
                         new RuntimeException("{\"ScriptFailures\":{}}"))));
 
-        assertEquals(WALLET_UTXO_SMALL, result.getKey().get(0));
-        assertEquals(WALLET_UTXO, result.getKey().get(1),
-                "the second candidate nominated the utxo the first one's evaluation named spent");
-        assertTrue(result.getValue().stream().anyMatch(event -> event.getLevel() == Level.WARN
-                        && event.getFormattedMessage().equals("dropped wallet utxo " + TX_WALLET_SMALL
-                        + "#0 from this cycle: \"ScriptFailures\":{}")),
-                "the drop is logged naming the marker: " + result.getValue());
+        assertEquals(List.of(WALLET_UTXO, WALLET_UTXO), result.getKey(),
+                "the second candidate is handed the same U");
+        assertFalse(saysDropped(result.getValue()), result.getValue().toString());
     }
 
     /** {@link #convertScenario(BigInteger)} again, under other refs and another loan id. */
@@ -2100,7 +2164,7 @@ class LiquidationExecutorTest {
                                             Utxo configUtxo, Utxo lmConfigUtxo,
                                             Map<String, OracleEntry> oraclesByUnit, BigInteger principalBalance,
                                             Function<BigInteger, Optional<Utxo>> walletSelector,
-                                            long validFromMillis, long validToMillis) {
+                                            Utxo collateralUtxo, long validFromMillis, long validToMillis) {
             nominated.add(walletSelector.apply(BigInteger.valueOf(4_000_000L)).orElse(null));
             throw nominated.size() == 1 ? badInputs() : new IllegalStateException("second build, irrelevant");
         }
@@ -2116,6 +2180,7 @@ class LiquidationExecutorTest {
         public Transaction buildConvertLiquidation(LiquidationAssessment assessment, Utxo loanUtxo,
                                                     Utxo bondUtxo, Utxo configUtxo, Utxo lmConfigUtxo,
                                                     Function<BigInteger, Optional<Utxo>> walletSelector,
+                                                    Utxo collateralUtxo,
                                                     Map<String, OracleEntry> oracles,
                                                     String changeAddress, long validFromMillis, long validToMillis) {
             nominated.add(walletSelector.apply(BigInteger.valueOf(4_000_000L)).orElse(null));
@@ -2124,15 +2189,16 @@ class LiquidationExecutorTest {
     }
 
     /**
-     * FAB-134 NQ r2 (PIA, convert). The two convert-bond routes' machinery catches carry the same
-     * spent-input drop as the plain one: two convert-bond candidates in one cycle, the first build
-     * failing with {@code BadInputsUTxO} after nominating the smaller wallet utxo — the second must
-     * nominate the other. The route is chosen by the ada market's action: ANTICIPATE (listed) routes to
-     * pay-in-advance, an unlisted market converts.
+     * FAB-134 NQ r2 (PIA, convert), under FAB-185's role rules — rewritten by FAB-186. The two convert-bond
+     * routes' machinery catches used to carry the same spent-input mark as the plain one. They mark nothing
+     * now: two convert-bond candidates in one cycle, the first build failing with {@code BadInputsUTxO} after
+     * U was handed out — the second, also designated to U, is handed the SAME U, never another output. The
+     * route is chosen by the ada market's action: ANTICIPATE (listed) routes to pay-in-advance, an unlisted
+     * market converts.
      */
     @ParameterizedTest
     @ValueSource(strings = {"PAY_IN_ADVANCE", "CONVERT"})
-    void aBadInputsMachineryFailureOnAConvertBondRouteDropsTheNominatedWalletUtxo(String route) {
+    void aBadInputsMachineryFailureOnAConvertBondRouteMarksNothing(String route) {
         boolean payInAdvance = route.equals("PAY_IN_ADVANCE");
         AppConfig.LiquidationConfiguration configuration = payInAdvance
                 ? shadow(SMALL_MARGIN)
@@ -2141,7 +2207,7 @@ class LiquidationExecutorTest {
         Scenario first = convertScenario(FAT_FEE_PER_MILLE);
         Scenario second = secondConvertScenario();
         List<Scenario> both = List.of(first, second);
-        List<Utxo> wallet = List.of(WALLET_UTXO, WALLET_UTXO_SMALL);
+        List<Utxo> wallet = shaped(WALLET_UTXO, WALLET_UTXO_SMALL);
         List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO));
         universe.addAll(wallet);
         both.forEach(scenario -> {
@@ -2167,20 +2233,18 @@ class LiquidationExecutorTest {
         List<Utxo> nominated = payInAdvance ? payInAdvanceRouter.nominated : convertRouter.nominated;
         assertTrue((payInAdvance ? convertRouter.nominated : payInAdvanceRouter.nominated).isEmpty(),
                 "the candidates took the other route");
-        assertEquals(2, nominated.size(), "both candidates reached the " + route + " router");
-        assertEquals(WALLET_UTXO_SMALL, nominated.get(0), "the sized selector prefers the smaller");
-        assertEquals(WALLET_UTXO, nominated.get(1),
-                "the second candidate nominated the wallet utxo the first one's failure named as spent");
+        assertEquals(List.of(WALLET_UTXO, WALLET_UTXO), nominated,
+                "both candidates reached the " + route + " router, and each was handed the same U");
     }
 
-    /** And an ordinary failure drops nothing: the second candidate may reuse the same input. */
+    /** And an ordinary failure marks nothing: the second candidate is handed the same U. */
     @Test
-    void anOrdinaryFailureLeavesTheWalletListAlone() {
+    void anOrdinaryFailureLeavesTheUsedMarksAlone() {
         var result = twoCandidatesFirstFailing(new IllegalStateException("cannot fetch protocol parameters",
                 new java.net.SocketTimeoutException(BLOCKFROST_TIMEOUT)));
 
-        assertEquals(WALLET_UTXO_SMALL, result.getKey().get(1),
-                "nothing said the input was spent, so it is still the best nomination");
+        assertEquals(List.of(WALLET_UTXO, WALLET_UTXO), result.getKey(),
+                "nothing said the input was spent, so U still funds the second candidate");
     }
 
     // ======================================================================================
@@ -2390,7 +2454,7 @@ class LiquidationExecutorTest {
             null);
 
     private static Wiring tokenPrincipalConvertEconomicsWiring() {
-        return tokenPrincipalConvertEconomicsWiring(List.of(WALLET_UTXO, TOKEN_WALLET_UTXO));
+        return tokenPrincipalConvertEconomicsWiring(shaped(WALLET_UTXO, TOKEN_WALLET_UTXO));
     }
 
     /** As above, with the wallet contents made explicit — F7's own scenario overrides these. */
@@ -2409,7 +2473,7 @@ class LiquidationExecutorTest {
     /** As above, with the node timing configuration made explicit too (FAB-126's builder-window refusal). */
     private static Wiring tokenPrincipalConvertEconomicsWiring(
             AppConfig.LiquidationConfiguration configuration) {
-        return tokenPrincipalConvertEconomicsWiring(List.of(WALLET_UTXO, TOKEN_WALLET_UTXO),
+        return tokenPrincipalConvertEconomicsWiring(shaped(WALLET_UTXO, TOKEN_WALLET_UTXO),
                 List.of(decoyVersion(collateralOracle(), 77), decoyVersion(principalOracle(), 9),
                         collateralOracle(), principalOracle()), configuration);
     }
@@ -2519,19 +2583,17 @@ class LiquidationExecutorTest {
         assertNotNull(decision.txHash(), "M18 — nominate() must pick the USDM+ada wallet utxo and "
                 + "actually build; got: " + decision.detail());
 
-        // ⛔ M18 — nominate() must ACTUALLY TAKE the token branch, named by its OWN nominated utxo and
-        // log shape. This is NOT provable by "the build succeeded" alone: cardano-client-lib's own
-        // balancer scans the whole wallet during balanceTx and will happily source the missing USDM
-        // from TOKEN_WALLET_UTXO even if nominate() itself picked the WRONG (ada-only) input — measured
-        // disabling the branch outright and finding every OTHER assertion in this test still passed.
-        // The nominate() log line is the only observable that actually pins WHICH utxo was chosen and
-        // by WHICH branch's logic (its message shape differs from the ada-only branch's).
-        boolean nominatedTheTokenUtxoByName = appender.list.stream()
-                .anyMatch(e -> e.getFormattedMessage().contains(TX_TOKEN_WALLET)
-                        && e.getFormattedMessage().contains("fee ceiling + min-ada rider"));
-        assertTrue(nominatedTheTokenUtxoByName, "nominate() must log choosing " + TX_TOKEN_WALLET
-                + " through its TOKEN branch (\"fee ceiling + min-ada rider\"), not fall through to the "
-                + "ada-only branch and rely on the balancer to paper over the wrong nomination: "
+        // ⛔ M18, under FAB-185's role rules — the candidate must ACTUALLY be funded from its TOKEN output,
+        // named by its own funding line. This is NOT provable by "the build succeeded" alone:
+        // cardano-client-lib's own balancer scans the whole wallet during balanceTx and will happily
+        // source the missing USDM from TOKEN_WALLET_UTXO even if the executor handed over the WRONG
+        // (ada-only) input. The funding line is the only observable that pins WHICH output was handed
+        // over and under WHICH role.
+        boolean fundedFromTheTokenOutputByName = appender.list.stream()
+                .anyMatch(e -> e.getFormattedMessage().contains("is funded from wallet output " + TX_TOKEN_WALLET
+                        + "#0 (role TOKEN " + PRINCIPAL_TOKEN_2.toUnit()));
+        assertTrue(fundedFromTheTokenOutputByName, "the executor must log funding from " + TX_TOKEN_WALLET
+                + " under role TOKEN, not hand over U and rely on the balancer to paper over it: "
                 + appender.list.stream().map(ILoggingEvent::getFormattedMessage).toList());
 
         // M12 — the announce line must name USDM, never "ada", for a token principal.
@@ -2587,7 +2649,7 @@ class LiquidationExecutorTest {
         Utxo tooLittleAda = LoanFixtures.utxo("d7".repeat(32), 0, ACCOUNT.baseAddress(), List.of(
                 Amount.lovelace(BigInteger.valueOf(1_400_000L)),
                 Amount.asset(LoanFixtures.unit(PRINCIPAL_TOKEN_2), BigInteger.valueOf(2_000L))), null);
-        Wiring wiring = tokenPrincipalConvertEconomicsWiring(List.of(WALLET_UTXO, tooLittleAda));
+        Wiring wiring = tokenPrincipalConvertEconomicsWiring(shaped(WALLET_UTXO, tooLittleAda));
 
         wiring.executor().cycle(NOW);
 
@@ -2623,7 +2685,7 @@ class LiquidationExecutorTest {
         Utxo thin = LoanFixtures.utxo("d8".repeat(32), 0, ACCOUNT.baseAddress(), List.of(
                 Amount.lovelace(BigInteger.valueOf(1_180_000L)),
                 Amount.asset(LoanFixtures.unit(PRINCIPAL_TOKEN_2), BigInteger.valueOf(3_000_000L))), null);
-        return List.of(WALLET_UTXO, thin);
+        return shaped(WALLET_UTXO, thin);
     }
 
     private static List<String> marketGateRefusalInfos(Wiring wiring) {
@@ -2680,7 +2742,7 @@ class LiquidationExecutorTest {
         Utxo tooLittleAda = LoanFixtures.utxo("d7".repeat(32), 0, ACCOUNT.baseAddress(), List.of(
                 Amount.lovelace(BigInteger.valueOf(1_400_000L)),
                 Amount.asset(LoanFixtures.unit(PRINCIPAL_TOKEN_2), BigInteger.valueOf(2_000L))), null);
-        Wiring wiring = tokenPrincipalConvertEconomicsWiring(List.of(WALLET_UTXO, tooLittleAda));
+        Wiring wiring = tokenPrincipalConvertEconomicsWiring(shaped(WALLET_UTXO, tooLittleAda));
 
         wiring.executor().cycle(NOW);
 
@@ -2698,20 +2760,27 @@ class LiquidationExecutorTest {
     }
 
     /**
-     * (c) THE CONTROL — green on the base as well. No token anywhere: the refusal reads exactly as it
-     * always did, "holds 0" and nothing about a total.
+     * (c) THE CONTROL, under FAB-185's role rules (task 6 e). No token anywhere: there is no TOKEN output to
+     * fund the token-principal pay-in-advance from, so it is refused by NAME before the router — and its
+     * market gate — is ever asked: {@code WALLET_ROLE_MISSING}, a detail starting {@code role TOKEN <unit>}
+     * and naming the rebalancer, and nothing about a token total.
      */
     @Test
-    void aWalletWithNoTokenAtAllStillSaysHoldsZeroAndNothingMore() {
-        Wiring wiring = tokenPrincipalConvertEconomicsWiring(List.of(WALLET_UTXO));
+    void aWalletWithNoTokenAtAllIsRefusedAsAMissingTokenRole() {
+        Wiring wiring = tokenPrincipalConvertEconomicsWiring(shaped(WALLET_UTXO));
 
-        wiring.executor().cycle(NOW);
+        List<ILoggingEvent> events = cyclesLogged(wiring, 1);
 
         LiquidationDecision decision = onlyDecision(wiring);
         assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
-        assertTrue(decision.detail().contains("holds 0 "), decision.detail());
+        assertEquals("WALLET_ROLE_MISSING", decision.reason(), decision.detail());
+        assertTrue(decision.detail().startsWith("role TOKEN " + PRINCIPAL_TOKEN_2.toUnit()), decision.detail());
+        assertTrue(decision.detail().contains("the wallet rebalancer is not wired"), decision.detail());
         assertFalse(decision.detail().contains("in total"), decision.detail());
-        assertEquals(decision.reason(), decision.detail(), "a refusal with no note is recorded as before");
+        List<ILoggingEvent> warns = events.stream().filter(event -> event.getLevel() == Level.WARN).toList();
+        assertEquals(1, warns.size(), warns.toString());
+        assertTrue(warns.getFirst().getFormattedMessage().contains("role TOKEN " + PRINCIPAL_TOKEN_2.toUnit()),
+                warns.toString());
     }
 
     /**
@@ -2774,25 +2843,113 @@ class LiquidationExecutorTest {
     }
 
     /**
-     * (g) The (a) wallet in a cycle whose protocol parameters could not be fetched: the floor is the 2 ADA
-     * rider alone, and the note must say the real one is higher, or it states a floor the bot does not use.
+     * FAB-185 r2 (F3): an ANTICIPATE token market the operator DISABLED, and a wallet {C, U} holding none of
+     * that token. The market is the answer, not the wallet: every check refuses it {@code MARKET_DISABLED} by
+     * the router's own gate — the row and INFO line it had before wallet roles existed — and the role lookup
+     * is never reached, so there is no {@code WALLET_ROLE_MISSING} row and no WARN about a role the bot is
+     * not to use in that market.
      */
     @Test
-    void anAdaFloorNoteWithoutAFeeCeilingSaysTheRealFloorIsHigher() {
+    void aDisabledAnticipateMarketIsRefusedMarketDisabledBeforeTheRoleLookup() {
+        AppConfig.LiquidationConfiguration configuration = shadow(SMALL_MARGIN);
+        AppConfig.LiquidationConfiguration.Market disabled = anticipateMarket(PRINCIPAL_TOKEN_2.toUnit(),
+                1_500_000_000L);
+        disabled.setMode(AppConfig.LiquidationConfiguration.Mode.DISABLED);
+        configuration.setMarkets(List.of(disabled));
+        Wiring wiring = tokenPrincipalConvertEconomicsWiring(shaped(WALLET_UTXO),
+                List.of(decoyVersion(collateralOracle(), 77), decoyVersion(principalOracle(), 9),
+                        collateralOracle(), principalOracle()), configuration);
+
+        List<ILoggingEvent> events = cyclesLogged(wiring, 2);
+
+        List<LiquidationDecision> decisions = wiring.log().newestFirst(10);
+        assertEquals(2, decisions.size(), "one row per check: " + decisions);
+        for (LiquidationDecision decision : decisions) {
+            assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
+            assertTrue(decision.reason().startsWith("MARKET_DISABLED"), decision.reason());
+            assertTrue(decision.reason().contains("is DISABLED"), decision.reason());
+            assertEquals(decision.reason(), decision.detail(), "recorded exactly as the router's gate records it");
+        }
+        assertEquals(0, decisions.stream().filter(d -> "WALLET_ROLE_MISSING".equals(d.reason())).count(),
+                decisions.toString());
+        List<ILoggingEvent> roleWarns = events.stream().filter(event -> event.getLevel() == Level.WARN)
+                .filter(event -> event.getFormattedMessage().contains("role ")).toList();
+        assertEquals(List.of(), roleWarns, "no WARN names a wallet role");
+        assertEquals(2, events.stream().filter(event -> event.getLevel() == Level.INFO)
+                        .filter(event -> event.getFormattedMessage().contains("refused by the market gate"))
+                        .filter(event -> event.getFormattedMessage().contains("MARKET_DISABLED")).count(),
+                "the router's gate refusal, at INFO, once per check: " + events);
+    }
+
+    /**
+     * FAB-185-3 (g), the FAB-185-1 r2 audit residue: the ADA-principal twin of the test above. A DISABLED
+     * {@code lovelace} ANTICIPATE market, the f855 pay-in-advance loan, and a wallet of {C} alone — no U, the
+     * role an ada principal is funded from. The market is the answer, not the missing U: exactly one
+     * {@code MARKET_DISABLED} row naming {@code lovelace}, no {@code WALLET_ROLE_MISSING} row and no WARN
+     * naming a wallet role, because a DISABLED market is refused before the role lookup on an ada principal
+     * as much as on a token one.
+     */
+    @Test
+    void aDisabledAdaAnticipateMarketWithNoUIsRefusedMarketDisabledBeforeTheRoleLookup() {
+        AppConfig.LiquidationConfiguration configuration = shadow(SMALL_MARGIN);
+        AppConfig.LiquidationConfiguration.Market disabled = anticipateMarket("lovelace", 1_000_000_000_000L);
+        disabled.setMode(AppConfig.LiquidationConfiguration.Mode.DISABLED);
+        configuration.setMarkets(List.of(disabled));
+        List<Utxo> onlyC = shaped();
+        assertEquals(1, onlyC.size(), "fixture: the wallet is role C alone, with no U: " + onlyC);
+        Wiring wiring = convertWiring(LoanFixtures.protocolParams(), F855.assessment(), configuration, onlyC);
+
+        // F855.NOW, not NOW: the frozen fixture's oracle feed is only valid around its own instant.
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            wiring.executor().cycle(F855.NOW);
+        } finally {
+            logger.detachAppender(appender);
+        }
+        List<ILoggingEvent> events = appender.list;
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
+        assertTrue(decision.reason().startsWith("MARKET_DISABLED"), decision.reason());
+        assertTrue(decision.reason().contains("market lovelace is DISABLED"), decision.reason());
+        assertFalse("WALLET_ROLE_MISSING".equals(decision.reason()), decision.toString());
+        List<ILoggingEvent> roleWarns = events.stream().filter(event -> event.getLevel() == Level.WARN)
+                .filter(event -> event.getFormattedMessage().contains("role ")).toList();
+        assertEquals(List.of(), roleWarns, "no WARN names a wallet role");
+    }
+
+    /**
+     * (g), under FAB-185 (task 6 f, replacing "an ada-floor note without a fee ceiling"): a check whose
+     * protocol parameters cannot be read cannot size C, so it builds NOTHING — no row, no router call — and
+     * says so in exactly ONE WARN naming role C and the cause chain. The old degraded path (a 2 ADA floor
+     * "without the fee ceiling") no longer exists: without C no output can be told apart.
+     */
+    @Test
+    void unreadableParametersAtCycleStartWarnOnceNamingRoleCAndBuildNothing() {
         Wiring wiring = tokenPrincipalConvertEconomicsWiringWithExecutorParams(tokenBehindTheAdaFloorWallet(),
                 throwingParams());
 
-        wiring.executor().cycle(NOW);
+        List<ILoggingEvent> events = cyclesLoggedAtDebug(wiring, 1);
 
-        LiquidationDecision decision = onlyDecision(wiring);
-        String detail = decision.detail();
-        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), detail);
-        assertTrue(decision.reason().startsWith("INSUFFICIENT_BALANCE"), decision.reason());
-        assertTrue(detail.contains("the wallet has 3000000 " + PRINCIPAL_TOKEN_2.toUnit() + " in total"),
-                detail);
-        assertTrue(detail.contains("less than 2000000 lovelace (2 ADA) each"), detail);
-        assertTrue(detail.contains("the fee ceiling was unavailable this cycle, so this floor leaves it out and "
-                + "the real one is higher"), detail);
+        assertEquals(0, wiring.log().size(), "nothing is built and nothing is recorded per candidate: "
+                + wiring.log().newestFirst(10));
+        assertEquals(1, wiring.scanner().scans, "the world is still observed");
+        // FAB-195: a failure of ours, so ERROR rather than WARN — still exactly one line, its stack trace at DEBUG.
+        List<ILoggingEvent> errors = events.stream().filter(event -> event.getLevel() == Level.ERROR).toList();
+        assertEquals(1, errors.size(), "exactly one ERROR: " + errors);
+        assertEquals(List.of(), events.stream().filter(event -> event.getLevel() == Level.WARN).toList(),
+                "and no WARN any more");
+        String warn = errors.getFirst().getFormattedMessage();
+        assertTrue(warn.contains("role C") && warn.contains(BLOCKFROST_TIMEOUT),
+                "it names role C and the cause chain down to the root: " + warn);
+        assertNull(errors.getFirst().getThrowableProxy(), "the ERROR line carries no throwable");
+        assertEquals(1, stackTracesAtDebug(events, "cannot be sized").size(),
+                "one DEBUG event carries the exception itself: " + events);
+        assertFalse(events.stream().anyMatch(event -> event.getFormattedMessage().contains("PAY-IN-ADVANCE")),
+                "no route was entered: " + events);
     }
 
     /**
@@ -2907,7 +3064,7 @@ class LiquidationExecutorTest {
         // Token collateral (its oracle present) and a USDM principal whose datum-named oracle is ABSENT --
         // only the principal leg can be what refuses. (The ada-collateral scenario this test used before
         // FAB-117 is now refused for its collateral first, by name.)
-        Wiring wiring = tokenPrincipalConvertEconomicsWiring(List.of(WALLET_UTXO, TOKEN_WALLET_UTXO),
+        Wiring wiring = tokenPrincipalConvertEconomicsWiring(shaped(WALLET_UTXO, TOKEN_WALLET_UTXO),
                 List.of(decoyVersion(principalOracle(), 9), collateralOracle()));
 
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
@@ -2948,7 +3105,7 @@ class LiquidationExecutorTest {
         Scenario tampered = convert.withAssessment(positiveEquity);
 
         Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(tampered.assessment()), List.of(tampered),
-                allUnspent(List.of(tampered)), List.of(WALLET_UTXO), noOracle(), false);
+                allUnspent(List.of(tampered)), shaped(WALLET_UTXO), noOracle(), false);
         wiring.executor().cycle(NOW);
 
         LiquidationDecision decision = onlyDecision(wiring);
@@ -3072,11 +3229,13 @@ class LiquidationExecutorTest {
     void anExceptionOutsideTheBuildTryIsCaughtByTheOuterNetAndLoggedAtErrorWithTheCause() {
         LiquidationAssessment assessment = nullLoanAssessment();
         Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(assessment), List.of(), Map.of(),
-                List.of(WALLET_UTXO), noOracle(), false);
+                shaped(WALLET_UTXO), noOracle(), false);
 
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
         appender.start();
+        Level previousLevel = logger.getLevel();
+        logger.setLevel(Level.DEBUG);
         logger.addAppender(appender);
         try {
             wiring.executor().cycle(NOW);
@@ -3103,45 +3262,36 @@ class LiquidationExecutorTest {
             assertFalse(event.getFormattedMessage().contains("java.lang.NullPointerException"),
                     "causeChain uses the SIMPLE name; e.toString() qualifies it: "
                             + event.getFormattedMessage());
-            assertNotNull(event.getThrowableProxy(),
-                    "the exception itself must be attached for the stack trace, not just the message");
+            // FAB-195: the stack trace goes to DEBUG, never on the ERROR line.
+            assertNull(event.getThrowableProxy(), "the ERROR line carries no throwable");
+            assertEquals(1, stackTracesAtDebug(appender.list, "could not consider bond").size(),
+                    "one DEBUG event carries the exception itself, for the stack trace: " + appender.list);
         } finally {
             logger.detachAppender(appender);
+            logger.setLevel(previousLevel);
         }
     }
 
     /**
-     * <b>T-052 — a fee-only liquidation nominates the SMALL utxo, leaving the large ones for the
-     * candidates that need them.</b>
+     * <b>FAB-185 — a plain liquidation is funded from U, the LARGEST ada-only output that is not C.</b>
      * <p>
-     * Giovanni's rule 5: <i>"the amount of ada a liquidator might spend might be little, just tx fee
-     * or something, so a 5 ada utxo would be perfect."</i> On the plain path the collateral funds
-     * every output, so the only ada the bot brings is the fee — measured here at 2,405,077 lovelace
-     * against the fixture's protocol parameters, which the 5-ada utxo covers comfortably.
-     * <p>
-     * ⚠ <b>This test used to assert the opposite</b> — that the LARGEST was nominated — and the
-     * reason it did is still true and still guarded: the nominated utxo is the only wallet input the
-     * builder declares, and cardano-client-lib evaluates script cost BEFORE balancing can add any
-     * more, so it must cover the transaction alone. Blockfrost refuses one that cannot with
-     * {@code EvaluationFailure} and an EMPTY {@code ScriptFailures} map, which reads as anything but
-     * a funding problem (measured on preview 2026-08-24: a 776-ada wallet across 14 utxos with a
-     * 5-ada one listed first, and every CONVERT liquidation failing on it).
-     * <p>
-     * <b>T-052 keeps that guarantee and stops paying for it with the biggest input:</b> the
-     * requirement is computed instead of over-provisioned. The convert half — where the requirement
-     * really is large — is asserted in {@code PayInAdvanceLiquidationRouterTest}, and the selection
-     * arithmetic in {@code WalletInputSelectionTest}.
+     * This replaces T-052's smallest-sufficient nomination (the test of that rule asserted the 5-ada utxo
+     * was taken; under the role rules a 5-ada ada-only output is C, the collateral, and never funds). U is
+     * one output resolved once per check, so a candidate can no longer fall to whichever smaller output a
+     * selector finds — and the guarantee T-052 kept is kept here too: the output handed over must still
+     * cover the requirement it was sized against, here the fee ceiling (2,405,077 lovelace on the fixture
+     * parameters).
      */
     @Test
-    void aFeeOnlyLiquidationNominatesTheSmallestSufficientUtxo() {
-        Utxo small = LoanFixtures.adaUtxo("11".repeat(32), 0, ACCOUNT.baseAddress(), 5_000_000L);
+    void aPlainLiquidationIsFundedFromUTheLargestAdaOnlyOutputNeverC() throws Exception {
+        Utxo small = LoanFixtures.adaUtxo("11".repeat(32), 0, ACCOUNT.baseAddress(), 10_000_000L);
         Utxo large = LoanFixtures.adaUtxo("22".repeat(32), 0, ACCOUNT.baseAddress(), 58_384_544L);
         Utxo middling = LoanFixtures.adaUtxo("33".repeat(32), 0, ACCOUNT.baseAddress(), 38_839_574L);
         Scenario honest = scenario(FAT_FEE_PER_MILLE);
 
-        // Deliberately listed smallest-first, the order that produced the live failure.
+        // Deliberately listed smallest-first, the order that produced the 2026-08-24 live failure.
         Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
-                allUnspent(List.of(honest)), List.of(small, large, middling), noOracle(), false);
+                allUnspent(List.of(honest)), shaped(small, large, middling), noOracle(), false);
 
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
@@ -3155,28 +3305,32 @@ class LiquidationExecutorTest {
 
         String chosen = appender.list.stream()
                 .map(ILoggingEvent::getFormattedMessage)
-                .filter(message -> message.contains("nominates wallet utxo"))
+                .filter(message -> message.contains("is funded from wallet output"))
                 .findFirst()
-                .orElseThrow(() -> new AssertionError("the executor must say which utxo it picked: "
+                .orElseThrow(() -> new AssertionError("the executor must say which output funds it: "
                         + appender.list));
-        assertTrue(chosen.contains("11".repeat(32)),
-                "a fee-only liquidation must take the small sufficient utxo: " + chosen);
-        assertFalse(chosen.contains("22".repeat(32)) || chosen.contains("33".repeat(32)),
-                "the large utxos must be left for candidates that need them: " + chosen);
+        assertTrue(chosen.contains("22".repeat(32) + "#0 (role U"),
+                "a plain liquidation is funded from U, the largest ada-only output: " + chosen);
+        assertFalse(chosen.contains("11".repeat(32)) || chosen.contains("33".repeat(32))
+                        || chosen.contains("c5".repeat(32)),
+                "never a smaller output, and never C: " + chosen);
 
-        // ⇒ AND IT MUST STILL COVER WHAT IT WAS CHOSEN AGAINST. This is the half the old
-        // largest-first rule bought by over-provisioning; asserting it here keeps the guarantee
-        // attached to the new mechanism instead of to a heuristic that happened to imply it.
+        // ⇒ AND IT MUST STILL COVER WHAT IT WAS SIZED AGAINST.
         java.util.regex.Matcher m = java.util.regex.Pattern
-                .compile("\\((\\d+) lovelace\\) for a requirement of (\\d+)").matcher(chosen);
-        assertTrue(m.find(), "the nomination line must state both figures: " + chosen);
+                .compile(", (\\d+) lovelace\\) for a requirement of (\\d+) lovelace").matcher(chosen);
+        assertTrue(m.find(), "the funding line must state both figures: " + chosen);
         assertTrue(Long.parseLong(m.group(1)) >= Long.parseLong(m.group(2)),
-                "the nominated utxo does not cover the requirement it was chosen against: " + chosen);
+                "the output does not cover the requirement it was sized against: " + chosen);
+        Transaction built = Transaction.deserialize(HexUtil.decodeHexString(onlyDecision(wiring).txCborHex()));
+        assertTrue(built.getBody().getInputs().contains(new TransactionInput("22".repeat(32), 0)),
+                "the built body spends U");
+        assertFalse(built.getBody().getInputs().contains(new TransactionInput("c5".repeat(32), 0)),
+                "the built body never spends C");
     }
 
-    /** A reference-script or datum-bearing utxo is still excluded, however large it is. */
+    /** A reference-script or datum-bearing utxo is never U, however large it is. */
     @Test
-    void theLargestUtxoIsStillSubjectToEveryEligibilityRule() {
+    void theLargestOutputIsStillSubjectToEveryEligibilityRuleBeforeItCanBeU() {
         Utxo huge = Utxo.builder()
                 .txHash("44".repeat(32)).outputIndex(0).address(ACCOUNT.baseAddress())
                 .amount(List.of(Amount.lovelace(BigInteger.valueOf(900_000_000L))))
@@ -3186,7 +3340,7 @@ class LiquidationExecutorTest {
         Scenario honest = scenario(FAT_FEE_PER_MILLE);
 
         Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
-                allUnspent(List.of(honest)), List.of(huge, modest), noOracle(), false);
+                allUnspent(List.of(honest)), shaped(huge, modest), noOracle(), false);
 
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
@@ -3200,10 +3354,10 @@ class LiquidationExecutorTest {
 
         String chosen = appender.list.stream()
                 .map(ILoggingEvent::getFormattedMessage)
-                .filter(message -> message.contains("nominates wallet utxo"))
+                .filter(message -> message.contains("is funded from wallet output"))
                 .findFirst()
-                .orElseThrow(() -> new AssertionError("expected a nomination: " + appender.list));
-        assertTrue(chosen.contains("55".repeat(32)),
+                .orElseThrow(() -> new AssertionError("expected a funding line: " + appender.list));
+        assertTrue(chosen.contains("55".repeat(32) + "#0 (role U"),
                 "largest-first must not override the reference-script exclusion: " + chosen);
     }
 
@@ -3238,6 +3392,8 @@ class LiquidationExecutorTest {
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
         appender.start();
+        Level previousLevel = logger.getLevel();
+        logger.setLevel(Level.DEBUG);
         logger.addAppender(appender);
         try {
             // F855.NOW, not NOW: the frozen fixture's oracle feed is only valid around its own
@@ -3245,6 +3401,7 @@ class LiquidationExecutorTest {
             wiring.executor().cycle(F855.NOW);
         } finally {
             logger.detachAppender(appender);
+            logger.setLevel(previousLevel);
         }
 
         LiquidationDecision decision = onlyDecision(wiring);
@@ -3271,8 +3428,10 @@ class LiquidationExecutorTest {
         assertTrue(event.getFormattedMessage().contains(BLOCKFROST_TIMEOUT),
                 "the log must surface the ROOT cause too, not just toString() of the wrapper: "
                         + event.getFormattedMessage());
-        assertNotNull(event.getThrowableProxy(),
-                "the exception itself must be attached for the stack trace, not just the message");
+        // FAB-195: the stack trace goes to DEBUG, never on the ERROR line.
+        assertNull(event.getThrowableProxy(), "the ERROR line carries no throwable");
+        assertEquals(1, stackTracesAtDebug(appender.list, "building the pay-in-advance liquidation of").size(),
+                "one DEBUG event carries the exception itself, for the stack trace: " + appender.list);
     }
 
     /**
@@ -3295,17 +3454,20 @@ class LiquidationExecutorTest {
 
         Scenario honest = scenario(FAT_FEE_PER_MILLE);
         Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
-                allUnspent(List.of(honest)), List.of(WALLET_UTXO), noOracle(), false, false,
+                allUnspent(List.of(honest)), shaped(WALLET_UTXO), noOracle(), false, false,
                 LoanFixtures.protocolParams(), null, brokenBuilder, metrics());
 
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
         appender.start();
+        Level previousLevel = logger.getLevel();
+        logger.setLevel(Level.DEBUG);
         logger.addAppender(appender);
         try {
             wiring.executor().cycle(NOW);
         } finally {
             logger.detachAppender(appender);
+            logger.setLevel(previousLevel);
         }
 
         LiquidationDecision decision = onlyDecision(wiring);
@@ -3324,7 +3486,10 @@ class LiquidationExecutorTest {
         ILoggingEvent event = errors.getFirst();
         assertTrue(event.getFormattedMessage().contains(BLOCKFROST_TIMEOUT),
                 "the log must surface the ROOT cause too: " + event.getFormattedMessage());
-        assertNotNull(event.getThrowableProxy(), "the exception must be attached for the stack trace");
+        // FAB-195: the stack trace goes to DEBUG, never on the ERROR line.
+        assertNull(event.getThrowableProxy(), "the ERROR line carries no throwable");
+        assertEquals(1, stackTracesAtDebug(appender.list, "building the liquidation of").size(),
+                "one DEBUG event carries the exception itself, for the stack trace: " + appender.list);
     }
 
     /**
@@ -3342,17 +3507,20 @@ class LiquidationExecutorTest {
                 new java.io.IOException("index segment 000042 is corrupt"));
         Scenario honest = scenario(FAT_FEE_PER_MILLE);
         Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
-                allUnspent(List.of(honest)), List.of(WALLET_UTXO), noOracle(), false, false,
+                allUnspent(List.of(honest)), shaped(WALLET_UTXO), noOracle(), false, false,
                 LoanFixtures.protocolParams(), boom, null, metrics());
 
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
         appender.start();
+        Level previousLevel = logger.getLevel();
+        logger.setLevel(Level.DEBUG);
         logger.addAppender(appender);
         try {
             wiring.executor().cycle(NOW);
         } finally {
             logger.detachAppender(appender);
+            logger.setLevel(previousLevel);
         }
 
         assertEquals(0, wiring.log().size(),
@@ -3372,7 +3540,10 @@ class LiquidationExecutorTest {
         assertTrue(event.getFormattedMessage().contains("index segment 000042 is corrupt"),
                 "must surface the ROOT cause, not just toString() of the wrapper: "
                         + event.getFormattedMessage());
-        assertNotNull(event.getThrowableProxy(), "the exception must be attached for the stack trace");
+        // FAB-195: the stack trace goes to DEBUG, never on the ERROR line.
+        assertNull(event.getThrowableProxy(), "the ERROR line carries no throwable");
+        assertEquals(1, stackTracesAtDebug(appender.list, "could not consider bond").size(),
+                "one DEBUG event carries the exception itself, for the stack trace: " + appender.list);
     }
 
     /**
@@ -3392,17 +3563,20 @@ class LiquidationExecutorTest {
     void aRefusalWrappingARealFailureSurfacesTheCauseInsteadOfReadingLikeAVerdict() {
         Scenario honest = scenario(FAT_FEE_PER_MILLE);
         Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
-                allUnspent(List.of(honest)), List.of(WALLET_UTXO), noOracle(), false, false,
+                allUnspent(List.of(honest)), shaped(WALLET_UTXO), noOracle(), false, false,
                 throwingParams(), null, null, metrics());
 
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
         appender.start();
+        Level previousLevel = logger.getLevel();
+        logger.setLevel(Level.DEBUG);
         logger.addAppender(appender);
         try {
             wiring.executor().cycle(NOW);
         } finally {
             logger.detachAppender(appender);
+            logger.setLevel(previousLevel);
         }
 
         LiquidationDecision decision = onlyDecision(wiring);
@@ -3420,7 +3594,10 @@ class LiquidationExecutorTest {
                 "a refusal that wraps a failure gets exactly one ERROR line: " + appender.list);
         assertTrue(errors.getFirst().getFormattedMessage().contains(BLOCKFROST_TIMEOUT),
                 "which must name the root cause: " + errors.getFirst().getFormattedMessage());
-        assertNotNull(errors.getFirst().getThrowableProxy(), "with the exception attached");
+        // FAB-195: the stack trace goes to DEBUG, never on the ERROR line.
+        assertNull(errors.getFirst().getThrowableProxy(), "the ERROR line carries no throwable");
+        assertEquals(1, stackTracesAtDebug(appender.list, "by a failure underneath").size(),
+                "one DEBUG event carries the exception itself, for the stack trace: " + appender.list);
     }
 
     /**
@@ -3504,17 +3681,20 @@ class LiquidationExecutorTest {
         when(unserialisable.build(any(LiquidateTransactionBuilder.Request.class))).thenReturn(broken);
 
         Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
-                allUnspent(List.of(honest)), List.of(WALLET_UTXO), noOracle(), false, false,
+                allUnspent(List.of(honest)), shaped(WALLET_UTXO), noOracle(), false, false,
                 LoanFixtures.protocolParams(), null, unserialisable, metrics());
 
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
         appender.start();
+        Level previousLevel = logger.getLevel();
+        logger.setLevel(Level.DEBUG);
         logger.addAppender(appender);
         try {
             wiring.executor().cycle(NOW);
         } finally {
             logger.detachAppender(appender);
+            logger.setLevel(previousLevel);
         }
 
         LiquidationDecision decision = onlyDecision(wiring);
@@ -3531,8 +3711,205 @@ class LiquidationExecutorTest {
         // THE DISCRIMINATOR: toString() on the wrapper stops one link short of this.
         assertTrue(event.getFormattedMessage().contains("cbor writer refused a 4-byte tag"),
                 "must surface the ROOT cause, not just toString(): " + event.getFormattedMessage());
-        assertNotNull(event.getThrowableProxy(),
-                "and the throwable must be attached — the old WARN passed none");
+        // FAB-195: the stack trace goes to DEBUG, never on the ERROR line.
+        assertNull(event.getThrowableProxy(), "the ERROR line carries no throwable");
+        assertEquals(1, stackTracesAtDebug(appender.list, "could not serialise").size(),
+                "one DEBUG event carries the exception itself, for the stack trace: " + appender.list);
+    }
+
+    // ======================================================================================
+    // FAB-195 — what a cycle tells the pass line, and the one-ERROR-line rule for a build failure
+    // ======================================================================================
+
+    /** A cycle on {@code executor} behind an open fence, counted on {@code tally}, with the logger at DEBUG. */
+    private static List<ILoggingEvent> cycleLoggedAtDebug(LiquidationExecutor executor, long now, StageTally tally) {
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        Level previousLevel = logger.getLevel();
+        logger.setLevel(Level.DEBUG);
+        logger.addAppender(appender);
+        try {
+            executor.cycle(now, SubmitFence.OPEN, tally);
+        } finally {
+            logger.detachAppender(appender);
+            logger.setLevel(previousLevel);
+        }
+        return appender.list;
+    }
+
+    /** submitted, would-submit, attempted, error, no-op — in the pass line's order. */
+    private static List<Integer> counts(StageTally tally) {
+        return List.of(tally.submitted(), tally.wouldSubmit(), tally.attempted(), tally.error(), tally.noOp());
+    }
+
+    /**
+     * FAB-195 LINE RULE: exactly one ERROR event in the cycle, naming {@code phrase}, the loan, {@code via <route>}
+     * and the root cause's message, with NO throwable; and exactly one DEBUG event, naming {@code phrase}, that
+     * carries the throwable.
+     */
+    private static void assertLineRule(List<ILoggingEvent> events, String phrase, String loanRef, String route,
+                                       String rootMessage) {
+        List<ILoggingEvent> errors = events.stream().filter(event -> event.getLevel() == Level.ERROR).toList();
+        assertEquals(1, errors.size(), "exactly one ERROR event for the failure: " + events);
+        String line = errors.getFirst().getFormattedMessage();
+        assertTrue(line.contains(phrase), "the site's own phrase: " + line);
+        assertTrue(line.contains(loanRef), "the loan: " + line);
+        assertTrue(line.contains("via " + route), "the route: " + line);
+        assertTrue(line.contains(rootMessage), "the whole cause chain, down to the root: " + line);
+        assertNull(errors.getFirst().getThrowableProxy(), "no throwable on the ERROR line: " + line);
+        assertEquals(1, stackTracesAtDebug(events, phrase).size(),
+                "exactly one DEBUG event carries the throwable: " + events);
+    }
+
+    /**
+     * (L1) Plain: an unexpected build failure (the mocked builder's machinery failure) counts {@code error 1} and is
+     * said under the LINE RULE, via plain.
+     */
+    @Test
+    void anUnexpectedPlainBuildFailureCountsOneErrorInOneErrorLine() {
+        LiquidateTransactionBuilder brokenBuilder = mock(LiquidateTransactionBuilder.class);
+        when(brokenBuilder.build(any(LiquidateTransactionBuilder.Request.class))).thenThrow(
+                new IllegalStateException("cannot fetch protocol parameters",
+                        new java.net.SocketTimeoutException(BLOCKFROST_TIMEOUT)));
+        Scenario honest = scenario(FAT_FEE_PER_MILLE);
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
+                allUnspent(List.of(honest)), shaped(WALLET_UTXO), noOracle(), false, false,
+                LoanFixtures.protocolParams(), null, brokenBuilder, metrics());
+        StageTally tally = new StageTally();
+
+        List<ILoggingEvent> events = cycleLoggedAtDebug(wiring.executor(), NOW, tally);
+
+        assertEquals(List.of(0, 0, 0, 1, 0), counts(tally), "error 1, nothing else");
+        assertLineRule(events, "building the liquidation of", honest.loan().loan().utxoRef(),
+                LiquidationExecutor.ROUTE_PLAIN, BLOCKFROST_TIMEOUT);
+    }
+
+    /** (L1) Convert (Minswap): any other exception from the router counts {@code error 1}, via convert. */
+    @Test
+    void anUnexpectedConvertBuildFailureCountsOneErrorInOneErrorLine() {
+        ConvertWiring wiring = convertWiringThrowing(new IllegalStateException("the convert route broke",
+                new java.io.IOException("pool snapshot 0007 is truncated")));
+        StageTally tally = new StageTally();
+
+        List<ILoggingEvent> events = cycleLoggedAtDebug(wiring.executor(), NOW, tally);
+
+        assertEquals(List.of(0, 0, 0, 1, 0), counts(tally), "error 1, nothing else");
+        assertLineRule(events, "building the convert liquidation of",
+                convertScenario(FAT_FEE_PER_MILLE).loan().loan().utxoRef(), LiquidationExecutor.ROUTE_CONVERT,
+                "pool snapshot 0007 is truncated");
+    }
+
+    /**
+     * (L1) Pay-in-advance: {@code convertWiring(throwingParams())} — the f855 loan, routed to the pay-in-advance
+     * builder by {@code shadow}'s ANTICIPATE market, whose own {@code try} wraps the throwing parameters — counts
+     * {@code error 1}, via pay-in-advance.
+     */
+    @Test
+    void anUnexpectedPayInAdvanceBuildFailureCountsOneErrorInOneErrorLine() {
+        Wiring wiring = convertWiring(throwingParams());
+        StageTally tally = new StageTally();
+
+        List<ILoggingEvent> events = cycleLoggedAtDebug(wiring.executor(), F855.NOW, tally);
+
+        assertEquals(List.of(0, 0, 0, 1, 0), counts(tally), "error 1, nothing else");
+        assertLineRule(events, "building the pay-in-advance liquidation of", F855.loan().utxoRef(),
+                LiquidationExecutor.ROUTE_PAY_IN_ADVANCE, BLOCKFROST_TIMEOUT);
+    }
+
+    /** (L1) The pool lookup failing to read the local index is a failure of ours: {@code error 1}, via convert. */
+    @Test
+    void aPoolLookupThatCannotReadTheIndexCountsOneErrorInOneErrorLine() {
+        ConvertWiring wiring = convertWiringThrowing(new MinswapPoolResolver.RefusedException(
+                MinswapPoolResolver.Refusal.LOOKUP_FAILED, "the pool lookup failed: index segment 000042 is corrupt"));
+        StageTally tally = new StageTally();
+
+        List<ILoggingEvent> events = cycleLoggedAtDebug(wiring.executor(), NOW, tally);
+
+        assertEquals(List.of(0, 0, 0, 1, 0), counts(tally), "error 1, nothing else");
+        assertLineRule(events, "failed reading the local pool index",
+                convertScenario(FAT_FEE_PER_MILLE).loan().loan().utxoRef(), LiquidationExecutor.ROUTE_CONVERT,
+                "index segment 000042 is corrupt");
+    }
+
+    /** (L2) Plain: U too small is a refusal by name — {@code no-op 1}, its WARN unchanged, no ERROR. */
+    @Test
+    void aPlainWalletTooSmallRefusalCountsOneNoOpAtItsOwnLevel() {
+        Utxo tiny = LoanFixtures.adaUtxo("77".repeat(32), 0, ACCOUNT.baseAddress(), 1_000_000L);
+        Scenario honest = scenario(FAT_FEE_PER_MILLE);
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
+                allUnspent(List.of(honest)), shaped(tiny), noOracle(), false, false,
+                LoanFixtures.protocolParams(), null, mock(LiquidateTransactionBuilder.class), metrics());
+        StageTally tally = new StageTally();
+
+        List<ILoggingEvent> events = cycleLoggedAtDebug(wiring.executor(), NOW, tally);
+
+        assertEquals(List.of(0, 0, 0, 0, 1), counts(tally), "no-op 1, nothing else");
+        List<ILoggingEvent> refusals = events.stream()
+                .filter(event -> event.getFormattedMessage().contains("U cannot fund this liquidation's fee ceiling."))
+                .toList();
+        assertEquals(1, refusals.size(), String.valueOf(events));
+        assertEquals(Level.WARN, refusals.getFirst().getLevel(), "its level is unchanged");
+        assertTrue(events.stream().noneMatch(event -> event.getLevel() == Level.ERROR), String.valueOf(events));
+    }
+
+    /** (L2) Convert: a {@code ConvertOrderPlan} refusal is a verdict — {@code no-op 1} at INFO, no ERROR. */
+    @Test
+    void aConvertPlanRefusalCountsOneNoOpAtItsOwnLevel() {
+        ConvertWiring wiring = convertWiringThrowing(new ConvertOrderPlan.RefusedException(
+                ConvertOrderPlan.Refusal.POOL_TOO_THIN,
+                "swapping 22003200000 would return about 824348402, but minimum_receive is 980001429"));
+        StageTally tally = new StageTally();
+
+        List<ILoggingEvent> events = cycleLoggedAtDebug(wiring.executor(), NOW, tally);
+
+        assertEquals(List.of(0, 0, 0, 0, 1), counts(tally), "no-op 1, nothing else");
+        List<ILoggingEvent> refusals = events.stream()
+                .filter(event -> event.getFormattedMessage().contains("was refused as POOL_TOO_THIN"))
+                .toList();
+        assertEquals(1, refusals.size(), String.valueOf(events));
+        assertEquals(Level.INFO, refusals.getFirst().getLevel(), "its level is unchanged");
+        assertTrue(events.stream().noneMatch(event -> event.getLevel() == Level.ERROR), String.valueOf(events));
+    }
+
+    /** (L2) Pay-in-advance: a market-gate refusal is policy — {@code no-op 1} at INFO, no ERROR. */
+    @Test
+    void aPayInAdvanceMarketGateRefusalCountsOneNoOpAtItsOwnLevel() {
+        Wiring wiring = tokenPrincipalConvertEconomicsWiring(tokenBehindTheAdaFloorWallet());
+        StageTally tally = new StageTally();
+
+        List<ILoggingEvent> events = cycleLoggedAtDebug(wiring.executor(), NOW, tally);
+
+        assertEquals(List.of(0, 0, 0, 0, 1), counts(tally), "no-op 1, nothing else");
+        List<ILoggingEvent> refusals = events.stream()
+                .filter(event -> event.getFormattedMessage().contains("was refused by the market gate"))
+                .toList();
+        assertEquals(1, refusals.size(), String.valueOf(events));
+        assertEquals(Level.INFO, refusals.getFirst().getLevel(), "its level is unchanged");
+        assertTrue(events.stream().noneMatch(event -> event.getLevel() == Level.ERROR), String.valueOf(events));
+    }
+
+    /**
+     * (L3) Protocol parameters unusable at the cycle start: {@code error 1} for the stage, in ONE ERROR line that
+     * names role C and the cause chain with no throwable, and one DEBUG event that carries it. No candidate is
+     * walked, so nothing else is counted.
+     */
+    @Test
+    void unusableParametersAtCycleStartCountOneErrorInOneErrorLine() {
+        Wiring wiring = tokenPrincipalConvertEconomicsWiringWithExecutorParams(tokenBehindTheAdaFloorWallet(),
+                throwingParams());
+        StageTally tally = new StageTally();
+
+        List<ILoggingEvent> events = cycleLoggedAtDebug(wiring.executor(), NOW, tally);
+
+        assertEquals(List.of(0, 0, 0, 1, 0), counts(tally), "error 1, nothing else");
+        List<ILoggingEvent> errors = events.stream().filter(event -> event.getLevel() == Level.ERROR).toList();
+        assertEquals(1, errors.size(), String.valueOf(events));
+        String line = errors.getFirst().getFormattedMessage();
+        assertTrue(line.contains("role C") && line.contains("cannot be sized") && line.contains(BLOCKFROST_TIMEOUT),
+                line);
+        assertNull(errors.getFirst().getThrowableProxy(), "no throwable on the ERROR line");
+        assertEquals(1, stackTracesAtDebug(events, "cannot be sized").size(), String.valueOf(events));
     }
 
     // ======================================================================================
@@ -3576,7 +3953,7 @@ class LiquidationExecutorTest {
     void anUnreadableLoanMakesTheScanLineSayTheHistogramIsContaminated() {
         Scenario honest = scenario(FAT_FEE_PER_MILLE);
         Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
-                allUnspent(List.of(honest)), List.of(WALLET_UTXO), noOracle(), false);
+                allUnspent(List.of(honest)), shaped(WALLET_UTXO), noOracle(), false);
         wiring.scanner().unreadable = 2;
 
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
@@ -3611,7 +3988,7 @@ class LiquidationExecutorTest {
     void aFullyReadableLoanPopulationSaysSoPositively() {
         Scenario honest = scenario(FAT_FEE_PER_MILLE);
         Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
-                allUnspent(List.of(honest)), List.of(WALLET_UTXO), noOracle(), false);
+                allUnspent(List.of(honest)), shaped(WALLET_UTXO), noOracle(), false);
 
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
@@ -3637,80 +4014,34 @@ class LiquidationExecutorTest {
     // ======================================================================================
 
     /**
-     * ⛔ <b>The live refusal named ONE of TWO gates and offered a remedy that does not work.</b>
-     * <p>
-     * It said <i>"fund the wallet with one ada-only utxo of at least that amount"</i>, where "that
-     * amount" was the fee ceiling. Doing exactly that clears the spend gate and then fails the
-     * <b>collateral</b> one, which T-050 made a separate selection with a separate — and larger —
-     * ceiling, summed across several utxos rather than found in one. The operator spends a funding
-     * transaction and returns to the same message.
-     * <p>
-     * <b>A remedy is a claim.</b> If a message tells you what to do, doing it must be sufficient, or
-     * the message must say it is not.
+     * ⛔ <b>A too-small U is refused by NAME, before anything is built</b> (FAB-185, replacing T-061's
+     * two-gate refusal). The collateral is no longer a total summed across several utxos — it is C, one
+     * output the rebalancer keeps at exactly {@code WalletShape.collateralLovelace} — so the only figure a
+     * plain refusal can honestly state is U's own: which output, what it holds, what it needed and by how
+     * much it fell short. <b>A remedy is a claim</b>: an operator who tops U up by that shortfall clears it.
      */
     @Test
-    void aWalletRefusalNamesBothTheSpendAndTheCollateralGate() {
+    void aTooSmallURefusalNamesTheRoleItsOutputWhatItHoldsAndWhatWasNeeded() {
         Utxo tiny = LoanFixtures.adaUtxo("77".repeat(32), 0, ACCOUNT.baseAddress(), 1_000_000L);
         Scenario honest = scenario(FAT_FEE_PER_MILLE);
+        LiquidateTransactionBuilder builder = mock(LiquidateTransactionBuilder.class);
         Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
-                allUnspent(List.of(honest)), List.of(tiny), noOracle(), false);
+                allUnspent(List.of(honest)), shaped(tiny), noOracle(), false, false,
+                LoanFixtures.protocolParams(), null, builder, metrics());
 
         wiring.executor().cycle(NOW);
 
         LiquidationDecision decision = onlyDecision(wiring);
         assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
+        assertEquals("WALLET_INPUT_TOO_SMALL", decision.reason(), decision.detail());
         String detail = decision.detail();
-        assertTrue(detail.contains("(1) SPEND INPUT"),
-                "the spend gate must be named: " + detail);
-        assertTrue(detail.contains("(2) COLLATERAL"),
-                "THE COLLATERAL GATE MUST BE NAMED TOO — funding for the first does not satisfy it: "
-                        + detail);
-        assertTrue(detail.contains("TOTAL across"),
-                "and it must say the collateral requirement is a TOTAL across utxos, not a single "
-                        + "utxo like the spend gate — an operator who reads it as 'one more utxo of "
-                        + "that size' is back where they started: " + detail);
-        assertFalse(detail.contains("Fund the wallet with one ada-only utxo of at least that amount"),
-                "the old single-gate remedy must be gone, not merely supplemented: " + detail);
-    }
-
-    /**
-     * ⚠ The other half, and it is the one that keeps the message honest: <b>it may only name gates it
-     * has actually evaluated.</b> With the protocol parameters unavailable neither ceiling can be
-     * sized, so the refusal must say so rather than print a plausible figure. <b>Listing a
-     * requirement nobody computed is a worse failure than listing too few</b>, because an operator
-     * cannot tell a measured number from an invented one.
-     */
-    @Test
-    void withNoProtocolParametersTheRefusalNamesNoFiguresRatherThanGuessing() {
-        String detail = LiquidationExecutor.walletDiagnosis(
-                List.of(LoanFixtures.adaUtxo("88".repeat(32), 0, ACCOUNT.baseAddress(), 1_000_000L)),
-                Optional.empty(), Optional.empty(), BigInteger.ZERO);
-
-        assertTrue(detail.contains("could not be fetched")
-                        && detail.contains("names no figure rather than guessing one"),
-                "it must say WHY no figure is given, not merely omit one — an omission reads as "
-                        + "'no requirement', which is the opposite of the truth: " + detail);
-        assertTrue(detail.contains("1000000"),
-                "what it CAN see — the largest nominable holding — is still reported: " + detail);
-        assertFalse(detail.contains("(1) SPEND INPUT") || detail.contains("(2) COLLATERAL"),
-                "it must not present numbered gates whose figures it never computed: " + detail);
-    }
-
-    /**
-     * And the collateral gate states a TOTAL across a bounded number of utxos, because that is what
-     * {@code collateralInputsFor} actually does. Reporting it as a single-utxo requirement would be
-     * the same masking defect wearing a second gate's name.
-     */
-    @Test
-    void theCollateralGateIsReportedAsATotalAcrossABoundedNumberOfUtxos() {
-        String gate = LiquidationExecutor.collateralGate(
-                List.of(LoanFixtures.adaUtxo("99".repeat(32), 0, ACCOUNT.baseAddress(), 2_000_000L),
-                        LoanFixtures.adaUtxo("aa".repeat(32), 0, ACCOUNT.baseAddress(), 3_000_000L)),
-                Optional.of(LoanFixtures.protocolParams().getProtocolParams()));
-
-        assertTrue(gate.contains("TOTAL across"), gate);
-        assertTrue(gate.contains("5000000"),
-                "the available total must be the SUM of nominable utxos, not the largest: " + gate);
+        assertTrue(detail.startsWith("role U, wallet output " + "77".repeat(32) + "#0, holds 1000000 lovelace"),
+                "the role, its output and what it holds: " + detail);
+        BigInteger feeCeiling = LedgerCeilings.maxPossibleFee(LoanFixtures.protocolParams().getProtocolParams());
+        assertTrue(detail.contains("needed " + feeCeiling + " lovelace"), "what was needed: " + detail);
+        assertTrue(detail.contains("short by " + feeCeiling.subtract(BigInteger.valueOf(1_000_000L))),
+                "and the shortfall: " + detail);
+        verify(builder, never()).build(any());
     }
 
     /**
@@ -3768,13 +4099,13 @@ class LiquidationExecutorTest {
     void theBuiltTransactionsWindowFollowsTheChainTipNotTheWallClock() throws Exception {
         Scenario honest = scenario(FAT_FEE_PER_MILLE);
         Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
-                allUnspent(List.of(honest)), List.of(WALLET_UTXO), noOracle(), false);
+                allUnspent(List.of(honest)), shaped(WALLET_UTXO), noOracle(), false);
 
         // The chain sits 157 seconds behind wall clock — the measured gap that caused the first live
         // rejection (tx 8062f42d…, OutsideValidityIntervalUTxO, a 182-slot preview block gap).
         long laggingSlot = LoanFixtures.converters().time().toSlot(java.time.LocalDateTime.ofInstant(
                 java.time.Instant.ofEpochMilli(NOW - 157_000L), java.time.ZoneOffset.UTC));
-        wiring.blockEventListener().getLastAppliedSlot().set(laggingSlot);
+        wiring.blockEventListener().getLastCommittedSlot().set(laggingSlot);
 
         wiring.executor().cycle(NOW);
 
@@ -3819,7 +4150,7 @@ class LiquidationExecutorTest {
     void aConvertCandidateIsRecordedAsConvertAndNotAsAPlainLiquidate() {
         Scenario convert = convertScenario(FAT_FEE_PER_MILLE);
         Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(convert.assessment()), List.of(convert),
-                allUnspent(List.of(convert)), List.of(WALLET_UTXO), noOracle(), false);
+                allUnspent(List.of(convert)), shaped(WALLET_UTXO), noOracle(), false);
 
         wiring.executor().cycle(NOW);
 
@@ -3834,7 +4165,7 @@ class LiquidationExecutorTest {
     void aPlainCandidateIsStillRecordedAsAPlainLiquidate() {
         Scenario honest = scenario(FAT_FEE_PER_MILLE);
         Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
-                allUnspent(List.of(honest)), List.of(WALLET_UTXO), noOracle(), false);
+                allUnspent(List.of(honest)), shaped(WALLET_UTXO), noOracle(), false);
 
         wiring.executor().cycle(NOW);
 
@@ -3863,7 +4194,7 @@ class LiquidationExecutorTest {
         Scenario convert = convertScenario(FAT_FEE_PER_MILLE);
 
         Wiring wiring = wiring(configuration, List.of(convert.assessment()), List.of(convert),
-                allUnspent(List.of(convert)), List.of(WALLET_UTXO), noOracle(), false);
+                allUnspent(List.of(convert)), shaped(WALLET_UTXO), noOracle(), false);
         wiring.executor().cycle(NOW);
 
         LiquidationDecision decision = onlyDecision(wiring);
@@ -3927,6 +4258,7 @@ class LiquidationExecutorTest {
      */
     private static final class CapturingConvertRouter extends ConvertLiquidationRouter {
         Utxo captured;
+        boolean reached;
         private final BigInteger requiredLovelace;
         CapturingConvertRouter(long requiredLovelace) {
             super(null, null, null, null, null, null, null, null);
@@ -3936,23 +4268,24 @@ class LiquidationExecutorTest {
         public Transaction buildConvertLiquidation(LiquidationAssessment assessment, Utxo loanUtxo,
                                                     Utxo bondUtxo, Utxo configUtxo, Utxo lmConfigUtxo,
                                                     Function<BigInteger, Optional<Utxo>> walletSelector,
+                                                    Utxo collateralUtxo,
                                                     Map<String, OracleEntry> oracles,
                                                     String changeAddress, long validFromMillis, long validToMillis) {
+            reached = true;
             captured = walletSelector.apply(requiredLovelace).orElse(null);
             throw new RuntimeException("captured the wallet input; nothing past this point is under test");
         }
     }
 
     /**
-     * ⛔ The regression the slice-3 round-2 audit caught, pinned. fbcf6b1 made the cycle's wallet list
-     * the UNFILTERED listing (so the token path could see multi-asset utxos), and the convert hand-off
-     * — {@code walletUtxos.get(0)}, untouched — silently became "the first utxo Blockfrost returns".
-     * Blockfrost lists ascending, so that is the OLDEST utxo at the bot's address: the published
-     * reference scripts. A convert would have spent {@code loan_claim_action}'s reference script.
+     * ⛔ The regression the slice-3 round-2 audit caught, pinned, under FAB-185's role rules. fbcf6b1 made
+     * the cycle's wallet list the UNFILTERED listing, and the convert hand-off — {@code walletUtxos.get(0)},
+     * untouched — silently became "the first utxo Blockfrost returns": the OLDEST utxo at the bot's
+     * address, the published reference scripts. A convert would have spent {@code loan_claim_action}'s
+     * reference script.
      *
-     * <p>The listing here puts a reference-script utxo FIRST on purpose; the captured input must be
-     * the ada-only one. Mutant: hand the router {@code walletUtxos.get(0)} again — this test fails with
-     * the reference-script hash in the message.
+     * <p>The listing here puts a LARGER reference-script utxo FIRST on purpose; the captured input must be
+     * U, the largest ADA-ONLY output — never the reference script and never C.
      *
      * <p>⚠ {@code convertScenario} is ada collateral, which {@link ConvertLiquidationRouter} (~line
      * 332, FAB-117) refuses before any wallet selection in production. This test reaches the sized
@@ -3961,10 +4294,10 @@ class LiquidationExecutorTest {
      * production would ever get this far on ada collateral.
      */
     @Test
-    void theConvertRouteIsHandedANominableWalletUtxoNeverTheFirstRawOne() {
+    void theConvertRouteIsHandedUNeverTheFirstRawOneNorC() {
         Utxo refScriptUtxo = Utxo.builder().txHash("f9".repeat(32)).outputIndex(0)
                 .address(ACCOUNT.baseAddress())
-                .amount(List.of(Amount.lovelace(BigInteger.valueOf(30_000_000L))))
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(900_000_000L))))
                 .referenceScriptHash("9ae63b26c98d90024a45f9cdb57e4154f72144d44325f0a261b8bc1d").build();
         AppConfig.LiquidationConfiguration configuration = new AppConfig.LiquidationConfiguration(
                 AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, SMALL_MARGIN, 200);
@@ -3987,7 +4320,7 @@ class LiquidationExecutorTest {
         // The order overhead a token-collateral convert carries — what the real router asks for.
         CapturingConvertRouter capturing = new CapturingConvertRouter(4_000_000L);
         LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
-                new FakeAppUtxoService(List.of(refScriptUtxo, WALLET_UTXO)), ACCOUNT, scanner, resolver, plainBuilder,
+                new FakeAppUtxoService(shaped(refScriptUtxo, WALLET_UTXO)), ACCOUNT, scanner, resolver, plainBuilder,
                 payInAdvanceRouter, capturing, LoanFixtures.registry(), log, metrics(), oracles,
                 previewNetwork(), LoanFixtures.protocolParams(), LoanFixtures.converters(),
                 EXPLODING_SUBMITTER);
@@ -3997,29 +4330,27 @@ class LiquidationExecutorTest {
                 "the CONVERT route was handed the published REFERENCE-SCRIPT utxo as its wallet input: "
                         + capturing.captured.getTxHash() + "#" + capturing.captured.getOutputIndex());
         assertEquals(WALLET_UTXO.getTxHash(), capturing.captured.getTxHash(),
-                "the convert route must receive a NOMINABLE utxo");
+                "the convert route must receive U, the largest ADA-ONLY output");
     }
 
     /**
-     * ⛔ <b>NOMINABLE IS NOT ENOUGH — the input must also be big enough for the order.</b>
-     *
-     * <p>The previous test would pass against "the first nominable utxo", which is what the hand-off
-     * was before this slice. This one cannot: the first nominable utxo in the listing holds 5 ADA and
-     * the convert order needs 60, so a first-match selection returns the small one and a SIZED
-     * selection returns the large one. Together the two tests pin both halves — nominability and size —
-     * and the mutant that reverts either is failed by one of them.
+     * ⛔ <b>U IS NOT ENOUGH — it must also be big enough for the order</b> (FAB-185, replacing the T-052
+     * "smallest nominable utxo large enough" test). The listing puts a smaller ada-only output FIRST: an
+     * order of 60 ADA is handed U (200 ADA) — never that smaller output, never C — and an order U cannot
+     * cover together with the fee ceiling is handed NOTHING: no other output is offered in U's place.
      *
      * <p>⚠ An ADA-collateral convert is what makes this matter: its {@code orderLovelace} is the whole
      * swappable amount PLUS the Minswap overhead, not the overhead alone, so it can be arbitrarily
-     * larger than any fixed headroom the old hand-off happened to have.
+     * larger than any fixed headroom.
      */
-    @Test
-    void theConvertRouteNominatesAWalletUtxoLargeEnoughForTheOrderNotMerelyTheFirstNominableOne() {
-        Utxo tooSmall = LoanFixtures.adaUtxo("ab".repeat(32), 0, ACCOUNT.baseAddress(), 5_000_000L);
+    @ParameterizedTest
+    @ValueSource(longs = {60_000_000L, 199_000_000L})
+    void theConvertRouteIsHandedUOnlyWhenItCoversTheOrderAndTheFeeCeiling(long order) {
+        Utxo smaller = LoanFixtures.adaUtxo("ab".repeat(32), 0, ACCOUNT.baseAddress(), 150_000_000L);
         AppConfig.LiquidationConfiguration configuration = new AppConfig.LiquidationConfiguration(
                 AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, SMALL_MARGIN, 200);
         Scenario convert = convertScenario(FAT_FEE_PER_MILLE);
-        List<Utxo> universe = List.of(CONFIG_UTXO, LM_CONFIG_UTXO, tooSmall, WALLET_UTXO,
+        List<Utxo> universe = List.of(CONFIG_UTXO, LM_CONFIG_UTXO, smaller, WALLET_UTXO,
                 convert.loan().utxo(), convert.bond().utxo());
         LiquidateTransactionBuilder plainBuilder = new LiquidateTransactionBuilder(LoanFixtures.registry(),
                 LoanFixtures.NETWORK, LoanFixtures.converters(), LoanFixtures.utxoSupplier(universe),
@@ -4033,19 +4364,25 @@ class LiquidationExecutorTest {
                 LoanFixtures.registry(), LoanFixtures.converters(), configuration,
                 new LiquidatePayInAdvanceTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
                         LoanFixtures.utxoSupplier(universe), LoanFixtures.protocolParams()));
-        // 60 ADA: more than the 5 ADA utxo listed FIRST, less than the 200 ADA one listed second.
-        CapturingConvertRouter capturing = new CapturingConvertRouter(60_000_000L);
+        CapturingConvertRouter capturing = new CapturingConvertRouter(order);
         LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
-                new FakeAppUtxoService(List.of(tooSmall, WALLET_UTXO)), ACCOUNT, scanner, resolver,
+                new FakeAppUtxoService(shaped(smaller, WALLET_UTXO)), ACCOUNT, scanner, resolver,
                 plainBuilder, payInAdvanceRouter, capturing, LoanFixtures.registry(), log, metrics(), noOracle(),
                 previewNetwork(), LoanFixtures.protocolParams(), LoanFixtures.converters(),
                 EXPLODING_SUBMITTER);
         executor.cycle(NOW);
 
-        assertNotNull(capturing.captured, "the convert route was never reached");
-        assertEquals(WALLET_UTXO.getTxHash(), capturing.captured.getTxHash(),
-                "the convert route nominated the FIRST nominable utxo (5 ADA) for an order needing "
-                        + "60 ADA; the nomination must be sized to the order, not to list position");
+        BigInteger needed = WalletRoles.convertRequired(BigInteger.valueOf(order),
+                LedgerCeilings.maxPossibleFee(LoanFixtures.protocolParams().getProtocolParams()));
+        assertTrue(capturing.reached, "the convert route was never reached");
+        if (needed.compareTo(LedgerCeilings.lovelaceOf(WALLET_UTXO)) <= 0) {
+            assertNotNull(capturing.captured, "U covers " + needed + " and must be offered");
+            assertEquals(WALLET_UTXO.getTxHash(), capturing.captured.getTxHash(),
+                    "the convert route must be handed U, not the first or a smaller output");
+        } else {
+            assertNull(capturing.captured, "U cannot cover " + needed + ", and nothing may be offered in its "
+                    + "place — not the smaller output, not C");
+        }
     }
 
     // ===== a VERDICT on the convert route is recorded at INFO, never logged as machinery =====
@@ -4062,6 +4399,7 @@ class LiquidationExecutorTest {
         public Transaction buildConvertLiquidation(LiquidationAssessment assessment, Utxo loanUtxo,
                                                     Utxo bondUtxo, Utxo configUtxo, Utxo lmConfigUtxo,
                                                     Function<BigInteger, Optional<Utxo>> walletSelector,
+                                                    Utxo collateralUtxo,
                                                     Map<String, OracleEntry> oracles,
                                                     String changeAddress, long validFromMillis, long validToMillis) {
             calls++;
@@ -4088,7 +4426,7 @@ class LiquidationExecutorTest {
                         LoanFixtures.utxoSupplier(universe), LoanFixtures.protocolParams()));
         ThrowingConvertRouter router = new ThrowingConvertRouter(toThrow);
         LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
-                new FakeAppUtxoService(List.of(WALLET_UTXO)), ACCOUNT,
+                new FakeAppUtxoService(shaped(WALLET_UTXO)), ACCOUNT,
                 new FakeScanner(List.of(convert.assessment())),
                 new FakeResolver(allUnspent(List.of(convert))), plainBuilder, payInAdvanceRouter,
                 router, LoanFixtures.registry(), log, metrics(), noOracle(), previewNetwork(),
@@ -4150,12 +4488,15 @@ class LiquidationExecutorTest {
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
         appender.start();
+        Level previousLevel = logger.getLevel();
+        logger.setLevel(Level.DEBUG);
         logger.addAppender(appender);
         try {
             wiring.executor().cycle(NOW);
             wiring.executor().cycle(NOW + 60_000L);
         } finally {
             logger.detachAppender(appender);
+            logger.setLevel(previousLevel);
         }
 
         assertEquals(2, wiring.router().calls, "retried on the very next cycle, not held");
@@ -4179,7 +4520,10 @@ class LiquidationExecutorTest {
         assertEquals(2, errors.size(), "ERROR on each cycle, never WARN: " + appender.list);
         assertTrue(errors.getFirst().getFormattedMessage().contains("SocketTimeoutException"),
                 errors.getFirst().getFormattedMessage());
-        assertNotNull(errors.getFirst().getThrowableProxy(), "the exception itself is attached");
+        // FAB-195: the stack trace goes to DEBUG, never on the ERROR line.
+        assertNull(errors.getFirst().getThrowableProxy(), "the ERROR line carries no throwable");
+        assertEquals(2, stackTracesAtDebug(appender.list, "failed reading the local pool index").size(),
+                "one DEBUG event per cycle carries the exception itself: " + appender.list);
     }
 
     /**
@@ -4287,7 +4631,7 @@ class LiquidationExecutorTest {
                         LoanFixtures.utxoSupplier(universe), LoanFixtures.protocolParams()));
         CycleCountingConvertRouter router = new CycleCountingConvertRouter();
         LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
-                new FakeAppUtxoService(List.of(WALLET_UTXO)), ACCOUNT,
+                new FakeAppUtxoService(shaped(WALLET_UTXO)), ACCOUNT,
                 new FakeScanner(List.of(convert.assessment())),
                 new FakeResolver(allUnspent(List.of(convert))), plainBuilder, payInAdvanceRouter,
                 router, LoanFixtures.registry(), new LiquidationDecisionLog(configuration), metrics(),
@@ -4323,7 +4667,7 @@ class LiquidationExecutorTest {
         CountingOracleProvider oracles = new CountingOracleProvider(
                 new FakeOracleClient(List.of()), new FakeOracleClient(List.of()));
         Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(cheap.assessment(), rich.assessment()),
-                both, allUnspent(both), List.of(WALLET_UTXO, WALLET_UTXO_SMALL), oracles, false, false,
+                both, allUnspent(both), shaped(WALLET_UTXO, WALLET_UTXO_SMALL), oracles, false, false,
                 LoanFixtures.protocolParams(), null, builder, metrics());
 
         List<ILoggingEvent> events = cyclesLogged(wiring, 1);
@@ -4429,7 +4773,7 @@ class LiquidationExecutorTest {
                 new FakeOracleClient(List.of()), new FakeOracleClient(List.of()));
         Wiring wiring = wiring(shadow(SMALL_MARGIN),
                 List.of(cheap.assessment(), unpriced.assessment(), rich.assessment()),
-                all, allUnspent(all), List.of(WALLET_UTXO, WALLET_UTXO_SMALL), oracles, false, false,
+                all, allUnspent(all), shaped(WALLET_UTXO, WALLET_UTXO_SMALL), oracles, false, false,
                 LoanFixtures.protocolParams(), null, builder, metrics());
 
         List<ILoggingEvent> events = cyclesLogged(wiring, 1);
@@ -4504,7 +4848,7 @@ class LiquidationExecutorTest {
         CountingOracleProvider oracles = new CountingOracleProvider(new FakeOracleClient(List.of()), rankingClient);
         Wiring wiring = wiring(shadow(SMALL_MARGIN),
                 List.of(throwing.assessment(), cheap.assessment(), rich.assessment()),
-                all, allUnspent(all), List.of(WALLET_UTXO, WALLET_UTXO_SMALL), oracles, false, false,
+                all, allUnspent(all), shaped(WALLET_UTXO, WALLET_UTXO_SMALL), oracles, false, false,
                 LoanFixtures.protocolParams(), null, builder, metrics());
 
         List<ILoggingEvent> events = cyclesLogged(wiring, 1);
@@ -4553,7 +4897,7 @@ class LiquidationExecutorTest {
 
         List<Scenario> one = List.of(cheap);
         Wiring single = wiring(shadow(SMALL_MARGIN), List.of(cheap.assessment()), one, allUnspent(one),
-                List.of(WALLET_UTXO, WALLET_UTXO_SMALL),
+                shaped(WALLET_UTXO, WALLET_UTXO_SMALL),
                 new CountingOracleProvider(new FakeOracleClient(List.of()), new FakeOracleClient(List.of())),
                 false, false, LoanFixtures.protocolParams(), null, builder, metrics());
         List<ILoggingEvent> singleEvents = cyclesLogged(single, 1);
@@ -4564,11 +4908,708 @@ class LiquidationExecutorTest {
 
         List<Scenario> two = List.of(cheap, rich);
         Wiring pair = wiring(shadow(SMALL_MARGIN), List.of(cheap.assessment(), rich.assessment()), two,
-                allUnspent(two), List.of(WALLET_UTXO, WALLET_UTXO_SMALL),
+                allUnspent(two), shaped(WALLET_UTXO, WALLET_UTXO_SMALL),
                 new CountingOracleProvider(new FakeOracleClient(List.of()), new FakeOracleClient(List.of())),
                 false, false, LoanFixtures.protocolParams(), null, builder, metrics());
         List<ILoggingEvent> pairEvents = cyclesLogged(pair, 1);
         assertEquals(1, liquidationOrderLines(pairEvents).size(),
                 "two candidates: exactly one order line: " + pairEvents);
+    }
+
+    // ======================================================================================
+    // FAB-183: the window starts no earlier than the newest feed the transaction carries
+    // ======================================================================================
+
+    /** The preview slot whose start is {@code millis} (every instant used below is a whole second). */
+    private static long slotAt(long millis) {
+        return LoanFixtures.converters().time().toSlot(java.time.LocalDateTime.ofInstant(
+                java.time.Instant.ofEpochMilli(millis), java.time.ZoneOffset.UTC));
+    }
+
+    private static long millisOfSlot(long slot) {
+        return LoanFixtures.converters().slot().slotToTime(slot).toInstant(java.time.ZoneOffset.UTC)
+                .toEpochMilli();
+    }
+
+    /** {@link #collateralOracle()} with its feed opening at {@code validFrom} (a realistic 10-minute window). */
+    private static OracleEntry collateralOracleOpeningAt(long validFrom) {
+        return LoanFixtures.charli3(COLLATERAL_TOKEN, ORACLE_TOKEN, ORACLE_CREDENTIAL,
+                OraclePriceFeed.priceDataCharlie(COLLATERAL_TOKEN, BigInteger.valueOf(50), BigInteger.ONE,
+                        validFrom, validFrom + 600_000L),
+                LoanFixtures.input(TX_ORACLE_NFT, 0), LoanFixtures.input(TX_ORACLE_SCRIPT, 0),
+                LoanFixtures.input(TX_CHARLI3_PROVIDER, 0));
+    }
+
+    /** {@link #tokenScenario()}'s token-collateral loan behind a CONVERT bond — the two convert-bond routes. */
+    private static Scenario tokenConvertScenario() {
+        Scenario plain = tokenScenario();
+        LoanFixtures.BondUtxo bond = LoanFixtures.bondUtxo(TX_BOND, 0, LOAN_ID,
+                LoanFixtures.convertToPrincipalBondDatum(FAT_FEE_PER_MILLE,
+                        LoanFixtures.inlineKeyStakeCredential(STAKE_KEY), AssetType.ada()),
+                2_000_000L);
+        return new Scenario(plain.loan(), bond, LoanFixtures.assess(bond.bond(), plain.loan().loan(),
+                OraclePriceFeed.unit(), collateralFeed(), VALID_FROM));
+    }
+
+    /** Records the window start the pay-in-advance route is handed, then stops the build. */
+    private static final class WindowCapturingPayInAdvanceRouter extends PayInAdvanceLiquidationRouter {
+        Long validFrom;
+        Long validTo;
+        WindowCapturingPayInAdvanceRouter(AppConfig.LiquidationConfiguration configuration, List<Utxo> universe) {
+            super(LoanFixtures.registry(), LoanFixtures.converters(), configuration,
+                    new LiquidatePayInAdvanceTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
+                            LoanFixtures.utxoSupplier(universe), LoanFixtures.protocolParams()));
+        }
+        @Override
+        Transaction buildConvertLiquidation(LiquidationAssessment assessment, Utxo loanUtxo, Utxo bondUtxo,
+                                            Utxo configUtxo, Utxo lmConfigUtxo,
+                                            Map<String, OracleEntry> oraclesByUnit, BigInteger principalBalance,
+                                            Function<BigInteger, Optional<Utxo>> walletSelector,
+                                            Utxo collateralUtxo, long validFromMillis, long validToMillis) {
+            validFrom = validFromMillis;
+            validTo = validToMillis;
+            throw new IllegalStateException("captured the window; the build is not under test here");
+        }
+    }
+
+    /** The convert route's twin of {@link WindowCapturingPayInAdvanceRouter}. */
+    private static final class WindowCapturingConvertRouter extends ConvertLiquidationRouter {
+        Long validFrom;
+        Long validTo;
+        WindowCapturingConvertRouter() {
+            super(null, null, null, null, null, null, null, null);
+        }
+        @Override
+        public Transaction buildConvertLiquidation(LiquidationAssessment assessment, Utxo loanUtxo,
+                                                    Utxo bondUtxo, Utxo configUtxo, Utxo lmConfigUtxo,
+                                                    Function<BigInteger, Optional<Utxo>> walletSelector,
+                                                    Utxo collateralUtxo,
+                                                    Map<String, OracleEntry> oracles,
+                                                    String changeAddress, long validFromMillis, long validToMillis) {
+            validFrom = validFromMillis;
+            validTo = validToMillis;
+            throw new IllegalStateException("captured the window; the build is not under test here");
+        }
+    }
+
+    /** What the plain builder, the pay-in-advance router and the convert router were each handed. */
+    private record WindowWiring(LiquidationExecutor executor, LiquidationDecisionLog log,
+                                BlockEventListener blockEventListener,
+                                java.util.concurrent.atomic.AtomicReference<LiquidateTransactionBuilder.Request> plain,
+                                WindowCapturingPayInAdvanceRouter payInAdvance,
+                                WindowCapturingConvertRouter convert) {
+
+        /** The window start handed to whichever route ran, or null if none was called. */
+        Long handedStart(String route) {
+            return switch (route) {
+                case "PLAIN" -> plain.get() == null ? null : plain.get().validFromMillis();
+                case "PAY_IN_ADVANCE" -> payInAdvance.validFrom;
+                case "CONVERT" -> convert.validFrom;
+                default -> throw new IllegalArgumentException(route);
+            };
+        }
+
+        Long handedEnd(String route) {
+            return switch (route) {
+                case "PLAIN" -> plain.get() == null ? null : plain.get().validToMillis();
+                case "PAY_IN_ADVANCE" -> payInAdvance.validTo;
+                case "CONVERT" -> convert.validTo;
+                default -> throw new IllegalArgumentException(route);
+            };
+        }
+
+        boolean noRouteCalled() {
+            return plain.get() == null && payInAdvance.validFrom == null && convert.validFrom == null;
+        }
+    }
+
+    /**
+     * One token-collateral candidate on {@code route}, every route a capturing fake, and the collateral feed
+     * opening at {@code feedValidFrom}. PLAIN is a plain bond; the two convert-bond routes are chosen the way
+     * an operator chooses them — the ada market listed as ANTICIPATE (pay-in-advance) or unlisted (convert).
+     */
+    private static WindowWiring windowWiring(String route, long feedValidFrom) {
+        boolean plainBond = route.equals("PLAIN");
+        AppConfig.LiquidationConfiguration configuration = route.equals("CONVERT")
+                ? new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.SHADOW, 60,
+                        120, 30, SMALL_MARGIN, 200)
+                : shadow(SMALL_MARGIN);
+        Scenario scenario = plainBond ? tokenScenario() : tokenConvertScenario();
+        List<Utxo> universe = List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO,
+                scenario.loan().utxo(), scenario.bond().utxo());
+
+        java.util.concurrent.atomic.AtomicReference<LiquidateTransactionBuilder.Request> plain =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        LiquidateTransactionBuilder plainBuilder = mock(LiquidateTransactionBuilder.class);
+        when(plainBuilder.build(any(LiquidateTransactionBuilder.Request.class))).thenAnswer(invocation -> {
+            plain.set(invocation.getArgument(0));
+            throw new IllegalStateException("captured the window; the build is not under test here");
+        });
+        WindowCapturingPayInAdvanceRouter payInAdvance = new WindowCapturingPayInAdvanceRouter(configuration,
+                universe);
+        WindowCapturingConvertRouter convert = new WindowCapturingConvertRouter();
+
+        FakeOracleClient client = new FakeOracleClient(List.of(collateralOracleOpeningAt(feedValidFrom)));
+        BlockEventListener blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+        LiquidationDecisionLog log = new LiquidationDecisionLog(configuration);
+        LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
+                new FakeAppUtxoService(shaped(WALLET_UTXO)), ACCOUNT,
+                new FakeScanner(List.of(scenario.assessment())),
+                new FakeResolver(allUnspent(List.of(scenario))), plainBuilder, payInAdvance, convert,
+                LoanFixtures.registry(), log, metrics(), new CountingOracleProvider(client, client),
+                previewNetwork(), LoanFixtures.protocolParams(), LoanFixtures.converters(), EXPLODING_SUBMITTER);
+        return new WindowWiring(executor, log, blockEventListener, plain, payInAdvance, convert);
+    }
+
+    /**
+     * ⛔ <b>EACH ROUTE IS HANDED THE CLAMPED START.</b> The chain's last committed block is five seconds
+     * behind wall clock (the anchor), and the collateral feed opened 10.5 s before it — inside the 30-second
+     * backdate. The base handed every route {@code anchor − 30 s}, before the feed opened, so the validator
+     * refused the price until a block landed 30 s after it. Now the start is the first whole slot at or after
+     * the feed's {@code validFrom}: {@code anchor − 10 s}, never past the anchor. {@code validTo} is
+     * unchanged, still wall clock plus the configured window.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"PLAIN", "PAY_IN_ADVANCE", "CONVERT"})
+    void eachRouteIsHandedAStartRaisedToTheNewestFeedsFirstWholeSlot(String route) {
+        long committedSlot = slotAt(NOW - 5_000L);
+        long anchor = millisOfSlot(committedSlot);
+        long feedValidFrom = anchor - 10_500L;
+        WindowWiring wiring = windowWiring(route, feedValidFrom);
+        wiring.blockEventListener().getLastCommittedSlot().set(committedSlot);
+
+        wiring.executor().cycle(NOW);
+
+        Long handed = wiring.handedStart(route);
+        assertNotNull(handed, route + " was never reached: " + wiring.log().newestFirst(10));
+        assertEquals(anchor - 10_000L, handed.longValue(),
+                "the first whole slot at or after the feed's validFrom " + feedValidFrom);
+        assertTrue(handed >= feedValidFrom, "the transaction must not open before the feed it carries");
+        assertTrue(handed <= anchor, "and must never open ahead of the chain");
+        assertNotEquals(anchor - 30_000L, handed.longValue(), "the base's floor, which the validator refused");
+        assertEquals(NOW + 120_000L, wiring.handedEnd(route).longValue(), "validTo is unchanged");
+    }
+
+    /**
+     * ⛔ <b>A FEED NEWER THAN THE CHAIN IS NOT BUILT THIS PASS.</b> Its {@code validFrom} lies two seconds
+     * past the anchor: no start is both at or after it and at or before the chain's position. The candidate
+     * is refused {@code ORACLE_FEED_NOT_YET_VALID} at INFO — a timing fact, not a fault — and no route is
+     * called; the held price is tried again on the next block.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"PLAIN", "PAY_IN_ADVANCE", "CONVERT"})
+    void aFeedOpeningAfterTheAnchorIsRefusedNotYetValidAndNoRouteIsCalled(String route) {
+        long committedSlot = slotAt(NOW - 5_000L);
+        long anchor = millisOfSlot(committedSlot);
+        WindowWiring wiring = windowWiring(route, anchor + 2_000L);
+        wiring.blockEventListener().getLastCommittedSlot().set(committedSlot);
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            wiring.executor().cycle(NOW);
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        assertTrue(wiring.noRouteCalled(), "nothing may be built for a start ahead of the chain");
+        List<LiquidationDecision> decisions = wiring.log().newestFirst(10);
+        assertEquals(1, decisions.size(), "exactly one decision: " + decisions);
+        LiquidationDecision decision = decisions.getFirst();
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome());
+        assertEquals("ORACLE_FEED_NOT_YET_VALID", decision.reason());
+        assertTrue(decision.detail().contains(String.valueOf(anchor + 2_000L)), "names the validFrom: "
+                + decision.detail());
+        assertTrue(decision.detail().contains(String.valueOf(anchor)), "names the anchor: " + decision.detail());
+        assertTrue(decision.detail().contains("2000 ms"), "names the gap: " + decision.detail());
+        assertTrue(decision.detail().contains("retried on the next block"), decision.detail());
+        assertTrue(appender.list.stream().anyMatch(event -> event.getLevel() == Level.INFO
+                        && event.getFormattedMessage().contains("retried on the next block")),
+                "logged at INFO: " + appender.list);
+        assertEquals(List.of(), appender.list.stream()
+                        .filter(event -> event.getLevel() == Level.ERROR || event.getLevel() == Level.WARN)
+                        .map(ILoggingEvent::getFormattedMessage).toList(),
+                "a feed newer than the chain is not a fault");
+    }
+
+    /**
+     * ⛔ <b>THE ANCHOR FOLLOWS THE COMMITTED BLOCK, NOT THE APPLIED ONE.</b> {@code lastAppliedSlot} is
+     * written inside the block's database transaction, before it commits; {@code lastCommittedSlot} only
+     * after. Here they disagree by 60 seconds — the applied one ahead — and no feed is fresh, so the start
+     * is exactly {@code committed − 30 s}.
+     */
+    @Test
+    void theWindowIsAnchoredToTheLastCommittedSlotNotTheLastAppliedOne() {
+        long committedSlot = slotAt(NOW - 100_000L);
+        long appliedSlot = slotAt(NOW - 40_000L);
+        WindowWiring wiring = windowWiring("PLAIN", NOW - 3_000_000L);
+        wiring.blockEventListener().getLastCommittedSlot().set(committedSlot);
+        wiring.blockEventListener().getLastAppliedSlot().set(appliedSlot);
+
+        wiring.executor().cycle(NOW);
+
+        Long handed = wiring.handedStart("PLAIN");
+        assertNotNull(handed, "the plain route was never reached: " + wiring.log().newestFirst(10));
+        assertEquals(millisOfSlot(committedSlot) - 30_000L, handed.longValue(),
+                "the start must be the COMMITTED block less 30 s");
+        assertNotEquals(millisOfSlot(appliedSlot) - 30_000L, handed.longValue(),
+                "anchoring to the applied slot would open the window on a block not yet stored");
+    }
+
+    /**
+     * FAB-183-2 audit residue (R1): the PRINCIPAL leg counts too. A token principal (USDM-shaped) against a
+     * token collateral, and it is the principal's feed that is the fresher one — it opened 10.5 s before the
+     * anchor, the collateral's 20.5 s before. Both sit inside the 30-second backdate, so the start must be
+     * raised to the NEWEST of them: the first whole slot at or after the principal feed's {@code validFrom}.
+     * Every other window test here lends ada, which is why dropping the principal leg from
+     * {@code nonAdaLegFeeds} used to survive the suite; here it would hand {@code anchor − 20 s} instead.
+     */
+    @Test
+    void aTokenPrincipalsFresherFeedRaisesTheStartAboveTheCollaterals() {
+        long committedSlot = slotAt(NOW - 5_000L);
+        long anchor = millisOfSlot(committedSlot);
+        long principalValidFrom = anchor - 10_500L;
+        long collateralValidFrom = anchor - 20_500L;
+
+        LoanDatum datum = LoanFixtures.loanDatum(PRINCIPAL_TOKEN_2, PRINCIPAL_TOKEN_2_ORACLE_NFT,
+                BigInteger.valueOf(2_000_000L), BigInteger.ZERO,
+                LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, ORACLE_TOKEN), LATE_LEND_DATE,
+                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+        LoanFixtures.LoanUtxo loan = LoanFixtures.loanUtxo(TX_LOAN, 0, LOAN_ID, datum, 2_000_000L,
+                List.of(LoanFixtures.token(COLLATERAL_TOKEN, 1_000_000L)));
+        LoanFixtures.BondUtxo bond = LoanFixtures.bondUtxo(TX_BOND, 0, LOAN_ID,
+                LoanFixtures.bondDatum(FAT_FEE_PER_MILLE, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY),
+                        PRINCIPAL_TOKEN_2),
+                2_000_000L);
+        Scenario scenario = new Scenario(loan, bond, LoanFixtures.assess(bond.bond(), loan.loan(),
+                principalFeed(), collateralFeed(), VALID_FROM));
+        OracleEntry freshPrincipal = LoanFixtures.charli3(PRINCIPAL_TOKEN_2, PRINCIPAL_TOKEN_2_ORACLE_NFT,
+                PRINCIPAL_TOKEN_2_CREDENTIAL, OraclePriceFeed.priceDataCharlie(PRINCIPAL_TOKEN_2,
+                        BigInteger.valueOf(5), BigInteger.ONE, principalValidFrom, principalValidFrom + 600_000L),
+                LoanFixtures.input(TX_PRINCIPAL_ORACLE_NFT, 0), LoanFixtures.input(TX_PRINCIPAL_ORACLE_SCRIPT, 0),
+                LoanFixtures.input(TX_PRINCIPAL_C3_PROVIDER, 0));
+
+        AppConfig.LiquidationConfiguration configuration = shadow(SMALL_MARGIN);
+        java.util.concurrent.atomic.AtomicReference<LiquidateTransactionBuilder.Request> handed =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        LiquidateTransactionBuilder plainBuilder = mock(LiquidateTransactionBuilder.class);
+        when(plainBuilder.build(any(LiquidateTransactionBuilder.Request.class))).thenAnswer(invocation -> {
+            handed.set(invocation.getArgument(0));
+            throw new IllegalStateException("captured the window; the build is not under test here");
+        });
+        FakeOracleClient client = new FakeOracleClient(List.of(freshPrincipal,
+                collateralOracleOpeningAt(collateralValidFrom)));
+        BlockEventListener blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+        blockEventListener.getLastCommittedSlot().set(committedSlot);
+        LiquidationDecisionLog log = new LiquidationDecisionLog(configuration);
+        LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
+                new FakeAppUtxoService(shaped(WALLET_UTXO)), ACCOUNT,
+                new FakeScanner(List.of(scenario.assessment())),
+                new FakeResolver(allUnspent(List.of(scenario))), plainBuilder,
+                new WindowCapturingPayInAdvanceRouter(configuration, List.of(CONFIG_UTXO, LM_CONFIG_UTXO,
+                        WALLET_UTXO, loan.utxo(), bond.utxo())),
+                new WindowCapturingConvertRouter(), LoanFixtures.registry(), log, metrics(),
+                new CountingOracleProvider(client, client), previewNetwork(), LoanFixtures.protocolParams(),
+                LoanFixtures.converters(), EXPLODING_SUBMITTER);
+
+        executor.cycle(NOW);
+
+        assertNotNull(handed.get(), "the plain route was never reached: " + log.newestFirst(10));
+        long start = handed.get().validFromMillis();
+        assertEquals(anchor - 10_000L, start,
+                "the first whole slot at or after the PRINCIPAL feed's validFrom " + principalValidFrom);
+        assertTrue(start >= principalValidFrom, "the transaction must not open before the principal feed");
+        assertTrue(start <= anchor, "and must never open ahead of the chain");
+        assertNotEquals(anchor - 20_000L, start, "the collateral feed alone, as if the principal leg were dropped");
+    }
+
+    /**
+     * The convert route's new window guard ({@code ConvertLiquidationRouter.FeedWindowException}) is a
+     * per-block timing fact, not machinery: recorded {@code CONVERT_FEED_WINDOW} at INFO, never ERROR, and
+     * reconsidered on the next cycle. The THROW side is pinned in {@code ConvertLiquidationRouterTest}.
+     */
+    @Test
+    void aConvertFeedWindowRefusalIsRecordedUnderItsOwnNameAtInfo() {
+        String detail = "the collateral feed window [1760000010000,1760001000000] does not cover the "
+                + "transaction window [1760000000000,1760000120000]";
+        ConvertWiring wiring = convertWiringThrowing(new ConvertLiquidationRouter.FeedWindowException(detail));
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            wiring.executor().cycle(NOW);
+            wiring.executor().cycle(NOW + 1_000L);
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        assertEquals(2, wiring.router().calls, "reconsidered on the next cycle, not held");
+        List<LiquidationDecision> decisions = wiring.log().newestFirst(10);
+        assertEquals(2, decisions.size());
+        for (LiquidationDecision decision : decisions) {
+            assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome());
+            assertEquals("CONVERT_FEED_WINDOW", decision.reason(),
+                    "its own name, not the exception class the generic catch would record");
+            assertEquals(detail, decision.detail());
+        }
+        assertEquals(2, appender.list.stream()
+                .filter(event -> event.getLevel() == Level.INFO)
+                .filter(event -> event.getFormattedMessage().contains("CONVERT_FEED_WINDOW"))
+                .count(), "INFO on each cycle: " + appender.list);
+        assertEquals(List.of(), appender.list.stream()
+                        .filter(event -> event.getLevel() == Level.ERROR)
+                        .map(ILoggingEvent::getFormattedMessage).toList(),
+                "a feed window is not a machinery fault");
+    }
+
+    // ======================================================================================
+    // FAB-183: the cycle-level lines say news at INFO, and repetition at DEBUG
+    // ======================================================================================
+
+    /** The heartbeat clock's origin; unrelated to the cycle's own {@link #NOW}, which it never feeds. */
+    private static final Instant HEARTBEAT_T0 = Instant.parse("2026-11-01T00:00:00Z");
+
+    private record Line(Level level, String text) {
+    }
+
+    /**
+     * Every line {@code action} logs, at every level, in order. The executor's logger is held at DEBUG for
+     * the duration — a Spring test earlier in the same JVM may have left it at INFO — and restored after.
+     */
+    private static List<Line> linesOf(Runnable action) {
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        Level previous = logger.getLevel();
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        logger.setLevel(Level.DEBUG);
+        try {
+            action.run();
+        } finally {
+            logger.setLevel(previous);
+            logger.detachAppender(appender);
+        }
+        return appender.list.stream()
+                .map(event -> new Line(event.getLevel(), event.getFormattedMessage()))
+                .toList();
+    }
+
+    /** One cycle at {@code now}, with the heartbeat clock standing at {@code at}. */
+    private static List<Line> cycleAt(Wiring wiring, long now, Instant at) {
+        wiring.executor().setClock(Clock.fixed(at, java.time.ZoneOffset.UTC));
+        return linesOf(() -> wiring.executor().cycle(now));
+    }
+
+    /** The one line of {@code lines} starting {@code prefix}, at whatever level it was said. */
+    private static Line onlyLineStarting(List<Line> lines, String prefix) {
+        List<Line> matching = lines.stream().filter(line -> line.text().startsWith(prefix)).toList();
+        assertEquals(1, matching.size(), () -> "exactly one '" + prefix + "' line: " + lines);
+        return matching.getFirst();
+    }
+
+    private static Line scanLineOf(List<Line> lines) {
+        return onlyLineStarting(lines, "liquidation scan:");
+    }
+
+    private static Line orderLineOf(List<Line> lines) {
+        return onlyLineStarting(lines, "liquidation order (most profitable first): ");
+    }
+
+    /**
+     * FAB-183: the stage now runs on every block. An unchanged world, under a heartbeat clock that does
+     * not move, says its scan line at INFO once; the next cycle says the SAME text at DEBUG.
+     */
+    @Test
+    void anUnchangedWorldSaysItsScanLineAtInfoOnceThenAtDebugWithTheSameText() {
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), scenario(FAT_FEE_PER_MILLE), false);
+
+        Line first = scanLineOf(cycleAt(wiring, NOW, HEARTBEAT_T0));
+        Line second = scanLineOf(cycleAt(wiring, NOW + 20_000L, HEARTBEAT_T0));
+
+        assertEquals(Level.INFO, first.level(), "the first scan line of an executor is news");
+        assertEquals(new Line(Level.DEBUG, first.text()), second,
+                "an unchanged world is said again at DEBUG, with the same text");
+        assertTrue(first.text().contains("1 buildable"), first.text());
+    }
+
+    /** FAB-183: the heartbeat. An unchanged scan line is said at INFO again once an hour has passed — not at 59 min. */
+    @Test
+    void anUnchangedScanLineIsSaidAtInfoAgainAfterAnHourAndNotBefore() {
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), scenario(FAT_FEE_PER_MILLE), false);
+
+        assertEquals(Level.INFO, scanLineOf(cycleAt(wiring, NOW, HEARTBEAT_T0)).level(), "the first");
+        assertEquals(Level.DEBUG, scanLineOf(cycleAt(wiring, NOW,
+                        HEARTBEAT_T0.plus(Duration.ofMinutes(59)))).level(),
+                "59 min after the last INFO scan line: not yet");
+        assertEquals(Level.INFO, scanLineOf(cycleAt(wiring, NOW, HEARTBEAT_T0.plus(Duration.ofHours(1)))).level(),
+                "1 h after the last INFO scan line: the heartbeat");
+        assertEquals(Level.DEBUG, scanLineOf(cycleAt(wiring, NOW,
+                        HEARTBEAT_T0.plus(Duration.ofHours(1)).plus(Duration.ofMinutes(59)))).level(),
+                "the hour is measured from the heartbeat itself");
+    }
+
+    /** FAB-183: a new exclusion changes the scan line, and is said at INFO that very cycle. */
+    @Test
+    void aChangedExclusionIsSaidAtInfoThatCycle() {
+        Scenario honest = scenario(FAT_FEE_PER_MILLE);
+        List<LiquidationAssessment> scanned = new ArrayList<>(List.of(honest.assessment()));
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), scanned, List.of(honest), false);
+
+        Line before = scanLineOf(cycleAt(wiring, NOW, HEARTBEAT_T0));
+        Line unchanged = scanLineOf(cycleAt(wiring, NOW, HEARTBEAT_T0));
+        scanned.add(LiquidationAssessment.excluded(honest.bond().bond(), honest.loan().loan(),
+                LiquidationExclusion.NOT_LIQUIDATABLE, "not late and currentLtv <= liquidationLtv"));
+        Line changed = scanLineOf(cycleAt(wiring, NOW, HEARTBEAT_T0));
+        Line again = scanLineOf(cycleAt(wiring, NOW, HEARTBEAT_T0));
+
+        assertEquals(Level.INFO, before.level());
+        assertEquals(Level.DEBUG, unchanged.level());
+        assertEquals(Level.INFO, changed.level(), "a new exclusion is news, with no wait for the heartbeat: "
+                + changed);
+        assertTrue(changed.text().contains("NOT_LIQUIDATABLE=1"), changed.text());
+        assertEquals(Level.DEBUG, again.level(), "and the new world, unchanged, is quiet again");
+    }
+
+    /** Two ranked candidates whose builds fail on purpose: only the order line is under test. */
+    private static Wiring rankedWiring(List<LiquidationAssessment> scanned) {
+        LiquidateTransactionBuilder builder = mock(LiquidateTransactionBuilder.class);
+        when(builder.build(any(LiquidateTransactionBuilder.Request.class)))
+                .thenThrow(new IllegalStateException("ordering probe: the build itself is not under test"));
+        List<Scenario> onChain = List.of(scenario(BigInteger.valueOf(100)), secondScenario());
+        return wiring(shadow(SMALL_MARGIN), scanned, onChain, allUnspent(onChain),
+                shaped(WALLET_UTXO, WALLET_UTXO_SMALL),
+                new CountingOracleProvider(new FakeOracleClient(List.of()), new FakeOracleClient(List.of())),
+                false, false, LoanFixtures.protocolParams(), null, builder, metrics());
+    }
+
+    /**
+     * FAB-183: the order line is news when the ORDER is. The same two refs in the same order with a new
+     * estimate for one of them — the 10-ada slice becoming a 20-ada one, still behind the 50-ada one —
+     * is said at DEBUG, with the new amounts in its text. An hour on, the same order is the heartbeat.
+     */
+    @Test
+    void theSameOrderWithNewAmountsIsSaidAtDebug() {
+        List<LiquidationAssessment> scanned = new ArrayList<>(List.of(
+                scenario(BigInteger.valueOf(100)).assessment(), secondScenario().assessment()));
+        Wiring wiring = rankedWiring(scanned);
+
+        Line first = orderLineOf(cycleAt(wiring, NOW, HEARTBEAT_T0));
+        scanned.set(0, scenario(BigInteger.valueOf(200)).assessment());
+        Line reprised = orderLineOf(cycleAt(wiring, NOW, HEARTBEAT_T0));
+        Line heartbeat = orderLineOf(cycleAt(wiring, NOW, HEARTBEAT_T0.plus(Duration.ofHours(1))));
+
+        assertEquals(new Line(Level.INFO, "liquidation order (most profitable first): "
+                + TX_LOAN_2 + "#0 ≈50000000 lovelace, " + TX_LOAN + "#0 ≈10000000 lovelace"), first);
+        assertEquals(new Line(Level.DEBUG, "liquidation order (most profitable first): "
+                        + TX_LOAN_2 + "#0 ≈50000000 lovelace, " + TX_LOAN + "#0 ≈20000000 lovelace"), reprised,
+                "same refs, same order, new amount: DEBUG, and the text still carries the new amount");
+        assertEquals(Level.INFO, heartbeat.level(), "an hour on, the unchanged order is the heartbeat");
+    }
+
+    /** FAB-183: a REORDERED order line is news, and is said at INFO that very cycle. */
+    @Test
+    void aReorderedOrderLineIsSaidAtInfo() {
+        List<LiquidationAssessment> scanned = new ArrayList<>(List.of(
+                scenario(BigInteger.valueOf(100)).assessment(), secondScenario().assessment()));
+        Wiring wiring = rankedWiring(scanned);
+
+        Line first = orderLineOf(cycleAt(wiring, NOW, HEARTBEAT_T0));
+        scanned.set(0, scenario(BigInteger.valueOf(900)).assessment());
+        Line reordered = orderLineOf(cycleAt(wiring, NOW, HEARTBEAT_T0));
+        Line unchanged = orderLineOf(cycleAt(wiring, NOW, HEARTBEAT_T0));
+
+        assertEquals(Level.INFO, first.level());
+        assertEquals(new Line(Level.INFO, "liquidation order (most profitable first): "
+                        + TX_LOAN + "#0 ≈90000000 lovelace, " + TX_LOAN_2 + "#0 ≈50000000 lovelace"), reordered,
+                "the 90-ada slice now leads: a different order, said at INFO with no wait");
+        assertEquals(Level.DEBUG, unchanged.level(), "and the new order, unchanged, is quiet again");
+    }
+
+    /** FAB-183: the syncing line is DEBUG, same text. */
+    @Test
+    void theSyncingLineIsDebug() {
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), scenario(FAT_FEE_PER_MILLE), true);
+
+        List<Line> lines = cycleAt(wiring, NOW, HEARTBEAT_T0);
+
+        assertEquals(List.of(new Line(Level.DEBUG, "node is syncing, skipping...")), lines.stream()
+                        .filter(line -> line.text().equals("node is syncing, skipping...")).toList(),
+                "said once, at DEBUG: " + lines);
+    }
+
+    /** FAB-183: the anchored line is DEBUG, same text. */
+    @Test
+    void theAnchoredLineIsDebug() {
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), scenario(FAT_FEE_PER_MILLE), false);
+        wiring.blockEventListener().getLastCommittedSlot().set(slotAt(NOW - 100_000L));
+
+        Line anchored = onlyLineStarting(cycleAt(wiring, NOW, HEARTBEAT_T0),
+                "validity window anchored to the last committed block (");
+
+        assertEquals(Level.DEBUG, anchored.level(), anchored.text());
+        assertTrue(anchored.text().endsWith(" ms behind wall clock) — invalidBefore would otherwise sit "
+                + "ahead of the node's current slot"), anchored.text());
+    }
+
+    // ======================================================================================
+    // FAB-185 — wallet roles: which output funds which route, and a missing role refused by name
+    // ======================================================================================
+
+    /** A token output for {@link #PRINCIPAL_TOKEN_2}: 3,000,000 of it beside 12 ADA — far smaller than U. */
+    private static final Utxo ROUTING_TOKEN_OUTPUT = LoanFixtures.utxo("d9".repeat(32), 0, ACCOUNT.baseAddress(),
+            List.of(Amount.lovelace(BigInteger.valueOf(12_000_000L)),
+                    Amount.asset(LoanFixtures.unit(PRINCIPAL_TOKEN_2), BigInteger.valueOf(3_000_000L))), null);
+
+    /** Applies the executor's selector for {@code payout}, records what it was handed, then stops the build. */
+    private static final class CapturingPayInAdvanceRouter extends PayInAdvanceLiquidationRouter {
+        final List<Utxo> handed = new ArrayList<>();
+        private final BigInteger payout;
+
+        CapturingPayInAdvanceRouter(AppConfig.LiquidationConfiguration configuration, BigInteger payout) {
+            super(LoanFixtures.registry(), LoanFixtures.converters(), configuration,
+                    new LiquidatePayInAdvanceTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
+                            LoanFixtures.utxoSupplier(List.of()), LoanFixtures.protocolParams()));
+            this.payout = payout;
+        }
+
+        @Override
+        Transaction buildConvertLiquidation(LiquidationAssessment assessment, Utxo loanUtxo, Utxo bondUtxo,
+                                            Utxo configUtxo, Utxo lmConfigUtxo,
+                                            Map<String, OracleEntry> oraclesByUnit, BigInteger principalBalance,
+                                            Function<BigInteger, Optional<Utxo>> walletSelector,
+                                            Utxo collateralUtxo, long validFromMillis, long validToMillis) {
+            handed.add(walletSelector.apply(payout).orElse(null));
+            throw new IllegalStateException("captured the wallet input; nothing past this point is under test");
+        }
+    }
+
+    /**
+     * (d) ROUTING, captured at each route's own seam: plain, convert and ADA-principal pay-in-advance are
+     * handed U; a token-principal pay-in-advance is handed its TOKEN output even though U is far larger; and
+     * C is never handed to any route. The wallet lists the token output and a smaller ada-only output BEFORE
+     * U, so neither list position nor "smallest sufficient" can produce these answers.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"PLAIN", "CONVERT", "ADA_PAY_IN_ADVANCE", "TOKEN_PAY_IN_ADVANCE"})
+    void eachRouteIsHandedItsOwnRoleOutputAndNeverC(String route) {
+        AppConfig.LiquidationConfiguration configuration = switch (route) {
+            case "CONVERT" -> new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                    60, 120, 30, SMALL_MARGIN, 200);
+            case "TOKEN_PAY_IN_ADVANCE" -> {
+                AppConfig.LiquidationConfiguration token = shadow(SMALL_MARGIN);
+                token.setMarkets(List.of(anticipateMarket(PRINCIPAL_TOKEN_2.toUnit(), 1_500_000_000L)));
+                yield token;
+            }
+            default -> shadow(SMALL_MARGIN);
+        };
+        Scenario scenario = switch (route) {
+            case "PLAIN" -> scenario(FAT_FEE_PER_MILLE);
+            case "TOKEN_PAY_IN_ADVANCE" -> tokenPrincipalConvertEconomicsScenario();
+            default -> convertScenario(FAT_FEE_PER_MILLE);
+        };
+        List<Utxo> wallet = shaped(ROUTING_TOKEN_OUTPUT, WALLET_UTXO_SMALL, WALLET_UTXO);
+        List<Utxo> handed = new ArrayList<>();
+        LiquidateTransactionBuilder plainBuilder = mock(LiquidateTransactionBuilder.class);
+        when(plainBuilder.build(any(LiquidateTransactionBuilder.Request.class))).thenAnswer(invocation -> {
+            handed.add(invocation.<LiquidateTransactionBuilder.Request>getArgument(0).walletUtxo());
+            throw new IllegalStateException("captured the wallet input; nothing past this point is under test");
+        });
+        CapturingPayInAdvanceRouter payInAdvanceRouter = new CapturingPayInAdvanceRouter(configuration,
+                route.equals("TOKEN_PAY_IN_ADVANCE") ? BigInteger.valueOf(1_600_000L) : BigInteger.valueOf(4_000_000L));
+        CapturingConvertRouter convertRouter = new CapturingConvertRouter(4_000_000L);
+        BlockEventListener blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+        LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
+                new FakeAppUtxoService(wallet), ACCOUNT, new FakeScanner(List.of(scenario.assessment())),
+                new FakeResolver(allUnspent(List.of(scenario))), plainBuilder, payInAdvanceRouter, convertRouter,
+                LoanFixtures.registry(), new LiquidationDecisionLog(configuration), metrics(), noOracle(),
+                previewNetwork(), LoanFixtures.protocolParams(), LoanFixtures.converters(), EXPLODING_SUBMITTER);
+
+        executor.cycle(NOW);
+
+        handed.addAll(payInAdvanceRouter.handed);
+        if (convertRouter.reached) {
+            handed.add(convertRouter.captured);
+        }
+        Utxo expected = route.equals("TOKEN_PAY_IN_ADVANCE") ? ROUTING_TOKEN_OUTPUT : WALLET_UTXO;
+        assertEquals(List.of(expected), handed, route + " is handed exactly its own role output");
+        Utxo c = wallet.getLast();
+        assertTrue(handed.stream().noneMatch(utxo -> utxo != null && utxo.getTxHash().equals(c.getTxHash())),
+                "C is never handed to any route");
+    }
+
+    /**
+     * (e) NO U. Every candidate designated to U gets its own {@code WALLET_ROLE_MISSING} row, starting
+     * {@code role U} and naming what the rebalancer last did — and the call says so at WARN exactly ONCE,
+     * however many candidates it refuses. Nothing is built.
+     */
+    @Test
+    void aMissingUIsRefusedByNameOnEveryCandidateAndWarnedOncePerCheck() {
+        Scenario first = scenario(FAT_FEE_PER_MILLE);
+        Scenario second = secondScenario();
+        List<Scenario> both = List.of(first, second);
+        LiquidateTransactionBuilder builder = mock(LiquidateTransactionBuilder.class);
+        // C, and a datum-carrying ada output that can never be U.
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(first.assessment(), second.assessment()), both,
+                allUnspent(both), shaped(WALLET_UTXO_WITH_DATUM), noOracle(), false, false,
+                LoanFixtures.protocolParams(), null, builder, metrics());
+        com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer rebalancer =
+                mock(com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.class);
+        when(rebalancer.lastOutcome()).thenReturn("REFUSED: a reference-script output keeps the wallet unshaped");
+        wiring.executor().setWalletRebalancer(rebalancer);
+
+        List<ILoggingEvent> events = cyclesLogged(wiring, 1);
+
+        List<LiquidationDecision> rows = wiring.log().newestFirst(10);
+        assertEquals(2, rows.size(), "one row per candidate: " + rows);
+        for (LiquidationDecision row : rows) {
+            assertEquals(LiquidationDecision.Outcome.REFUSED, row.outcome(), row.detail());
+            assertEquals("WALLET_ROLE_MISSING", row.reason(), row.detail());
+            assertTrue(row.detail().startsWith("role U"), row.detail());
+            assertTrue(row.detail().contains("the wallet rebalancer's last outcome: REFUSED: a reference-script "
+                    + "output keeps the wallet unshaped"), row.detail());
+        }
+        List<ILoggingEvent> warns = events.stream().filter(event -> event.getLevel() == Level.WARN)
+                .filter(event -> event.getFormattedMessage().contains("role U")).toList();
+        assertEquals(1, warns.size(), "exactly one WARN for the missing role in this check: " + warns);
+        assertTrue(warns.getFirst().getFormattedMessage().contains("a reference-script output keeps the wallet "
+                + "unshaped"), warns.toString());
+        verify(builder, never()).build(any());
+    }
+
+    /**
+     * (g) A token output below {@code WalletRoles.tokenOutputRequiredAda} — enough of the token, but 6 ADA
+     * beside it against a 7,905,077-lovelace ceiling (fee ceiling, lender min-ada, S-15 rider, change
+     * min-ada) — is refused {@code WALLET_INPUT_TOO_SMALL} naming the role, the output, what it holds and the
+     * shortfall, and nothing is built. Its 6 ADA still clears the market gate's 4.405 ADA floor, so the
+     * refusal is the role's, not the gate's.
+     */
+    @Test
+    void aTokenOutputBelowItsAdaCeilingIsRefusedNamingTheRoleAndTheShortfall() {
+        Utxo thinTokenOutput = LoanFixtures.utxo("da".repeat(32), 0, ACCOUNT.baseAddress(), List.of(
+                Amount.lovelace(BigInteger.valueOf(6_000_000L)),
+                Amount.asset(LoanFixtures.unit(PRINCIPAL_TOKEN_2), BigInteger.valueOf(3_000_000L))), null);
+        Wiring wiring = tokenPrincipalConvertEconomicsWiring(shaped(WALLET_UTXO, thinTokenOutput));
+
+        wiring.executor().cycle(NOW);
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        String detail = decision.detail();
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), detail);
+        assertEquals("WALLET_INPUT_TOO_SMALL", decision.reason(), detail);
+        BigInteger required = WalletRoles.tokenOutputRequiredAda(
+                LedgerCeilings.maxPossibleFee(LoanFixtures.protocolParams().getProtocolParams()));
+        assertTrue(detail.startsWith("role TOKEN " + PRINCIPAL_TOKEN_2.toUnit() + ", wallet output "
+                + "da".repeat(32) + "#0, holds 3000000 " + PRINCIPAL_TOKEN_2.toUnit() + " + 6000000 lovelace"), detail);
+        assertTrue(detail.contains(required + " lovelace"), "what was needed: " + detail);
+        assertTrue(detail.contains("short by " + required.subtract(BigInteger.valueOf(6_000_000L)) + " lovelace"),
+                "and the shortfall: " + detail);
+        assertNull(decision.txHash(), "nothing was built: " + detail);
     }
 }

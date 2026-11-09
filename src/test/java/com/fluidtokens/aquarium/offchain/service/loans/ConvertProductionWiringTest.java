@@ -1,10 +1,13 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
 import com.bloxbean.cardano.aiken.AikenTransactionEvaluator;
+import com.bloxbean.cardano.client.address.Address;
 import com.bloxbean.cardano.client.address.AddressProvider;
 import com.bloxbean.cardano.client.address.Credential;
 import com.bloxbean.cardano.client.api.ScriptSupplier;
 import com.bloxbean.cardano.client.api.TransactionEvaluator;
+import com.bloxbean.cardano.client.api.UtxoSupplier;
+import com.bloxbean.cardano.client.api.common.OrderEnum;
 import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.EvaluationResult;
 import com.bloxbean.cardano.client.api.model.Result;
@@ -32,6 +35,8 @@ import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
 import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import com.fluidtokens.aquarium.offchain.model.loans.Rational;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletShape;
+import com.fluidtokens.aquarium.offchain.util.LedgerCeilings;
 import lombok.extern.slf4j.Slf4j;
 import org.cardanofoundation.conversions.CardanoConverters;
 import org.cardanofoundation.conversions.ClasspathConversionsFactory;
@@ -51,6 +56,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
@@ -150,6 +156,14 @@ class ConvertProductionWiringTest {
     private static final String BOT_ADDRESS = AddressProvider.getEntAddress(
             Credential.fromKey(HexUtil.decodeHexString("11".repeat(28))), NETWORK).getAddress();
     private static final Utxo WALLET_UTXO = LoanFixtures.adaUtxo("e0".repeat(32), 0, BOT_ADDRESS, 50_000_000L);
+    /** FAB-185 — wallet role C: ada-only, exactly {@code WalletShape.collateralLovelace} of this rig's params. */
+    private static final Utxo COLLATERAL_UTXO = LoanFixtures.adaUtxo("c5".repeat(32), 0, BOT_ADDRESS,
+            WalletShape.collateralLovelace(EvalFixtures.protocolParams().getProtocolParams()).longValueExact());
+    /** FAB-185 — the shaped wallet's other outputs: a 30-ADA ada-only output and a token output. */
+    private static final Utxo SPARE_ADA_UTXO = LoanFixtures.adaUtxo("e3".repeat(32), 0, BOT_ADDRESS, 30_000_000L);
+    private static final Utxo TOKEN_UTXO = LoanFixtures.utxo("e4".repeat(32), 0, BOT_ADDRESS,
+            List.of(Amount.lovelace(BigInteger.valueOf(10_000_000L)),
+                    Amount.asset(FLDT.toUnit(), BigInteger.valueOf(5_000_000L))), null);
 
     /**
      * The six loans-v4 validators a mainnet convert references — exactly the six slots
@@ -354,7 +368,12 @@ class ConvertProductionWiringTest {
      *       with an unguarded default strategy and a 5 ADA target — blind to both guards above.</li>
      * </ul>
      * For every wallet value, under every {@link Ordering}, the build either refuses or neither spends nor
-     * pledges a published script.
+     * pledges a published script — and, since FAB-185, pledges exactly [C].
+     * <p>
+     * ⛔ FAB-185 INVERTED the {@link Ordering#WALLET_SPLIT} leg. It used to require that some value BUILT, and
+     * every build there was funded by balancing pulling further 4-ADA chunks out of the wallet. The builder
+     * now sees only its designated input, a chunk of at most 4 ADA cannot fund a convert alone, and so every
+     * value under that ordering must REFUSE — a build there would mean a second wallet output was pulled.
      */
     @Test
     void aShortWalletNeverSpendsAPublishedReferenceScriptHeldAtTheBotAddress() throws Exception {
@@ -387,6 +406,8 @@ class ConvertProductionWiringTest {
                 }
                 List<TransactionInput> collateral = reread.getBody().getCollateral() == null
                         ? List.of() : reread.getBody().getCollateral();
+                assertEquals(List.of(refOf(COLLATERAL_UTXO)), collateral, ordering + ", wallet " + lovelace
+                        + " lovelace: the collateral must be exactly the pinned C (FAB-185)");
                 for (TransactionInput input : collateral) {
                     assertFalse(published.contains(input), ordering + ", wallet " + lovelace + " lovelace: the "
                             + "build pledges the published reference-script utxo " + input.getTransactionId() + "#"
@@ -398,8 +419,13 @@ class ConvertProductionWiringTest {
                         + collateral.size() + " collateral");
             }
             log.info("FAB-134 B3b-3 convert short-wallet sweep {}: {}", ordering, outcomes);
-            assertTrue(built > 0, ordering + ": no wallet value built at all, so the sweep proves nothing: "
-                    + outcomes);
+            if (ordering == Ordering.WALLET_SPLIT) {
+                assertEquals(0, built, ordering + ": the designated input is a chunk of at most 4 ADA, which cannot "
+                        + "fund a convert alone; a build means balancing pulled a second wallet output: " + outcomes);
+            } else {
+                assertTrue(built > 0, ordering + ": no wallet value built at all, so the sweep proves nothing: "
+                        + outcomes);
+            }
         }
     }
 
@@ -436,6 +462,222 @@ class ConvertProductionWiringTest {
     }
 
     /**
+     * (a) ⛔ FAB-185, through the PRODUCTION constructor: a shaped wallet — C, U, a 30-ADA ada-only output, a
+     * token output and the six published loans-v4 reference scripts, all at the bot's address. Off the
+     * DESERIALISED built body: the wallet-credential inputs are exactly {U}, U appears once, the collateral is
+     * exactly [C], and every redeemer carries the evaluator's ex-units, above CCL's placeholder.
+     * <p>
+     * The layout probe (pass 1) is never evaluated, so its body is never seen here; what it saw is read off the
+     * injected supplier instead. Neither pass may list a wallet address on it — only the designated-input view
+     * may — so a pass handed the raw supplier shows up as a wallet listing on the recorder.
+     */
+    @Test
+    void aShapedWalletSpendsExactlyUOnBothPassesAndPledgesExactlyC() throws Exception {
+        Fixture f = shaped(LARGE_U, COLLATERAL_UTXO);
+        // C is sized from this rig's parameters (68,526,272 lovelace here), which makes it larger than
+        // WALLET_UTXO and the 30-ADA spare. U is therefore the production shape — the working capital, LARGER
+        // than C — so a collateral chooser going largest-first would land on U, never on C by coincidence.
+        assertTrue(LedgerCeilings.lovelaceOf(LARGE_U).compareTo(LedgerCeilings.lovelaceOf(COLLATERAL_UTXO)) > 0,
+                "fixture: U is larger than C, as in production");
+        ListingRecorder injected = new ListingRecorder(LoanFixtures.utxoSupplier(f.universe));
+        Recording evaluator = new Recording(aiken(f.universe));
+
+        Transaction built = production(injected, new HashCheckedScriptSupplier(rigScripts()), evaluator)
+                .build(f.request);
+        Transaction reread = Transaction.deserialize(built.serialize());
+        log.info("FAB-185 convert shaped wallet: fee {}, inputs {}, collateral {}, listings {}",
+                reread.getBody().getFee(), reread.getBody().getInputs().size(), reread.getBody().getCollateral(),
+                injected.listed);
+
+        assertEquals(List.of(refOf(LARGE_U)), walletInputs(reread, f.universe),
+                "the wallet-credential inputs must be exactly {U}, U once");
+        assertEquals(List.of(refOf(COLLATERAL_UTXO)), reread.getBody().getCollateral(),
+                "the collateral must be exactly [C]");
+        assertEquals(1, evaluator.calls.get(), "exactly one evaluation: pass 2's (CCL trap 23)");
+        List<Redeemer> redeemers = reread.getWitnessSet().getRedeemers();
+        assertEquals(8, redeemers.size(), "two spends, one burn, five withdrawals (the oracle's included)");
+        for (Redeemer redeemer : redeemers) {
+            String key = redeemer.getTag() + "#" + redeemer.getIndex();
+            EvaluationResult costing = evaluator.last.get().stream()
+                    .filter(r -> r.getRedeemerTag() == redeemer.getTag()
+                            && r.getIndex() == redeemer.getIndex().intValue())
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError("no evaluation for " + key));
+            assertEquals(costing.getExUnits().getMem(), redeemer.getExUnits().getMem(), "declared mem for " + key);
+            assertEquals(costing.getExUnits().getSteps(), redeemer.getExUnits().getSteps(),
+                    "declared steps for " + key);
+            assertTrue(redeemer.getExUnits().getMem().compareTo(PLACEHOLDER_MEM) > 0,
+                    key + " carries CCL's 10000-mem placeholder: the evaluator was not load-bearing");
+        }
+        assertEquals(List.of(), injected.walletListings(),
+                "a pass listed a wallet address on the injected supplier, past the designated-input view");
+    }
+
+    /**
+     * (b) ⛔ FAB-185: the same shaped wallet with a U too small for the order's lovelace plus the fee. The
+     * build refuses — it never pulls the 30-ADA output, C, the token output or a published script to make up
+     * the difference — on EITHER pass: no wallet address is ever listed on the injected supplier, and no body
+     * the evaluator was shown carries a wallet input other than U.
+     * <p>
+     * The sizes, measured on this rig (U of {@value #U_THAT_BUILDS} lovelace builds): below the order's own
+     * lovelace; the order's lovelace exactly; and {@value #U_BETWEEN_THE_PASSES} lovelace, which the layout
+     * probe balances (its fee carries no measured ex-units) and the strict pass cannot — so it reaches the
+     * evaluator, and the per-attempt check runs on a real attempted body rather than vacuously.
+     */
+    @Test
+    void aUTooSmallForTheOrderAndTheFeeRefusesAndNeverPullsAnotherWalletOutput() throws Exception {
+        long orderLovelace = shaped(WALLET_UTXO, COLLATERAL_UTXO).request.plan().orderLovelace().longValueExact();
+        int attempts = 0;
+        for (long lovelace : new long[]{orderLovelace - 1, orderLovelace, U_BETWEEN_THE_PASSES}) {
+            Utxo smallU = LoanFixtures.adaUtxo("e1".repeat(32), 0, BOT_ADDRESS, lovelace);
+            Fixture f = shaped(smallU, COLLATERAL_UTXO);
+            ListingRecorder injected = new ListingRecorder(LoanFixtures.utxoSupplier(f.universe));
+            Recording evaluator = new Recording(aiken(f.universe));
+
+            RuntimeException refused = assertThrows(RuntimeException.class,
+                    () -> production(injected, new HashCheckedScriptSupplier(rigScripts()), evaluator)
+                            .build(f.request),
+                    "a U of " + lovelace + " lovelace must refuse, not pull another wallet output");
+            String chain = LiquidationExecutor.causeChain(refused);
+            log.info("FAB-185 convert U of {} lovelace refused after {} evaluated attempt(s): {}", lovelace,
+                    evaluator.attempts.size(), chain);
+            assertTrue(chain.contains("Not enough funds") || chain.contains("Insufficient"),
+                    "U of " + lovelace + ": refused for want of funds in the designated input, not for "
+                            + "anything else: " + chain);
+
+            for (byte[] attempt : evaluator.attempts) {
+                assertEquals(List.of(refOf(smallU)), walletInputs(Transaction.deserialize(attempt), f.universe),
+                        "U of " + lovelace + ": an attempted body carries a wallet input other than U");
+                attempts++;
+            }
+            assertEquals(List.of(), injected.walletListings(), "U of " + lovelace + ": a pass listed a wallet "
+                    + "address on the injected supplier, past the designated-input view");
+        }
+        assertTrue(attempts > 0, "no attempted body was ever evaluated, so the per-attempt check proved nothing");
+
+        // The control: the same shaped wallet with a U that suffices builds, so the sizes above refuse for
+        // their size and not for anything else about the rig.
+        Utxo enough = LoanFixtures.adaUtxo("e1".repeat(32), 0, BOT_ADDRESS, U_THAT_BUILDS);
+        Fixture f = shaped(enough, COLLATERAL_UTXO);
+        Transaction reread = Transaction.deserialize(production(f.universe, new HashCheckedScriptSupplier(rigScripts()),
+                new Recording(aiken(f.universe))).build(f.request).serialize());
+        assertEquals(List.of(refOf(enough)), walletInputs(reread, f.universe), "the control spends exactly {U}");
+    }
+
+    /**
+     * (c) ⛔ FAB-185 (m3): C is the ONLY collateral, so a C too small for {@code fee × collateral_percent} is
+     * refused {@code INSUFFICIENT_COLLATERAL} after pass 2, naming C — not shipped with a negative collateral
+     * return (CCL trap 16), and not rescued by any other wallet output.
+     */
+    @Test
+    void aCollateralTooSmallForTheFeeIsRefusedInsufficientCollateralNamingC() throws Exception {
+        Utxo smallC = LoanFixtures.adaUtxo("c5".repeat(32), 0, BOT_ADDRESS, 1_000_000L);
+        Fixture f = shaped(WALLET_UTXO, smallC);
+
+        LiquidateTransactionBuilder.RefusedException refused = assertThrows(
+                LiquidateTransactionBuilder.RefusedException.class,
+                () -> production(f.universe, new HashCheckedScriptSupplier(rigScripts()), new Recording(aiken(f.universe)))
+                        .build(f.request));
+
+        assertEquals(LiquidateTransactionBuilder.Refusal.INSUFFICIENT_COLLATERAL, refused.getReason(),
+                refused.getMessage());
+        assertTrue(refused.getMessage().contains(smallC.getTxHash() + "#" + smallC.getOutputIndex()),
+                "the refusal names C: " + refused.getMessage());
+        assertFalse(refused.getMessage().contains(WALLET_UTXO.getTxHash()), "and not U: " + refused.getMessage());
+    }
+
+    /** (a)'s U: the production shape, larger than C. */
+    private static final Utxo LARGE_U = LoanFixtures.adaUtxo("e0".repeat(32), 0, BOT_ADDRESS, 100_000_000L);
+
+    /**
+     * (b)'s sizes, measured on this rig in 0.1-ADA steps from the order's 4 ADA: below 7.8 ADA both passes
+     * refuse before any evaluation; from 7.8 to 8.0 ADA the layout probe balances (no measured ex-units in its
+     * fee) and the strict pass is evaluated once and then cannot balance; from 8.1 ADA it builds. So 7.9 ADA
+     * is between the passes, and 9 ADA is the smallest whole-ADA U that builds.
+     */
+    private static final long U_THAT_BUILDS = 9_000_000L;
+    private static final long U_BETWEEN_THE_PASSES = 7_900_000L;
+
+    /**
+     * The shaped wallet of (a)-(c): C, {@code u}, a 30-ADA output, a token output and the six published
+     * loans-v4 reference scripts, all at the bot's address.
+     */
+    private static Fixture shaped(Utxo u, Utxo collateral) throws Exception {
+        Fixture f = fixture(u, BOT_ADDRESS, collateral);
+        List<Utxo> universe = new ArrayList<>(f.universe);
+        universe.add(SPARE_ADA_UTXO);
+        universe.add(TOKEN_UTXO);
+        assertEquals(10, universe.stream().filter(x -> atWalletCredential(x.getAddress())).count(),
+                "C, U, the 30-ADA output, the token output and six published scripts at the bot address");
+        return new Fixture(universe, f.request);
+    }
+
+    /** The body's inputs whose UTxO sits at the wallet's payment credential, in body order. */
+    private static List<TransactionInput> walletInputs(Transaction transaction, List<Utxo> universe) {
+        List<TransactionInput> atWallet = new ArrayList<>();
+        for (TransactionInput input : transaction.getBody().getInputs()) {
+            Utxo utxo = universe.stream()
+                    .filter(u -> u.getTxHash().equals(input.getTransactionId())
+                            && u.getOutputIndex() == input.getIndex())
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError("an input outside the universe: " + input));
+            if (atWalletCredential(utxo.getAddress())) {
+                atWallet.add(input);
+            }
+        }
+        return atWallet;
+    }
+
+    private static TransactionInput refOf(Utxo utxo) {
+        return new TransactionInput(utxo.getTxHash(), utxo.getOutputIndex());
+    }
+
+    /** True when {@code address}'s payment credential is the bot wallet's. */
+    private static boolean atWalletCredential(String address) {
+        try {
+            return java.util.Arrays.equals(new Address(address).getPaymentCredentialHash().orElse(null),
+                    new Address(BOT_ADDRESS).getPaymentCredentialHash().orElseThrow());
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    /**
+     * FAB-185 — the injected supplier, recording every address anything lists through {@code getPage} or
+     * {@code getAll}. The builder must never list a wallet address on it, on either pass: only its
+     * designated-input view may.
+     */
+    private static final class ListingRecorder implements UtxoSupplier {
+        final UtxoSupplier delegate;
+        final List<String> listed = new CopyOnWriteArrayList<>();
+
+        ListingRecorder(UtxoSupplier delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public List<Utxo> getPage(String address, Integer nrOfItems, Integer page, OrderEnum order) {
+            listed.add(address);
+            return delegate.getPage(address, nrOfItems, page, order);
+        }
+
+        @Override
+        public List<Utxo> getAll(String address) {
+            listed.add(address);
+            return delegate.getAll(address);
+        }
+
+        @Override
+        public Optional<Utxo> getTxOutput(String txHash, int outputIndex) {
+            return delegate.getTxOutput(txHash, outputIndex);
+        }
+
+        List<String> walletListings() {
+            return listed.stream().filter(ConvertProductionWiringTest::atWalletCredential).toList();
+        }
+    }
+
+    /**
      * The production constructor has no null-script-supplier form: a null there would silently select the
      * OFFLINE path (the three-argument QuickTxBuilder, a declared reference-script list and a no-op
      * supplier), whose fee prices only the registry's scripts — never the oracle's (CCL trap 9).
@@ -463,8 +705,13 @@ class ConvertProductionWiringTest {
     /** The production constructor, exactly the one YaciConfig calls. */
     private static ConvertTransactionBuilder production(List<Utxo> universe, ScriptSupplier scripts,
                                                         TransactionEvaluator evaluator) {
-        return new ConvertTransactionBuilder(REGISTRY, NETWORK, LoanFixtures.utxoSupplier(universe),
-                EvalFixtures.protocolParams(), scripts, evaluator);
+        return production(LoanFixtures.utxoSupplier(universe), scripts, evaluator);
+    }
+
+    private static ConvertTransactionBuilder production(UtxoSupplier injected, ScriptSupplier scripts,
+                                                        TransactionEvaluator evaluator) {
+        return new ConvertTransactionBuilder(REGISTRY, NETWORK, injected, EvalFixtures.protocolParams(), scripts,
+                evaluator);
     }
 
     private static Transaction buildProduction(Fixture f, ScriptSupplier scripts) throws Exception {
@@ -516,11 +763,12 @@ class ConvertProductionWiringTest {
                 rigScripts(), SlotConfigs.mainnet());
     }
 
-    /** Records how often it was asked and what it last returned. */
+    /** Records how often it was asked, every body it was asked about, and what it last returned. */
     private static final class Recording implements TransactionEvaluator {
         final TransactionEvaluator delegate;
         final AtomicInteger calls = new AtomicInteger();
         final AtomicReference<List<EvaluationResult>> last = new AtomicReference<>();
+        final List<byte[]> attempts = new CopyOnWriteArrayList<>();
 
         Recording(TransactionEvaluator delegate) {
             this.delegate = delegate;
@@ -530,6 +778,7 @@ class ConvertProductionWiringTest {
         public Result<List<EvaluationResult>> evaluateTx(byte[] cbor, Set<Utxo> inputUtxos)
                 throws com.bloxbean.cardano.client.api.exception.ApiException {
             calls.incrementAndGet();
+            attempts.add(cbor);
             Result<List<EvaluationResult>> result = delegate.evaluateTx(cbor, inputUtxos);
             last.set(result.getValue());
             return result;
@@ -544,6 +793,11 @@ class ConvertProductionWiringTest {
      *                               each at its own script's enterprise address
      */
     private static Fixture fixture(Utxo wallet, String referenceScriptAddress) throws Exception {
+        return fixture(wallet, referenceScriptAddress, COLLATERAL_UTXO);
+    }
+
+    /** As above, with wallet role C stated: it sits in the universe and is the Request's collateral. */
+    private static Fixture fixture(Utxo wallet, String referenceScriptAddress, Utxo collateral) throws Exception {
         String loanDatumHex = LoanFixtures.fixture("mainnet-loan-datum-d832b78e.hex");
         String bondDatumHex = LoanFixtures.fixture("mainnet-lender-bond-datum-d832b78e.hex");
         String poolDatumHex = LoanFixtures.fixture("mainnet-minswap-pool-ada-fldt.hex");
@@ -614,7 +868,7 @@ class ConvertProductionWiringTest {
                 poolDatumHex);
 
         List<Utxo> universe = new ArrayList<>(List.of(loanUtxo, bondUtxo, configUtxo, lmConfigUtxo, poolUtxo,
-                wallet));
+                wallet, collateral));
         // The oracle's NFT holder and its published script, at their recorded coordinates; values
         // reconstructed. A Blockfrost Utxo carries the reference script's HASH, never its bytes.
         universe.add(LoanFixtures.utxo(entry.referenceInput().getTransactionId(), entry.referenceInput().getIndex(),
@@ -640,7 +894,7 @@ class ConvertProductionWiringTest {
                 bond.lenderStakeCredential(), LOAN_ID, NETWORK);
         var request = new ConvertTransactionBuilder.Request(loanUtxo, bondUtxo, poolUtxo, entry, configUtxo,
                 lmConfigUtxo, wallet, referenceScripts, plan, claim, FLDT, lenderBond, loan.repaymentReceipts(),
-                orderAddress, BOT_ADDRESS, validFromSlot, validToSlot);
+                orderAddress, BOT_ADDRESS, validFromSlot, validToSlot, collateral);
         return new Fixture(universe, request);
     }
 

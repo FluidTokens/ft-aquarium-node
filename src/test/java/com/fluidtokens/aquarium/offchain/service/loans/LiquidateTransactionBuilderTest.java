@@ -39,6 +39,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.Rational;
 import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import com.fluidtokens.aquarium.offchain.service.TransactionInputComparator;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletShape;
 import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.Test;
 
@@ -140,6 +141,9 @@ class LiquidateTransactionBuilderTest {
             LoanFixtures.botAddress(), 50_000_000L);
     private static final Utxo BOT_SPARE_UTXO = LoanFixtures.adaUtxo(TX_BOT_SPARE, 0,
             LoanFixtures.botAddress(), 10_000_000L);
+    /** FAB-185 — wallet role C: ada-only, exactly {@code WalletShape.collateralLovelace} of the fixture params. */
+    private static final Utxo COLLATERAL_UTXO = LoanFixtures.adaUtxo(repeat("c5"), 0, LoanFixtures.botAddress(),
+            WalletShape.collateralLovelace(LoanFixtures.protocolParams().getProtocolParams()).longValueExact());
 
     // Token collateral leg, priced by a Charli3 feed.
     private static final AssetType COLLATERAL_TOKEN = new AssetType(repeatHash("c0"), "544f4b");
@@ -1997,6 +2001,40 @@ class LiquidateTransactionBuilderTest {
         assertEquals(LiquidateTransactionBuilder.Refusal.WALLET_UTXO_NOT_ADA_ONLY, refused.getReason());
     }
 
+    /**
+     * FAB-185 (e) — C is pinned as the only collateral and never spent, so it must be a separate, pure-ada
+     * output: the wallet utxo itself, a datum-bearing output, a token-bearing one or none at all is refused
+     * by name before anything is built.
+     */
+    @Test
+    void refusesACollateralUtxoThatIsTheWalletUtxoOrNotPureAda() {
+        AdaScenario scenario = adaScenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 1000L,
+                200_000_000L, BigInteger.TEN, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
+        Utxo withDatum = LoanFixtures.utxo(COLLATERAL_UTXO.getTxHash(), 0, LoanFixtures.botAddress(),
+                COLLATERAL_UTXO.getAmount(), "d87980");
+        Utxo withToken = LoanFixtures.utxo(COLLATERAL_UTXO.getTxHash(), 0, LoanFixtures.botAddress(),
+                List.of(COLLATERAL_UTXO.getAmount().getFirst(), LoanFixtures.token(COLLATERAL_TOKEN, 5)), null);
+        Utxo sameRefAsWallet = LoanFixtures.adaUtxo(TX_WALLET, 0, LoanFixtures.botAddress(),
+                COLLATERAL_UTXO.getAmount().getFirst().getQuantity().longValueExact());
+
+        Map<String, Utxo> invalid = new LinkedHashMap<>();
+        invalid.put("the wallet utxo itself", WALLET_UTXO);
+        invalid.put("another output at the wallet utxo's ref", sameRefAsWallet);
+        invalid.put("a datum-bearing output", withDatum);
+        invalid.put("a token-bearing output", withToken);
+        invalid.put("no output at all", null);
+        invalid.forEach((what, collateral) -> {
+            LiquidateTransactionBuilder.RefusedException refused =
+                    assertThrows(LiquidateTransactionBuilder.RefusedException.class,
+                            () -> builder(List.of(scenario), Map.of()).build(
+                                    request(List.of(scenario), Map.of(), WALLET_UTXO, MARGIN, VALID_FROM, VALID_TO,
+                                            LiquidateTransactionBuilder.ReferenceScripts.none(), collateral)),
+                            what);
+            assertEquals(LiquidateTransactionBuilder.Refusal.COLLATERAL_UTXO_INVALID, refused.getReason(),
+                    what + ": " + refused.getMessage());
+        });
+    }
+
     @Test
     void refusesTwoEntriesForTheSameLoan() {
         AdaScenario scenario = adaScenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 1000L,
@@ -2500,7 +2538,7 @@ class LiquidateTransactionBuilderTest {
                                                        Map<String, OracleEntry> oracles,
                                                        TransactionEvaluator evaluator) {
         List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO,
-                BOT_SPARE_UTXO));
+                BOT_SPARE_UTXO, COLLATERAL_UTXO));
         scenarios.forEach(scenario -> {
             universe.add(scenario.loanUtxo());
             universe.add(scenario.bond().utxo());
@@ -2514,10 +2552,19 @@ class LiquidateTransactionBuilderTest {
                                                                Utxo wallet, long margin,
                                                                long validFrom, long validTo,
                                                                LiquidateTransactionBuilder.ReferenceScripts refs) {
+        return request(scenarios, oracles, wallet, margin, validFrom, validTo, refs, COLLATERAL_UTXO);
+    }
+
+    private static LiquidateTransactionBuilder.Request request(List<AdaScenario> scenarios,
+                                                               Map<String, OracleEntry> oracles,
+                                                               Utxo wallet, long margin,
+                                                               long validFrom, long validTo,
+                                                               LiquidateTransactionBuilder.ReferenceScripts refs,
+                                                               Utxo collateral) {
         return new LiquidateTransactionBuilder.Request(
                 scenarios.stream().map(AdaScenario::toLiquidation).toList(),
                 CONFIG_UTXO, LM_CONFIG_UTXO, oracles, wallet, LoanFixtures.botAddress(),
-                validFrom, validTo, margin, refs);
+                validFrom, validTo, margin, refs, collateral);
     }
 
     private static Transaction build(List<AdaScenario> scenarios, Map<String, OracleEntry> oracles,

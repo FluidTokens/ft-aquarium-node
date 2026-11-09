@@ -5,6 +5,7 @@ import java.math.BigInteger;
 import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Action;
 import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Market;
 import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Mode;
+import com.fluidtokens.aquarium.offchain.service.loans.PoolUsability;
 
 /**
  * ⛔ <b>What the bot would do about THIS loan, right now, on THIS node.</b>
@@ -31,11 +32,25 @@ import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfigurati
  *       every market's {@code CONVERT}, and the market still reads as CONVERT.</li>
  * </ol>
  *
+ * <h2>⚠ A {@code CONVERT_BEFORE_ANTICIPATE} answer is an ESTIMATE</h2>
+ * Such a market converts when it can and pays in advance only when convert is impossible, so its answer
+ * follows the pool verdict: {@code USABLE} converts; {@code NO_POOL}, {@code TOO_THIN}, {@code NOT_CONFIGURED}
+ * or convert switched off take the {@code ANTICIPATE} answers; {@code WRONG_PAIR} and {@code CANNOT_QUOTE} are
+ * refused and never fall back; {@code CHECK_FAILED} and {@code UNKNOWN} are unknown, never ADVANCE. The page
+ * tests every indexed pool at render time while the bot resolves one pool when it builds, so the two can
+ * disagree for a block — every such detail says so ({@link #ESTIMATE_NOTE}).
+ *
  * <p>⚠ <b>Health is checked FIRST and deliberately.</b> Most loans are healthy, and "the bot is off"
  * is not the interesting answer for a loan that would not be touched anyway — it buries the arming
  * problem under rows where it does not matter.
  */
 public record ActionNow(String text, String detail, boolean wouldAct) {
+
+    /** Ends every {@code CONVERT_BEFORE_ANTICIPATE} detail: the page and the bot may consult different pools. */
+    public static final String ESTIMATE_NOTE = " — an estimate: this page tests every indexed pool now, while the "
+            + "bot resolves one pool when it builds";
+
+    private static final String CBA_PREFIX = "this market is action: CONVERT_BEFORE_ANTICIPATE";
 
     private static ActionNow none(String text, String detail) {
         return new ActionNow(text, detail, false);
@@ -66,35 +81,53 @@ public record ActionNow(String text, String detail, boolean wouldAct) {
     /**
      * @param liquidatable  null when health could not be computed — which is NOT "no"
      * @param effectiveMode the market's mode after the node's ceiling is applied
+     * @param poolVerdict   the page's pool verdict for this loan; null is read as {@code UNKNOWN}, never
+     *                      as {@code USABLE}
      * @param advance       what an ANTICIPATE would have to front, null when unknown
      */
     public static ActionNow of(Boolean liquidatable, Mode effectiveMode, Action action,
-                               Market market, boolean convertEnabled, boolean poolUsable,
+                               Market market, boolean convertEnabled, PoolUsability.Verdict poolVerdict,
                                BigInteger advance) {
         ActionNow head = sharedHead(liquidatable, effectiveMode, market);
         if (head != null) {
             return head;
         }
 
+        PoolUsability.Verdict verdict = poolVerdict == null ? PoolUsability.Verdict.UNKNOWN : poolVerdict;
         Action effectiveAction = action == null ? Action.CONVERT : action;
-        if (effectiveAction == Action.CONVERT) {
-            if (!convertEnabled) {
-                return none("NONE — convert off", "this market routes to CONVERT, but convert is "
-                        + "globally disabled on this node, so no DEX order would be created");
-            }
-            if (!poolUsable) {
-                return none("NONE — pool", "no Minswap pool can clear this loan's debt, so the "
-                        + "convert order would be refused before it was built");
-            }
-        } else if (market != null && market.getCap() != null && advance != null
+        // Exhaustive, no default: a new action does not compile until it says what it would do here.
+        return switch (effectiveAction) {
+            case CONVERT -> convert(effectiveMode, convertEnabled, verdict);
+            case ANTICIPATE -> anticipate(effectiveMode, market, advance);
+            case CONVERT_BEFORE_ANTICIPATE ->
+                    convertBeforeAnticipate(effectiveMode, market, convertEnabled, verdict, advance);
+        };
+    }
+
+    private static ActionNow convert(Mode effectiveMode, boolean convertEnabled, PoolUsability.Verdict verdict) {
+        if (!convertEnabled) {
+            return none("NONE — convert off", "this market routes to CONVERT, but convert is "
+                    + "globally disabled on this node, so no DEX order would be created");
+        }
+        if (verdict != PoolUsability.Verdict.USABLE) {
+            return none("NONE — pool", "no Minswap pool can clear this loan's debt, so the "
+                    + "convert order would be refused before it was built");
+        }
+        return acting("CONVERT", effectiveMode);
+    }
+
+    private static ActionNow anticipate(Mode effectiveMode, Market market, BigInteger advance) {
+        if (market != null && market.getCap() != null && advance != null
                 && market.getCap().compareTo(advance) < 0) {
             // ⛔ PER-LOAN, not per-market. The market is valid and the cap is deliberate; it simply
             // does not reach THIS loan, and nothing about the market's own display would show that.
             return none("NONE — cap", "this market's cap of " + market.getCap() + " is below the "
                     + advance + " this loan would need fronted");
         }
+        return acting("ADVANCE", effectiveMode);
+    }
 
-        String verb = effectiveAction == Action.CONVERT ? "CONVERT" : "ADVANCE";
+    private static ActionNow acting(String verb, Mode effectiveMode) {
         if (effectiveMode == Mode.SHADOW) {
             return none("WOULD " + verb, "shadow mode: the transaction would be built and "
                     + "size-checked, and NOT submitted");
@@ -102,11 +135,46 @@ public record ActionNow(String text, String detail, boolean wouldAct) {
         return new ActionNow(verb, "live: this loan would be liquidated on the next scan", true);
     }
 
+    /**
+     * ⛔ FAB-194-4: the executor's route for a {@code CONVERT_BEFORE_ANTICIPATE} market, read from the page's
+     * pool verdict. Only convert switched off or a verdict saying convert is IMPOSSIBLE ({@code NO_POOL},
+     * {@code TOO_THIN}, {@code NOT_CONFIGURED}) pays in advance. A refused pool ({@code WRONG_PAIR},
+     * {@code CANNOT_QUOTE}) is never a reason to front capital, and a verdict that could not be reached
+     * ({@code CHECK_FAILED}, {@code UNKNOWN}) is unknown — never ADVANCE, because "could not ask" is not
+     * "no pool".
+     */
+    private static ActionNow convertBeforeAnticipate(Mode effectiveMode, Market market, boolean convertEnabled,
+                                                     PoolUsability.Verdict verdict, BigInteger advance) {
+        if (!convertEnabled) {
+            return estimate(anticipate(effectiveMode, market, advance), CBA_PREFIX
+                    + " and convert is disabled on this node, so it pays in advance: ");
+        }
+        return switch (verdict) {
+            case NO_POOL, TOO_THIN, NOT_CONFIGURED ->
+                    estimate(anticipate(effectiveMode, market, advance), CBA_PREFIX
+                            + " and convert is impossible for this loan (" + verdict + "), so it pays in "
+                            + "advance: ");
+            case USABLE -> estimate(acting("CONVERT", effectiveMode), CBA_PREFIX
+                    + " and a pool can clear this loan's debt (" + verdict + "), so it converts first: ");
+            case WRONG_PAIR, CANNOT_QUOTE -> none("NONE — pool", CBA_PREFIX
+                    + " and the convert route refuses this loan's pool (" + verdict + "); that refusal is "
+                    + "not a reason to pay in advance, so nothing would be attempted" + ESTIMATE_NOTE);
+            case CHECK_FAILED, UNKNOWN -> none("UNKNOWN", CBA_PREFIX
+                    + " and whether convert is possible is not known (" + verdict + "), so whether the bot "
+                    + "would convert or pay in advance is not known either — this is not the same as 'no'"
+                    + ESTIMATE_NOTE);
+        };
+    }
+
+    private static ActionNow estimate(ActionNow answer, String prefix) {
+        return new ActionNow(answer.text(), prefix + answer.detail() + ESTIMATE_NOTE, answer.wouldAct());
+    }
+
     public static ActionNow forRoute(BondRoute route, Boolean liquidatable, Mode effectiveMode,
                                      Action action, Market market, boolean convertEnabled,
-                                     boolean poolUsable, BigInteger advance) {
+                                     PoolUsability.Verdict poolVerdict, BigInteger advance) {
         if (route == BondRoute.CONVERT) {
-            return of(liquidatable, effectiveMode, action, market, convertEnabled, poolUsable, advance);
+            return of(liquidatable, effectiveMode, action, market, convertEnabled, poolVerdict, advance);
         }
 
         ActionNow head = sharedHead(liquidatable, effectiveMode, market);

@@ -9,6 +9,9 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Collection;
 import java.util.Map;
 import java.util.Objects;
@@ -74,19 +77,29 @@ import java.util.concurrent.atomic.AtomicInteger;
  * distinct assets and in practice tracks 256.
  *
  * <h2>Transitions, not repetitions — and not blackouts either</h2>
- * The cycle runs every {@code loans.liquidation.delay-seconds} (default 60). Logging every
- * unservable market every cycle would bury the line that matters under thousands of identical ones,
- * so a WARN is emitted when a triple <b>becomes</b> unservable and an INFO when it stops.
+ * A scan arrives whenever the liquidation stage runs — on every committed block and on every merged
+ * price change (FAB-183), so at no fixed cadence. Logging every unservable market on every scan
+ * would bury the line that matters under thousands of identical ones, so a WARN is emitted when a
+ * triple <b>becomes</b> unservable and an INFO when it stops.
  * <p>
  * ⚠ <b>A transition alone is not enough, because the oracle blackout IS a transition.</b> Preview
- * has a real ~60–80 s price blackout every five minutes, upstream of us, which at the default cycle
- * makes a non-ada market flip unservable and back roughly 288 times a day. A WARN on each flip turns
- * Giovanni's floor into noise on the first network the bot runs on. So the condition must hold for
- * the cadence-derived number from {@link #warnAfterCyclesFor(long)} of <b>consecutive</b> cycles
- * before the first WARN, and the matching INFO is emitted only if that WARN was reached — a
- * blackout that never warned never recovers out loud either.
+ * has a real ~60–80 s price blackout every five minutes, upstream of us, which makes a non-ada market
+ * flip unservable and back roughly 288 times a day. A WARN on each flip turns Giovanni's floor into
+ * noise on the first network the bot runs on. So the first WARN waits until the triple has been
+ * unservable <b>continuously</b> for MORE than {@link #MAX_BLACKOUT_SECONDS} of wall-clock time,
+ * measured from the first unservable scan of the episode to the current scan; any servable scan in
+ * between ends the episode and the next one starts its own clock. The matching INFO is emitted only
+ * if that WARN was reached — a blackout that never warned never recovers out loud either.
  * <p>
- * <b>The gauge still goes to 1 on the first cycle.</b> It is the continuously-true thing, and an
+ * ⚠ <b>Time, not a count of scans.</b> This gate used to count consecutive scans, a number derived
+ * from the old fixed polling delay. Once scans follow blocks and prices that number means
+ * nothing — an 80 s blackout spans four or five block scans rather than one or two — so a count
+ * would silently weaken the protection it exists for. Elapsed time is the quantity a blackout is
+ * measured in, so it is the quantity the gate compares. An operator who sets
+ * {@link #WARN_AFTER_CYCLES_PROPERTY} above zero still gets the consecutive-scan count exactly as
+ * before.
+ * <p>
+ * <b>The gauge still goes to 1 on the first scan.</b> It is the continuously-true thing, and an
  * alert rule holds it with its own {@code for:} clause; the log is the thing that cannot be held
  * after the fact.
  *
@@ -98,7 +111,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <h2>⚠ Known limitation: a permanently unsupported feed and a stale one share one reason</h2>
  * {@code PRINCIPAL_ORACLE_UNUSABLE} covers both "this feed is a variant we do not model" (permanent,
  * and the thing worth paging on) and "this feed's validity window does not cover now" (transient).
- * The consecutive-cycle gate above is what keeps the second out of the log; distinguishing them in
+ * The wall-clock gate above is what keeps the second out of the log; distinguishing them in
  * the metric itself needs a structured sub-reason on the scanner's side, which is a decision this
  * slice does not make.
  */
@@ -129,44 +142,26 @@ public class MarketCoverageReporter {
     /**
      * Measured upper end of preview's ~60–80 s Charli3 feed blackouts every five minutes, upstream
      * of this service (design §6.7–6.8). This is observed provenance, not a guessed tuning value.
+     * The default WARN gate fires only once a triple has been unservable for strictly longer.
      */
     static final int MAX_BLACKOUT_SECONDS = 80;
 
-    /**
-     * How many consecutive cycles a triple must stay unservable before the first WARN at the
-     * default 60 s cadence. This is the value {@link #warnAfterCyclesFor(long)} derives there.
-     *
-     * <p>Overridable with
-     * {@link #WARN_AFTER_CYCLES_PROPERTY} — set it to 1 to have the log follow the gauge exactly, on
-     * a network with no blackout.
-     */
-    static final int DEFAULT_WARN_AFTER_CYCLES = 3;
+    private static final Duration MAX_BLACKOUT = Duration.ofSeconds(MAX_BLACKOUT_SECONDS);
 
-    /** Operator override; zero or absence selects the cadence-derived WARN gate. */
+    /**
+     * Operator override: above zero, the WARN waits for this many <b>consecutive</b> unservable scans
+     * instead of for wall-clock time — set it to 1 to have the log follow the gauge exactly, on a
+     * network with no blackout. Zero or absence selects the wall-clock gate.
+     */
     static final String WARN_AFTER_CYCLES_PROPERTY = "loans.market-coverage.warn-after-cycles";
-
-    /**
-     * Derives the first consecutive-cycle count that one measured blackout cannot reach.
-     *
-     * <p>A blackout of {@code D} seconds, observed by scans at spacing {@code C}, falls on at most
-     * {@code floor(D/C) + 1} consecutive scans: an arithmetic progression of spacing {@code C}
-     * places at most that many points inside an interval of length {@code D}. Therefore
-     * {@code floor(D/C) + 2} is the first count a single blackout cannot reach. Spring's
-     * {@code @Scheduled(fixedDelay...)} measures the gap between completions, so the real period is
-     * at least {@code C}; this derivation consequently errs toward fewer observations, which is the
-     * conservative direction. A non-positive cadence falls back to the production default rather
-     * than producing a nonsensical debounce or preventing the node from booting.
-     */
-    static int warnAfterCyclesFor(long delaySeconds) {
-        if (delaySeconds <= 0) {
-            return DEFAULT_WARN_AFTER_CYCLES;
-        }
-        return (int) (MAX_BLACKOUT_SECONDS / delaySeconds) + 2;
-    }
 
     private final MeterRegistry registry;
 
+    /** The consecutive-scan gate when above zero; zero selects the wall-clock gate. */
     private final int warnAfterCycles;
+
+    /** Read once per scan, and only by the wall-clock WARN gate. */
+    private final Clock clock;
 
     /** One {@link Coverage} per registered series; also the bound's counter. */
     private final Map<UnservableMarket, Coverage> series = new ConcurrentHashMap<>();
@@ -182,16 +177,17 @@ public class MarketCoverageReporter {
     @Autowired
     public MarketCoverageReporter(MeterRegistry registry,
                                   @Value("${loans.market-coverage.warn-after-cycles:0}")
-                                  int warnAfterCycles,
-                                  @Value("${loans.liquidation.delay-seconds:60}")
-                                  long delaySeconds) {
+                                  int warnAfterCycles) {
+        this(registry, warnAfterCycles, Clock.systemUTC());
+    }
+
+    /** As the Spring constructor, with the clock the wall-clock gate reads stated, so a test can move it. */
+    MarketCoverageReporter(MeterRegistry registry, int warnAfterCycles, Clock clock) {
         this.registry = Objects.requireNonNull(registry, "registry");
-        // Clamped rather than rejected: a nonsensical value here must not stop an operator's node
-        // booting over a metric, and 1 is the strictest thing the gate can mean.
-        int effectiveWarnAfterCycles = warnAfterCycles == 0
-                ? warnAfterCyclesFor(delaySeconds)
-                : warnAfterCycles;
-        this.warnAfterCycles = Math.max(1, effectiveWarnAfterCycles);
+        this.clock = Objects.requireNonNull(clock, "clock");
+        // Clamped rather than rejected: a nonsensical (negative) value here must not stop an
+        // operator's node booting over a metric, and 1 is the strictest thing the count can mean.
+        this.warnAfterCycles = warnAfterCycles == 0 ? 0 : Math.max(1, warnAfterCycles);
         Gauge.builder(UNTRACKED, untracked, AtomicInteger::doubleValue)
                 .description("Distinct (market, leg, reason) triples the bot could not serve and "
                         + "could not give a metric series to, because every series was already "
@@ -199,9 +195,14 @@ public class MarketCoverageReporter {
                 .register(registry);
     }
 
-    /** Test seam; 60 s is the production-default cadence used when Spring does not supply one. */
+    /**
+     * Test seam: the consecutive-scan gate at three scans, on the system clock. The tests built on it
+     * are about WHAT is said — names, legs, the bound, recovery — not WHEN, and a count keeps them
+     * independent of wall-clock time; the wall-clock gate is driven through the {@link Clock}
+     * constructor.
+     */
     MarketCoverageReporter(MeterRegistry registry) {
-        this(registry, 0, 60);
+        this(registry, 3, Clock.systemUTC());
     }
 
     /**
@@ -212,6 +213,7 @@ public class MarketCoverageReporter {
      */
     public void report(Collection<LiquidationAssessment> assessments) {
         long now = ++cycle;
+        Instant at = clock.instant();
         SortedMap<UnservableMarket, String> unservable = UnservableMarket.seenIn(assessments);
         Set<UnservableMarket> stillUnservable = unservable.keySet();
 
@@ -224,6 +226,7 @@ public class MarketCoverageReporter {
             }
             Coverage coverage = tracked.getValue();
             coverage.unservableCycles = 0;
+            coverage.unservableSince = null;
             if (coverage.gauge.getAndSet(0) == 0) {
                 continue;
             }
@@ -256,7 +259,10 @@ public class MarketCoverageReporter {
             }
             coverage.gauge.set(1);
             coverage.zeroSince = Long.MAX_VALUE;
-            if (coverage.warned || ++coverage.unservableCycles < warnAfterCycles) {
+            if (coverage.unservableSince == null) {
+                coverage.unservableSince = at;
+            }
+            if (coverage.warned || !warnGateReached(coverage, at)) {
                 continue;
             }
             coverage.warned = true;
@@ -271,6 +277,19 @@ public class MarketCoverageReporter {
                             + "in the WARN lines above — this bot is now reporting LESS than it knows.",
                     refused, MAX_TRACKED_SERIES, UNSERVABLE, UNTRACKED);
         }
+    }
+
+    /**
+     * Whether this scan is the one the first WARN of the episode waits for: the consecutive-scan count
+     * when the operator set one, otherwise more than {@link #MAX_BLACKOUT_SECONDS} of wall-clock time
+     * since the episode's first unservable scan. Called only while the episode has not warned, so the
+     * count advances exactly as it always did.
+     */
+    private boolean warnGateReached(Coverage coverage, Instant at) {
+        if (warnAfterCycles > 0) {
+            return ++coverage.unservableCycles >= warnAfterCycles;
+        }
+        return Duration.between(coverage.unservableSince, at).compareTo(MAX_BLACKOUT) > 0;
     }
 
     /** The one WARN shape, so "no series available" cannot quietly become a different sentence. */
@@ -367,8 +386,14 @@ public class MarketCoverageReporter {
 
         private Gauge meter;
 
-        /** Consecutive cycles this triple has been unservable; the WARN gate's counter. */
+        /** Consecutive scans this triple has been unservable; the override's WARN counter. */
         private int unservableCycles;
+
+        /**
+         * The instant of the first unservable scan of the current episode; {@code null} while
+         * servable. The wall-clock WARN gate measures from it.
+         */
+        private Instant unservableSince;
 
         /** Whether the WARN has already been emitted for the current unservable episode. */
         private boolean warned;

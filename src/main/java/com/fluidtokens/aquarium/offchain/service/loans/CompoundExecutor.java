@@ -1,6 +1,7 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
 import com.bloxbean.cardano.client.account.Account;
+import com.bloxbean.cardano.client.api.model.ProtocolParams;
 import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
@@ -8,11 +9,6 @@ import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
-import com.fasterxml.jackson.core.JsonFactory;
-import com.fasterxml.jackson.core.JsonParser;
-import com.fasterxml.jackson.core.JsonToken;
-import com.fasterxml.jackson.core.StreamReadConstraints;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.config.ProtocolParamsRejections;
 import com.fluidtokens.aquarium.offchain.model.loans.CompoundAssessment;
@@ -20,11 +16,16 @@ import com.fluidtokens.aquarium.offchain.model.loans.CompoundCandidate;
 import com.fluidtokens.aquarium.offchain.model.loans.CompoundExclusion;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
-import com.fluidtokens.aquarium.offchain.util.WalletInputSelection;
+import com.fluidtokens.aquarium.offchain.service.StageTally;
+import com.fluidtokens.aquarium.offchain.service.SubmitFence;
+import com.fluidtokens.aquarium.offchain.service.WorkResult;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletRoles;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletShape;
+import com.fluidtokens.aquarium.offchain.util.LedgerCeilings;
 import lombok.extern.slf4j.Slf4j;
 import org.cardanofoundation.conversions.CardanoConverters;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.math.BigInteger;
@@ -34,13 +35,14 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.TreeMap;
-import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -65,6 +67,23 @@ import java.util.stream.Collectors;
  * An operator asking "why did it not compound?" must find the answer in the log rather than in the
  * source. Structural refusals come from {@link CompoundCandidateScanner}, economic ones from
  * {@link CompoundEconomics}, and both are printed with the arithmetic that produced them.
+ *
+ * <h2>⛔ Funded from U, with collateral C (FAB-185)</h2>
+ * The wallet is read ONCE per walk, after the scan and only when an armed walk has a ready candidate, and
+ * its roles are resolved from that read ({@link WalletRoles}): C, the ada-only output of exactly
+ * {@code WalletShape.collateralLovelace(params)}, and U, the largest other ada-only output. Every candidate
+ * of the walk is funded from U and pins C as its only collateral; the builder sees the wallet holding U
+ * alone, so no compound can spend C, a token output or a published reference script. A missing C or U is
+ * said ONCE per role per walk at WARN, naming the role and the wallet rebalancer's last outcome — the
+ * rebalancer is what keeps C and U in place — and nothing is built.
+ *
+ * <h2>What the pass line is told (FAB-195)</h2>
+ * {@link #cycle(SubmitFence, StageTally)} counts each structurally ready candidate the walk reaches exactly once on
+ * the stage's tally, for the wallet pipeline's summary line only: an accepted submit, and an AMBIGUOUS one or a
+ * transport that threw (a display merge), is {@code submitted}; a WOULD_SUBMIT is {@code would-submit}; a decoded
+ * Blockfrost refusal is {@code attempted}; a failure of ours — the protocol parameters unusable, the build failing
+ * unexpectedly, or the body-identity and signing guards — is {@code error}; every refusal by name is
+ * {@code no-op}. A candidate the fence stopped, and an escrow that is not ready, count nothing.
  */
 @Service
 @Slf4j
@@ -73,38 +92,13 @@ public class CompoundExecutor {
     /** 30 s of backdate, matching the liquidation path. Anchored to the tip, never to the clock. */
     private static final long VALID_FROM_BACKDATE_MILLIS = 30_000L;
     private static final long VALIDITY_WINDOW_MILLIS = 120_000L;
-    private static final int MAX_PROVIDER_RESPONSE_LENGTH = 131_072;
-    private static final int MAX_PROVIDER_JSON_DEPTH = 16;
-    private static final int MAX_PROVIDER_JSON_STRING_LENGTH = 65_536;
-    private static final int MAX_PROVIDER_JSON_NUMBER_LENGTH = 20;
-    private static final int MIN_PROVIDER_ROOT_MEMBERS = 3;
-    private static final int MAX_PROVIDER_ROOT_MEMBERS = 32;
     /** FAB-180: an unchanged cycle summary is still said at INFO this often, so a quiet log is not a dead one. */
     private static final Duration SUMMARY_HEARTBEAT = Duration.ofHours(1);
-    private static final ObjectMapper BLOCKFROST_ERROR_MAPPER = new ObjectMapper(JsonFactory.builder()
-            .streamReadConstraints(StreamReadConstraints.builder()
-                    .maxNestingDepth(MAX_PROVIDER_JSON_DEPTH)
-                    .maxStringLength(MAX_PROVIDER_JSON_STRING_LENGTH)
-                    .maxNameLength(MAX_PROVIDER_JSON_STRING_LENGTH)
-                    .maxNumberLength(MAX_PROVIDER_JSON_NUMBER_LENGTH)
-                    .build())
-            .build());
 
     /** Everything this class can do to the network: hand over bytes. */
     @FunctionalInterface
     public interface TransactionSubmitter {
         Result<String> submit(byte[] signedTransactionBytes) throws Exception;
-    }
-
-    enum CandidateOutcome {
-        DEFINITE_FAILURE,
-        SUBMITTED,
-        WOULD_SUBMIT,
-        AMBIGUOUS;
-
-        boolean terminal() {
-            return this != DEFINITE_FAILURE;
-        }
     }
 
     /**
@@ -152,7 +146,22 @@ public class CompoundExecutor {
     private final LiquidationUtxoResolver utxoResolver;
     private final UtxoSupplier utxoSupplier;
     private final CardanoConverters converters;
+    /** FAB-185: sizes C ({@code WalletShape.collateralLovelace}) and U's fee ceiling, once per walk. */
+    private final ProtocolParamsSupplier protocolParamsSupplier;
     private final TransactionSubmitter submitter;
+
+    /**
+     * FAB-185: the wallet rebalancer, read for one thing only — its last outcome, which every wallet-role
+     * refusal names, because the rebalancer is what keeps C and U in place. Setter-injected and REQUIRED in
+     * the container, like the liquidation executor's; null only in a direct test construction, where a
+     * refusal says the rebalancer is not wired.
+     */
+    private WalletRebalancer walletRebalancer;
+
+    @Autowired
+    public void setWalletRebalancer(WalletRebalancer walletRebalancer) {
+        this.walletRebalancer = walletRebalancer;
+    }
 
     /**
      * ⛔ Closed by {@code LoansConfigVerifier} when the live Lending v4 config does not match what this
@@ -218,7 +227,7 @@ public class CompoundExecutor {
                             ProtocolParamsSupplier protocolParamsSupplier,
                             BFBackendService backendService) {
         this(configuration, network, blockEventListener, appUtxoService, account, scanner, economics,
-                builder, utxoResolver, utxoSupplier, converters,
+                builder, utxoResolver, utxoSupplier, converters, protocolParamsSupplier,
                 bytes -> {
                     // FAB-134 B5a: a rejection naming the parameters refreshes them; the result itself
                     // is returned untouched (nothing retried, no outcome changed).
@@ -228,7 +237,10 @@ public class CompoundExecutor {
                 });
     }
 
-    /** The same loop with the submitter stated, so a test can watch exactly what reaches the wire. */
+    /**
+     * The same loop with the submitter stated, so a test can watch exactly what reaches the wire. The
+     * protocol parameters are stated too (FAB-185): they size the wallet's roles C and U.
+     */
     public CompoundExecutor(AppConfig.CompoundConfiguration configuration,
                             AppConfig.Network network,
                             BlockEventListener blockEventListener,
@@ -240,6 +252,7 @@ public class CompoundExecutor {
                             LiquidationUtxoResolver utxoResolver,
                             UtxoSupplier utxoSupplier,
                             CardanoConverters converters,
+                            ProtocolParamsSupplier protocolParamsSupplier,
                             TransactionSubmitter submitter) {
         this.configuration = configuration;
         this.network = network;
@@ -252,32 +265,51 @@ public class CompoundExecutor {
         this.utxoResolver = utxoResolver;
         this.utxoSupplier = utxoSupplier;
         this.converters = converters;
+        this.protocolParamsSupplier = protocolParamsSupplier;
         this.submitter = submitter;
     }
 
-    @Scheduled(timeUnit = TimeUnit.SECONDS, fixedDelayString = "${loans.compound.delay-seconds:60}")
-    public void runCycle() {
-        // One bad cycle must not take the scheduler thread with it.
-        try {
-            cycle();
-        } catch (Exception e) {
-            log.error("compound cycle failed: {}", e.toString(), e);
-        }
+    /** One walk behind a fence that never closes. */
+    WorkResult cycle() {
+        return cycle(SubmitFence.OPEN);
     }
 
-    void cycle() {
+    /** One walk, counted on a tally nobody reads. The answer is exactly {@link #cycle(SubmitFence, StageTally)}'s. */
+    public WorkResult cycle(SubmitFence fence) {
+        return cycle(fence, new StageTally());
+    }
+
+    /**
+     * What one ready candidate's walk ended as, beyond its returned {@link WorkResult}, for {@code stageTally}
+     * (FAB-195): a decoded refusal ({@code attempted}), or a failure of ours ({@code error}). Neither decides
+     * anything; created per candidate and dropped with it.
+     */
+    private static final class CandidateEnding {
+        private boolean attempted;
+        private boolean error;
+    }
+
+    /**
+     * One walk. Returns the terminal outcome that ended it, or {@link WorkResult#DEFINITE_FAILURE} when
+     * nothing terminal happened — including every return before the walk. {@code fence} is read before
+     * each ready candidate and immediately before transmitting; once it reads {@code false} nothing more
+     * is transmitted, the walk ends, and the summary counts the rest as {@code not reached}. It is not
+     * retained after the call. Each ready candidate the walk reaches is counted once on {@code stageTally}, which
+     * nothing here reads back.
+     */
+    public WorkResult cycle(SubmitFence fence, StageTally stageTally) {
         if (refusedByLendingConfigGate("compound")) {
-            return;
+            return WorkResult.DEFINITE_FAILURE;
         }
         if (blockEventListener.getIsSyncing().get()) {
             log.debug("compound: still syncing, skipping the cycle");
-            return;
+            return WorkResult.DEFINITE_FAILURE;
         }
 
         CompoundCandidateScanner.Scan scan = scanner.scan();
         if (scan.candidates().isEmpty()) {
             log.debug("compound: no asset-manager escrows in the index");
-            return;
+            return WorkResult.DEFINITE_FAILURE;
         }
 
         CycleTally tally = new CycleTally();
@@ -314,6 +346,13 @@ public class CompoundExecutor {
             }
         }
 
+        // ⛔ FAB-185 — THE WALLET'S ROLES, RESOLVED ONCE FOR THIS WALK FROM ONE READ.
+        //
+        // Below the scan and the ranking, and only when an ARMED walk has a ready candidate: a disarmed walk
+        // builds nothing and never needed the wallet, so it still does not read it. Every candidate of the
+        // walk is funded from U with C as its collateral; a missing role is said once per role per walk.
+        WalletCheck walletCheck = configuration.isEnabled() && tally.ready > 0 ? walletCheck() : null;
+
         // Every escrow is reported, refused or not: "nothing to do" and "eight things all blocked"
         // must not look alike to an operator. Per escrow at DEBUG; the cycle's summary carries the counts.
         int readyWalked = 0;
@@ -323,14 +362,42 @@ public class CompoundExecutor {
                         candidate.escrowRef(), candidate.exclusion(), candidate.detail());
                 continue;
             }
-            readyWalked++;
-            if (consider(candidate, tally).terminal()) {
+            if (!fence.mayProceed()) {
+                // FAB-183: the chain rolled back or the pass deadline passed. Nothing more goes out.
                 tally.notReached = tally.ready - readyWalked;
                 logSummary(tally);
-                return;
+                return WorkResult.DEFINITE_FAILURE;
+            }
+            readyWalked++;
+            CandidateEnding ending = new CandidateEnding();
+            WorkResult outcome = consider(candidate, tally, fence, walletCheck, ending);
+            count(outcome, ending, stageTally);
+            if (outcome.terminal()) {
+                tally.notReached = tally.ready - readyWalked;
+                logSummary(tally);
+                return outcome;
             }
         }
         logSummary(tally);
+        return WorkResult.DEFINITE_FAILURE;
+    }
+
+    /**
+     * FAB-195: one ready candidate, into exactly one bucket. AMBIGUOUS is counted as submitted: nothing says the
+     * bytes did not go out (a display merge; the pipeline still ends the pass on it).
+     */
+    private static void count(WorkResult outcome, CandidateEnding ending, StageTally stageTally) {
+        if (outcome == WorkResult.SUBMITTED || outcome == WorkResult.AMBIGUOUS) {
+            stageTally.recordSubmitted();
+        } else if (outcome == WorkResult.WOULD_SUBMIT) {
+            stageTally.recordWouldSubmit();
+        } else if (ending.attempted) {
+            stageTally.recordAttempted();
+        } else if (ending.error) {
+            stageTally.recordError();
+        } else {
+            stageTally.recordNoOp();
+        }
     }
 
     /**
@@ -432,7 +499,8 @@ public class CompoundExecutor {
         return ordered;
     }
 
-    private CandidateOutcome consider(CompoundCandidate candidate, CycleTally tally) {
+    private WorkResult consider(CompoundCandidate candidate, CycleTally tally, SubmitFence fence,
+                                WalletCheck walletCheck, CandidateEnding ending) {
         if (!configuration.isEnabled()) {
             // Not a fault. Said at DEBUG per escrow (FAB-180); the cycle summary's `not armed` count is
             // what answers an operator asking why a ready candidate went unprocessed.
@@ -441,7 +509,7 @@ public class CompoundExecutor {
                             + "compoudingFeePerMille={} — set loans.compound.enabled=true to act on it",
                     candidate.loanId(), candidate.escrowRef(), candidate.addedLiquidity(),
                     candidate.poolId(), candidate.feePerMille());
-            return CandidateOutcome.DEFINITE_FAILURE;
+            return WorkResult.DEFINITE_FAILURE;
         }
 
         Optional<Utxo> bondUtxo = utxoResolver.resolveBondUtxo(candidate.bond());
@@ -452,29 +520,17 @@ public class CompoundExecutor {
                     bondUtxo.isEmpty() ? "the lender bond " : "",
                     configUtxo.isEmpty() ? "the config " : "",
                     lmConfigUtxo.isEmpty() ? "the lm config " : "");
-            return CandidateOutcome.DEFINITE_FAILURE;
+            return WorkResult.DEFINITE_FAILURE;
         }
 
-        List<Utxo> walletUtxos = appUtxoService.listWalletUtxo();
-        final WalletInputSelection.CompoundFunding funding;
-        try {
-            funding = WalletInputSelection.selectForCompound(walletUtxos, BigInteger.ZERO);
-        } catch (WalletInputSelection.CompoundFundingException e) {
-            // ⛔ "Nothing qualified" cannot tell an EMPTY wallet from a FULL one whose every UTxO is
-            // ineligible, and those need opposite responses. Measured 2026-09-02: the wallet held
-            // 9,898 ada and could not build, because its only UTxO also carried a native token —
-            // CCL trap 17, where a successful transaction's change output disables the next one.
-            long total = walletUtxos.stream()
-                    .flatMap(u -> u.getAmount().stream())
-                    .filter(a -> "lovelace".equals(a.getUnit()))
-                    .mapToLong(a -> a.getQuantity().longValue()).sum();
-            long multiAsset = walletUtxos.stream().filter(u -> u.getAmount().size() > 1).count();
-            log.warn("compound SKIPPED {}: {}. Wallet has {} utxo(s), {} lovelace and {} "
-                            + "token-bearing utxo(s); ordinary compound inputs may carry safe token "
-                            + "change, while collateral must be a distinct pure-ADA UTxO",
-                    candidate.loanId(), e.reason(), walletUtxos.size(), total, multiAsset);
-            return CandidateOutcome.DEFINITE_FAILURE;
+        // ⛔ FAB-185: funded from U, the walk's ONE ordinary wallet input, with C as the only collateral —
+        // both resolved once for the walk, never re-read here. A missing role or a U below the fee ceiling
+        // refuses this candidate; nothing is built from another wallet output instead.
+        Utxo fundingUtxo = designatedU(candidate, walletCheck, ending);
+        if (fundingUtxo == null) {
+            return WorkResult.DEFINITE_FAILURE;
         }
+        Utxo collateralUtxo = walletCheck.roles().c().orElseThrow();
 
         // THE validator's fee (ADA: at least 1 ADA since 2026-10-26; token: Q*c/1000). It is what the
         // builder hands the pool owner's share to, what the pool output is reduced by, and what is priced.
@@ -497,23 +553,26 @@ public class CompoundExecutor {
             tally.notApproved(exclusion);
             log.debug("compound NOT APPROVED {} escrow {}: {} — F={} raw units, quote={}",
                     candidate.loanId(), candidate.escrowRef(), exclusion, fee, quote.refusal());
-            return CandidateOutcome.DEFINITE_FAILURE;
+            return WorkResult.DEFINITE_FAILURE;
         }
 
         CompoundTransactionBuilder.Built built;
         try {
             built = builder.buildWithFacts(new CompoundTransactionBuilder.Request(
                     candidate, referenceScripts(), bondUtxo.get(), configUtxo.get(), lmConfigUtxo.get(),
-                    funding.ordinaryInput(),
-                    account.baseAddress(), fee, slots[0], slots[1]));
+                    fundingUtxo,
+                    account.baseAddress(), fee, slots[0], slots[1], collateralUtxo));
         } catch (CompoundTransactionBuilder.RefusedException e) {
             log.warn("compound REFUSED BY BUILDER {} escrow {}: {}", candidate.loanId(),
                     candidate.escrowRef(), e.getMessage());
-            return CandidateOutcome.DEFINITE_FAILURE;
+            return WorkResult.DEFINITE_FAILURE;
         } catch (Exception e) {
+            // FAB-195: one ERROR line with the whole cause chain; the stack trace goes to DEBUG.
+            ending.error = true;
             log.error("compound BUILD FAILED {} escrow {}: {}", candidate.loanId(),
-                    candidate.escrowRef(), e.toString(), e);
-            return CandidateOutcome.DEFINITE_FAILURE;
+                    candidate.escrowRef(), LiquidationExecutor.causeChain(e));
+            log.debug("compound BUILD FAILED {} escrow {}", candidate.loanId(), candidate.escrowRef(), e);
+            return WorkResult.DEFINITE_FAILURE;
         }
 
         // ⛔ The gate runs on the BUILT transaction's own fee — measured, not estimated.
@@ -538,15 +597,15 @@ public class CompoundExecutor {
                               + "1 ADA floor and a token pool pays nothing; this measured net requires a "
                               + "lower operator-stated floor)"
                             : "");
-            return CandidateOutcome.DEFINITE_FAILURE;
+            return WorkResult.DEFINITE_FAILURE;
         }
 
-        return submit(candidate, built, assessment, quote, tally);
+        return submit(candidate, built, assessment, quote, tally, fence, ending);
     }
 
-    private CandidateOutcome submit(CompoundCandidate candidate, CompoundTransactionBuilder.Built built,
-                                    CompoundAssessment assessment, PricingService.Priced quote,
-                                    CycleTally tally) {
+    private WorkResult submit(CompoundCandidate candidate, CompoundTransactionBuilder.Built built,
+                              CompoundAssessment assessment, PricingService.Priced quote,
+                              CycleTally tally, SubmitFence fence, CandidateEnding ending) {
         // ⛔ THE NETWORK GATE IS GONE — `loans.submittable-network` was removed on 2026-09-04
         // (Giovanni: "a barrier that silently blocks submission even when everything else is armed
         // is a bug, not a safeguard"). `config.network` alone decides where this node acts, and it
@@ -567,9 +626,10 @@ public class CompoundExecutor {
         Transaction transaction = built.transaction();
         if (!Arrays.equals(built.facts().bodyIdentity(),
                 CompoundTransactionBuilder.bodyIdentity(transaction))) {
+            ending.error = true;
             log.warn("compound REFUSED {}: validated transaction body changed before signing",
                     candidate.loanId());
-            return CandidateOutcome.DEFINITE_FAILURE;
+            return WorkResult.DEFINITE_FAILURE;
         }
         CompoundExclusion observationRefusal = economics.revalidateObservation(assessment,
                 candidate.bond().datum().principalAsset(), System.currentTimeMillis());
@@ -577,7 +637,7 @@ public class CompoundExecutor {
             tally.notApproved(observationRefusal);
             log.info("compound NOT APPROVED {} escrow {}: {} immediately before signing",
                     candidate.loanId(), candidate.escrowRef(), observationRefusal);
-            return CandidateOutcome.DEFINITE_FAILURE;
+            return WorkResult.DEFINITE_FAILURE;
         }
         CompoundAssessment finalAssessment = economics.assessFinal(true, true,
                 candidate.bond().datum().principalAsset(), candidate.addedLiquidity(),
@@ -586,7 +646,7 @@ public class CompoundExecutor {
             tally.notApproved(finalAssessment.exclusion());
             log.info("compound NOT APPROVED {} escrow {}: {} on the immediate pre-sign recheck",
                     candidate.loanId(), candidate.escrowRef(), finalAssessment.exclusion());
-            return CandidateOutcome.DEFINITE_FAILURE;
+            return WorkResult.DEFINITE_FAILURE;
         }
         assessment = finalAssessment;
 
@@ -596,172 +656,158 @@ public class CompoundExecutor {
             Transaction signedTransaction = Transaction.deserialize(signed);
             if (!Arrays.equals(built.facts().bodyIdentity(),
                     CompoundTransactionBuilder.bodyIdentity(signedTransaction))) {
+                ending.error = true;
                 log.error("compound SIGN FAILED {}: signer changed the validated transaction body; "
                         + "nothing was transmitted", candidate.loanId());
-                return CandidateOutcome.DEFINITE_FAILURE;
+                return WorkResult.DEFINITE_FAILURE;
             }
         } catch (Exception e) {
+            ending.error = true;
             log.error("compound SIGN FAILED {}: {} — nothing was transmitted",
                     candidate.loanId(), e.toString(), e);
-            return CandidateOutcome.DEFINITE_FAILURE;
+            return WorkResult.DEFINITE_FAILURE;
         }
 
+        // ⛔ THE LAST LOOK BEFORE THE WIRE. A definite failure, not a terminal outcome: nothing went out,
+        // and the walk's own fence check stops it before the next candidate.
+        if (!fence.mayProceed()) {
+            log.info("compound FENCED {}: nothing transmitted", candidate.loanId());
+            return WorkResult.DEFINITE_FAILURE;
+        }
         try {
             Result<String> result = submitter.submit(signed);
-            if (result != null && result.isSuccessful()) {
-                boolean wouldSubmit = "WOULD_SUBMIT".equals(result.getValue())
-                        || "WOULD_SUBMIT".equals(result.getResponse());
-                log.info("{} {} escrow {}: Q={} raw units into pool {}, F={} raw units, priced "
-                                + "reward={} lovelace, recovered E={} lovelace, final fee L={} lovelace, "
-                                + "pool top-up T={} lovelace, net={} lovelace — tx {}",
-                        wouldSubmit ? "WOULD_SUBMIT" : "COMPOUNDED",
-                        candidate.loanId(), candidate.escrowRef(), candidate.addedLiquidity(),
-                        candidate.poolId(), assessment.expectedFee(), assessment.expectedFeeLovelace(),
-                        assessment.recoveredEscrowLovelace(), assessment.txFee(),
-                        assessment.poolTopUpLovelace(), assessment.net(), result.getValue());
-                return wouldSubmit ? CandidateOutcome.WOULD_SUBMIT : CandidateOutcome.SUBMITTED;
+            WorkResult outcome = WorkResult.classify(result);
+            switch (outcome) {
+                case SUBMITTED, WOULD_SUBMIT -> {
+                    log.info("{} {} escrow {}: Q={} raw units into pool {}, F={} raw units, priced "
+                                    + "reward={} lovelace, recovered E={} lovelace, final fee L={} lovelace, "
+                                    + "pool top-up T={} lovelace, net={} lovelace — tx {}",
+                            outcome == WorkResult.WOULD_SUBMIT ? "WOULD_SUBMIT" : "COMPOUNDED",
+                            candidate.loanId(), candidate.escrowRef(), candidate.addedLiquidity(),
+                            candidate.poolId(), assessment.expectedFee(), assessment.expectedFeeLovelace(),
+                            assessment.recoveredEscrowLovelace(), assessment.txFee(),
+                            assessment.poolTopUpLovelace(), assessment.net(), result.getValue());
+                }
+                case DEFINITE_FAILURE -> {
+                    ending.attempted = true;
+                    log.warn("compound SUBMIT REJECTED {} by decoded Blockfrost provider submit refusal "
+                                    + "(HTTP {}): {}",
+                            candidate.loanId(), result.code(), result.getResponse());
+                }
+                case AMBIGUOUS -> {
+                    log.error("compound SUBMIT AMBIGUOUS {}: {}", candidate.loanId(),
+                            result == null ? "no response" : result);
+                }
             }
-            if (isDecodedBlockfrostProviderSubmitRefusal(result)) {
-                log.warn("compound SUBMIT REJECTED {} by decoded Blockfrost provider submit refusal "
-                                + "(HTTP {}): {}",
-                        candidate.loanId(), result.code(), result.getResponse());
-                return CandidateOutcome.DEFINITE_FAILURE;
-            }
-            log.error("compound SUBMIT AMBIGUOUS {}: {}", candidate.loanId(),
-                    result == null ? "no response" : result);
-            return CandidateOutcome.AMBIGUOUS;
+            return outcome;
         } catch (Exception e) {
             log.error("compound SUBMIT AMBIGUOUS {}: transport threw {}; candidate pass stops",
                     candidate.loanId(), e.toString(), e);
-            return CandidateOutcome.AMBIGUOUS;
+            return WorkResult.AMBIGUOUS;
         }
+    }
+
+    // ---- the walk's wallet roles (FAB-185) -------------------------------------------------------
+
+    /** The role names a refusal starts with: {@code role C}, {@code role U}. */
+    static final String ROLE_C = "C";
+    static final String ROLE_U = "U";
+
+    /**
+     * One walk's wallet: the roles resolved from its one read and the fee ceiling U is sized against — or,
+     * when the protocol parameters could not size C, neither, with why and the failure itself — and the missing
+     * roles already said at WARN (or, for unusable parameters, at ERROR). Created per
+     * {@link #cycle(SubmitFence, StageTally)} call and dropped with it; nothing in it outlives it.
+     */
+    private record WalletCheck(WalletRoles roles, BigInteger feeCeiling, String unsizable, Throwable unsizableCause,
+                               Set<String> warnedMissingRoles) {
     }
 
     /**
-     * CCL 0.7.2 exposes a Blockfrost failure only as an HTTP code plus its raw response body.
-     * Continue the candidate pass only for the complete, bounded HTTP-400 envelope documented by
-     * Blockfrost for {@code /tx/submit}. The diagnostic {@code message} is deliberately opaque: the
-     * provider publishes no Cardano/Haskell grammar for it, so its content cannot decide whether a
-     * different candidate may be submitted.
+     * Reads the wallet once and resolves its roles. ⚠ The parameters are REQUIRED: without them C cannot be
+     * sized, and without C no role can be told apart. They are proven usable INSIDE the catch — the fee
+     * ceiling and C are both derived there — so a partial object is "C cannot be sized", never a later
+     * NullPointerException (CCL trap 19).
      */
-    private static boolean isDecodedBlockfrostProviderSubmitRefusal(Result<?> result) {
-        if (result == null || result.isSuccessful() || result.code() != 400
-                || result.getResponse() == null
-                || result.getResponse().length() < 1
-                || result.getResponse().length() > MAX_PROVIDER_RESPONSE_LENGTH) {
-            return false;
-        }
-        String response = result.getResponse();
-        int start = 0;
-        int end = response.length();
-        while (start < end && isJsonWhitespace(response.charAt(start))) {
-            start++;
-        }
-        while (end > start && isJsonWhitespace(response.charAt(end - 1))) {
-            end--;
-        }
-        if (start == end || response.charAt(start) == '\uFEFF') {
-            return false;
-        }
-
+    private WalletCheck walletCheck() {
+        List<Utxo> wallet = appUtxoService.listWalletUtxo();
+        BigInteger feeCeiling;
+        BigInteger collateralLovelace;
         try {
-            JsonParser parser = BLOCKFROST_ERROR_MAPPER.getFactory()
-                    .createParser(response.substring(start, end));
-            parser.enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION);
-            try (parser) {
-                if (parser.nextToken() != JsonToken.START_OBJECT) {
-                    return false;
-                }
-                int depth = 1;
-                int rootMembers = 0;
-                String rootField = null;
-                boolean statusSeen = false;
-                boolean statusValid = false;
-                boolean errorSeen = false;
-                boolean errorValid = false;
-                boolean messageSeen = false;
-                boolean messageValid = false;
+            ProtocolParams params = protocolParamsSupplier.getProtocolParams();
+            feeCeiling = LedgerCeilings.maxPossibleFee(params);
+            collateralLovelace = WalletShape.collateralLovelace(params);
+        } catch (Exception e) {
+            return new WalletCheck(null, null, "the protocol parameters are unusable ("
+                    + LiquidationExecutor.causeChain(e) + "), so C cannot be sized and no wallet output can be "
+                    + "told apart", e, new HashSet<>());
+        }
+        WalletRoles roles = WalletRoles.resolve(wallet, collateralLovelace);
+        log.debug("compound wallet roles for this walk: C {}, U {}",
+                roles.c().map(c -> WalletRoles.ref(c) + " (" + collateralLovelace + " lovelace)").orElse("none"),
+                roles.u().map(u -> WalletRoles.ref(u) + " (" + LedgerCeilings.lovelaceOf(u) + " lovelace)")
+                        .orElse("none"));
+        return new WalletCheck(roles, feeCeiling, null, null, new HashSet<>());
+    }
 
-                JsonToken token;
-                while ((token = parser.nextToken()) != null) {
-                    if (depth == 0) {
-                        return false;
-                    }
-                    if (token == JsonToken.FIELD_NAME) {
-                        if (parser.currentName().length() > MAX_PROVIDER_JSON_STRING_LENGTH) {
-                            return false;
-                        }
-                        if (depth == 1) {
-                            rootMembers++;
-                            if (rootMembers > MAX_PROVIDER_ROOT_MEMBERS) {
-                                return false;
-                            }
-                            rootField = parser.currentName();
-                        }
-                        continue;
-                    }
-                    if (token == JsonToken.START_OBJECT || token == JsonToken.START_ARRAY) {
-                        if (depth == 1 && rootField != null) {
-                            if ("status_code".equals(rootField)) {
-                                statusSeen = true;
-                            } else if ("error".equals(rootField)) {
-                                errorSeen = true;
-                            } else if ("message".equals(rootField)) {
-                                messageSeen = true;
-                            }
-                            rootField = null;
-                        }
-                        depth++;
-                        if (depth > MAX_PROVIDER_JSON_DEPTH) {
-                            return false;
-                        }
-                        continue;
-                    }
-                    if (token == JsonToken.END_OBJECT || token == JsonToken.END_ARRAY) {
-                        depth--;
-                        if (depth < 0) {
-                            return false;
-                        }
-                        continue;
-                    }
-                    if (token == JsonToken.VALUE_STRING
-                            && parser.getText().length() > MAX_PROVIDER_JSON_STRING_LENGTH) {
-                        return false;
-                    }
-                    if ((token == JsonToken.VALUE_NUMBER_INT || token == JsonToken.VALUE_NUMBER_FLOAT)
-                            && parser.getText().length() > MAX_PROVIDER_JSON_NUMBER_LENGTH) {
-                        return false;
-                    }
-                    if (depth == 1 && rootField != null) {
-                        if ("status_code".equals(rootField)) {
-                            statusSeen = true;
-                            statusValid = token == JsonToken.VALUE_NUMBER_INT
-                                    && BigInteger.valueOf(400).equals(parser.getBigIntegerValue())
-                                    && result.code() == 400;
-                        } else if ("error".equals(rootField)) {
-                            errorSeen = true;
-                            errorValid = token == JsonToken.VALUE_STRING
-                                    && "Bad Request".equals(parser.getText());
-                        } else if ("message".equals(rootField)) {
-                            messageSeen = true;
-                            messageValid = token == JsonToken.VALUE_STRING;
-                        }
-                        rootField = null;
-                    }
-                }
-                return depth == 0
-                        && rootMembers >= MIN_PROVIDER_ROOT_MEMBERS
-                        && statusSeen && statusValid
-                        && errorSeen && errorValid
-                        && messageSeen && messageValid;
+    /**
+     * U, when this walk has both roles and U holds at least the fee ceiling; otherwise null, said: a missing
+     * role at WARN once per role per walk (DEBUG after), a U that is too small at WARN for this candidate.
+     * Unusable protocol parameters are a failure of ours, not a missing role (FAB-195): an {@code error} for every
+     * candidate they refuse, said in ONE ERROR line per walk with the cause chain, its stack trace at DEBUG, and
+     * at DEBUG after that.
+     */
+    private Utxo designatedU(CompoundCandidate candidate, WalletCheck walletCheck, CandidateEnding ending) {
+        if (walletCheck.roles() == null) {
+            ending.error = true;
+            String detail = "role %s is missing: %s, so this compound has nothing to be funded from; %s"
+                    .formatted(ROLE_C, walletCheck.unsizable(), rebalancerOutcome());
+            if (walletCheck.warnedMissingRoles().add(ROLE_C)) {
+                log.error("compound SKIPPED {}: {}", candidate.loanId(), detail);
+                log.debug("compound SKIPPED {}: the protocol parameters are unusable", candidate.loanId(),
+                        walletCheck.unsizableCause());
+            } else {
+                log.debug("compound SKIPPED {}: {}", candidate.loanId(), detail);
             }
-        } catch (java.io.IOException | RuntimeException ignored) {
-            return false;
+            return null;
+        }
+        WalletRoles roles = walletCheck.roles();
+        if (roles.c().isEmpty()) {
+            missingRole(candidate, walletCheck, ROLE_C, "the wallet holds no ada-only output (no datum, no "
+                    + "reference script) of exactly " + roles.collateralLovelace() + " lovelace, the collateral");
+            return null;
+        }
+        if (roles.u().isEmpty()) {
+            missingRole(candidate, walletCheck, ROLE_U, "the wallet holds no ada-only output (no datum, no "
+                    + "reference script) besides C, the " + roles.collateralLovelace() + "-lovelace collateral");
+            return null;
+        }
+        Utxo u = roles.u().get();
+        BigInteger holds = LedgerCeilings.lovelaceOf(u);
+        if (holds.compareTo(walletCheck.feeCeiling()) < 0) {
+            log.warn("compound SKIPPED {}: role U, wallet output {}, holds {} lovelace — too small for the fee "
+                            + "ceiling of {} lovelace (a pre-build ceiling: the build is the judge); {}",
+                    candidate.loanId(), WalletRoles.ref(u), holds, walletCheck.feeCeiling(), rebalancerOutcome());
+            return null;
+        }
+        return u;
+    }
+
+    /** Says a missing {@code role} for {@code candidate}: at WARN the first time in this walk, at DEBUG after. */
+    private void missingRole(CompoundCandidate candidate, WalletCheck walletCheck, String role, String why) {
+        String detail = "role %s is missing: %s, so this compound has nothing to be funded from; %s"
+                .formatted(role, why, rebalancerOutcome());
+        if (walletCheck.warnedMissingRoles().add(role)) {
+            log.warn("compound SKIPPED {}: {}", candidate.loanId(), detail);
+        } else {
+            log.debug("compound SKIPPED {}: {}", candidate.loanId(), detail);
         }
     }
 
-    private static boolean isJsonWhitespace(char c) {
-        return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+    /** What a role refusal says about the rebalancer, which is what keeps the wallet in shape. */
+    private String rebalancerOutcome() {
+        return walletRebalancer == null ? "the wallet rebalancer is not wired"
+                : "the wallet rebalancer's last outcome: " + walletRebalancer.lastOutcome();
     }
 
     /**

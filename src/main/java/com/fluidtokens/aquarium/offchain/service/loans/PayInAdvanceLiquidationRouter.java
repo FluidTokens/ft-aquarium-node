@@ -139,6 +139,10 @@ public class PayInAdvanceLiquidationRouter {
      * Assembles and builds the pay-in-advance liquidation for one already-resolved convert candidate,
      * or refuses it cleanly.
      *
+     * @param collateralUtxo  ⛔ FAB-185 — the executor's wallet role C, handed to the builder UNCHANGED as the
+     *                        transaction's only collateral. This router never chooses, substitutes or
+     *                        inspects it; the builder refuses an invalid one by name
+     *                        ({@code COLLATERAL_UTXO_INVALID}).
      * @param validFromMillis the requested window lower bound — the same {@code now - backdate} the
      *                        plain path passes; clamped inwards to a whole slot here
      * @param validToMillis   the requested window upper bound — the same {@code now + window} the plain
@@ -164,6 +168,7 @@ public class PayInAdvanceLiquidationRouter {
                                         Map<String, OracleEntry> oraclesByUnit,
                                         BigInteger principalBalance,
                                         Function<BigInteger, Optional<Utxo>> walletSelector,
+                                        Utxo collateralUtxo,
                                         long validFromMillis,
                                         long validToMillis) {
         LoanDatum datum = assessment.loan().datum();
@@ -302,7 +307,10 @@ public class PayInAdvanceLiquidationRouter {
                         // Same operator setting the plain path uses, threaded the same way. Without it
                         // this path builds transactions the oracle feed cannot cover and the validator
                         // aborts with an empty trace — see the builder's V3 comment.
-                        configuration.getOracleWindowMarginSeconds() * 1000L);
+                        configuration.getOracleWindowMarginSeconds() * 1000L,
+                        // FAB-185 — role C, exactly as the executor handed it in: pinned by the builder as
+                        // the only collateral and never spent. Passed through, never chosen here.
+                        collateralUtxo);
         return builder.build(request);
     }
 

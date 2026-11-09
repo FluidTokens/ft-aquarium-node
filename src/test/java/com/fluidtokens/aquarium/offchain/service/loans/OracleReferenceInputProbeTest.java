@@ -393,6 +393,48 @@ class OracleReferenceInputProbeTest {
         verifyNoMoreInteractions(blockfrost);
     }
 
+    // ---- FAB-183: "not yet visible" is a wait, and only the content-unknown branch is one ---------------
+
+    /** An out-ref whose content the node cannot see yet — a provider announced by a fresher price. */
+    @Test
+    void anOutRefWhoseContentIsUnknownIsNotYetVisible() throws Exception {
+        UtxoService blockfrost = mock(UtxoService.class);
+        when(blockfrost.getUtxos(FEED_ADDRESS, FEED_NFT.toUnit(), 100, 1)).thenReturn(ok(FEED_UTXO));
+
+        var e = refused(() -> probe(blockfrost, FEED_UTXO).requireLive(List.of(c3(FEED_NFT, FEED_REF, C3_NFT))));
+
+        assertTrue(e.notYetVisible(), "no content for the out-ref is a wait: " + e.getMessage());
+        verify(blockfrost, never()).getUtxos(anyString(), anyString(), anyInt(), anyInt());
+    }
+
+    /** Spent (the NFT now elsewhere), 404 and a provider error are facts or faults, never a wait. */
+    @Test
+    void spentA404AndAProviderErrorAreNotNotYetVisible() throws Exception {
+        Utxo moved = holding(LoanFixtures.input("77".repeat(32), 3), FEED_ADDRESS, FEED_NFT);
+        List<Result<List<Utxo>>> answers = List.of(ok(moved), failed(404, "{\"status_code\":404}"),
+                failed(500, "{\"status_code\":500}"));
+        for (Result<List<Utxo>> answer : answers) {
+            UtxoService blockfrost = mock(UtxoService.class);
+            when(blockfrost.getUtxos(FEED_ADDRESS, FEED_NFT.toUnit(), 100, 1)).thenReturn(answer);
+
+            var e = refused(() -> probe(blockfrost, FEED_UTXO).requireLive(List.of(multisig())));
+
+            assertFalse(e.notYetVisible(), "not a wait: " + e.getMessage());
+        }
+        UtxoService throwing = mock(UtxoService.class);
+        when(throwing.getUtxos(FEED_ADDRESS, FEED_NFT.toUnit(), 100, 1))
+                .thenThrow(new ApiException("connect timed out"));
+        var thrown = refused(() -> probe(throwing, FEED_UTXO).requireLive(List.of(multisig())));
+        assertFalse(thrown.notYetVisible(), "a throwing provider is not a wait: " + thrown.getMessage());
+        // and the branches decided before any call: a missing provider NFT, two NFTs at one out-ref
+        var noNft = refused(() -> probe(mock(UtxoService.class), FEED_UTXO, PROVIDER_UTXO)
+                .requireLive(List.of(c3(FEED_NFT, FEED_REF, null))));
+        assertFalse(noNft.notYetVisible(), noNft.getMessage());
+        var twoNfts = refused(() -> probe(mock(UtxoService.class), FEED_UTXO, PROVIDER_UTXO).requireLive(List.of(
+                c3(FEED_NFT, FEED_REF, C3_NFT), c3(FEED_NFT_V2, FEED_REF, C3_NFT))));
+        assertFalse(twoNfts.notYetVisible(), twoNfts.getMessage());
+    }
+
     /** Every refusal text this class can produce, gathered and checked for the two §13 markers. */
     @Test
     void noRefusalTextCarriesASpentInputMarker() throws Exception {

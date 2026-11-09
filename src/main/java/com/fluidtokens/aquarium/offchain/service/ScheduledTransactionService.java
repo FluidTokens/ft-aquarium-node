@@ -6,7 +6,7 @@ import com.bloxbean.cardano.client.common.model.Network;
 import com.bloxbean.cardano.client.api.util.ValueUtil;
 import com.bloxbean.cardano.client.function.helper.SignerProviders;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
-import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
+import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.fluidtokens.aquarium.offchain.service.loans.ReferenceScriptSafeUtxoSelection;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
 import com.bloxbean.cardano.client.quicktx.ScriptTx;
@@ -117,11 +117,13 @@ public class ScheduledTransactionService {
 
 
     /**
-     * Only the dump-mode evaluator reads this ({@code scheduling.transaction-processor.dump-cbor}):
-     * it wraps the same Blockfrost evaluation the {@code QuickTxBuilder} bean's processor performs.
-     * Coin selection no longer goes through it — see {@link #utxoSupplier}.
+     * FAB-38: the shared {@code YaciConfig.transactionEvaluator} bean — the node's one script-cost
+     * evaluator, the very instance the {@code QuickTxBuilder} bean's processor slot evaluates through.
+     * Only the dump-mode wrapper reads it here ({@code scheduling.transaction-processor.dump-cbor});
+     * outside dump mode the tank is evaluated through that processor slot and this field is not touched.
+     * Unconditional: {@code YaciConfig} declares that bean with no condition.
      */
-    private final BFBackendService bfBackendService;
+    private final TransactionEvaluator transactionEvaluator;
 
     /**
      * The shared {@code YaciConfig} bean: the chain's protocol parameters, fetched once per epoch
@@ -434,9 +436,10 @@ public class ScheduledTransactionService {
                 // rejected. For a decode failure at offset 0, "close" is useless: the whole question
                 // is which byte is wrong.
                 //
-                // ⚠ This wraps the SAME backend evaluator the bean already uses, so it changes
-                // nothing about where evaluation happens -- it only copies the payload to the log on
-                // the way past, and returns the backend's own answer untouched.
+                // ⚠ This wraps the SAME injected evaluator bean (YaciConfig.transactionEvaluator) the
+                // QuickTxBuilder bean's processor slot already evaluates through, so it changes nothing
+                // about where evaluation happens -- it only copies the payload to the log on the way
+                // past, and returns the bean's own answer untouched.
                 if (dumpCbor) {
                     var dumpTank = tankPaymentUtxo;
                     composed = composed.withTxEvaluator((cbor, inputUtxos) -> {
@@ -445,7 +448,7 @@ public class ScheduledTransactionService {
                                 dumpTank.getTxHash(), dumpTank.getOutputIndex(), cbor.length,
                                 inputUtxos == null ? 0 : inputUtxos.size(),
                                 com.bloxbean.cardano.client.util.HexUtil.encodeHexString(cbor));
-                        return bfBackendService.getTransactionService().evaluateTx(cbor);
+                        return transactionEvaluator.evaluateTx(cbor, inputUtxos);
                     });
                 }
 

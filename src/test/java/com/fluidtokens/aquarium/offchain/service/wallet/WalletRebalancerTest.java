@@ -11,12 +11,13 @@ import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.common.model.Networks;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
-import com.bloxbean.cardano.yaci.store.events.EventMetadata;
-import com.bloxbean.cardano.yaci.store.events.internal.CommitEvent;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Action;
 import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Market;
 import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Mode;
+import com.fluidtokens.aquarium.offchain.service.StageTally;
+import com.fluidtokens.aquarium.offchain.service.SubmitFence;
+import com.fluidtokens.aquarium.offchain.service.WorkResult;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanFixtures;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -40,6 +41,8 @@ import java.util.stream.Collectors;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -169,10 +172,6 @@ class WalletRebalancerTest {
         return List.of(utxo(1_180_000, NIGHT, 15_000_000_000L), utxo(200_000_000));
     }
 
-    private static CommitEvent<?> event() {
-        return new CommitEvent<>(EventMetadata.builder().slot(1L).build(), List.of());
-    }
-
     private List<ILoggingEvent> at(Level level) {
         return logs.list.stream().filter(e -> e.getLevel() == level).toList();
     }
@@ -182,7 +181,7 @@ class WalletRebalancerTest {
     }
 
     private void assertBlocked(WalletRebalancer rebalancer, String why) {
-        rebalancer.onCommit();
+        rebalancer.housekeep(SubmitFence.OPEN);
         assertEquals(0, reads.get(), why + ": a blocked gate must not read the wallet (cheapest first)");
         assertEquals(0, submits.get(), why + ": a blocked gate must not submit");
         assertEquals(0, signs.get(), why + ": a blocked gate must not sign");
@@ -190,7 +189,7 @@ class WalletRebalancerTest {
     }
 
     private void assertRebalancedOnce(WalletRebalancer rebalancer, String why) {
-        rebalancer.onCommit();
+        rebalancer.housekeep(SubmitFence.OPEN);
         assertEquals(1, reads.get(), why + ": the wallet is read once");
         assertEquals(1, signs.get(), why + ": the built transaction is signed once");
         assertEquals(1, submits.get(), why + ": the built transaction is submitted once");
@@ -203,10 +202,19 @@ class WalletRebalancerTest {
         assertRebalancedOnce(rebalancer(true), "every gate open (positive control for the matrix)");
     }
 
+    /**
+     * Env off on this LIVE node: blocked, and — FAB-188 (B1) — the one INFO-or-above line is the WARN that
+     * liquidation depends on a shaped wallet ({@link #anOffOrSuspendedRebalancerOnAShadowOrLiveNodeWarnsOncePerPass}).
+     */
     @Test
     void envOffBlocks() {
         WalletRebalancer rebalancer = rebalancer(false);
-        assertBlocked(rebalancer, "loans.wallet.rebalance.enabled=false");
+        rebalancer.housekeep(SubmitFence.OPEN);
+        assertEquals(0, reads.get(), "env off: a blocked gate must not read the wallet (cheapest first)");
+        assertEquals(0, submits.get(), "env off: a blocked gate must not submit");
+        assertEquals(0, signs.get(), "env off: a blocked gate must not sign");
+        assertEquals(1, atOrAbove(Level.INFO).size(), "env off on a LIVE node: only the B1 WARN: " + logs.list);
+        assertEquals(Level.WARN, atOrAbove(Level.INFO).get(0).getLevel(), String.valueOf(logs.list));
         assertEquals(new WalletRebalancer.State(false, false, false), rebalancer.state());
     }
 
@@ -217,7 +225,7 @@ class WalletRebalancerTest {
 
         rebalancer.suspend();
         assertEquals(new WalletRebalancer.State(true, true, false), rebalancer.state());
-        rebalancer.onCommit();
+        rebalancer.housekeep(SubmitFence.OPEN);
         assertEquals(0, reads.get(), "suspended: no wallet read");
         assertEquals(0, submits.get(), "suspended: no submission");
 
@@ -233,7 +241,7 @@ class WalletRebalancerTest {
         rebalancer.resume();
         assertEquals(new WalletRebalancer.State(false, false, false), rebalancer.state(),
                 "resume can never override env=false");
-        rebalancer.onCommit();
+        rebalancer.housekeep(SubmitFence.OPEN);
         assertEquals(0, reads.get(), "resume after env=false must not read the wallet");
         assertEquals(0, submits.get(), "resume after env=false must not submit");
     }
@@ -258,21 +266,25 @@ class WalletRebalancerTest {
         assertRebalancedOnce(rebalancer(true), "mode " + armed);
     }
 
+    /** FAB-188: the markets no longer arm the rebalancer — a node with only CONVERT markets is armed too. */
     @Test
-    void noAnticipateMarketBlocks() {
+    void onlyConvertMarketsArm() {
         markets.set(List.of(market(NIGHT, Action.CONVERT), market("lovelace", Action.CONVERT)));
-        assertBlocked(rebalancer(true), "only CONVERT markets");
+        assertRebalancedOnce(rebalancer(true), "only CONVERT markets");
+        assertTrue(at(Level.INFO).get(0).getFormattedMessage().contains("relevant []"),
+                "a CONVERT market's token is not relevant: " + at(Level.INFO).get(0).getFormattedMessage());
     }
 
     @Test
-    void noMarketAtAllBlocks() {
+    void noMarketAtAllArms() {
         markets.set(List.of());
-        assertBlocked(rebalancer(true), "no market configured");
+        assertRebalancedOnce(rebalancer(true), "no market configured");
     }
 
     /**
-     * An ADA-principal ANTICIPATE market opens G4 (the bot fronts ADA from the change, so its wallet still has
-     * to be in shape) while contributing nothing to the relevant set: lovelace is not a token to isolate.
+     * An ADA-principal ANTICIPATE market arms the rebalancer as every market now does (the bot fronts ADA from the
+     * change, so its wallet still has to be in shape) while contributing nothing to the relevant set: lovelace is
+     * not a token to isolate.
      */
     @Test
     void aLovelaceAnticipateMarketOpensTheGateWithAnEmptyRelevantSet() {
@@ -296,13 +308,16 @@ class WalletRebalancerTest {
 
     /**
      * An ANTICIPATE market whose OWN mode is DISABLED can never liquidate ({@code effectiveMode} is DISABLED
-     * whatever the node's mode), so it must not open G4: nothing read, nothing submitted.
+     * whatever the node's mode). FAB-188: that no longer holds the rebalancer back — the shadow node still shapes
+     * its wallet — but the market's token is not relevant, so nothing is isolated for it.
      */
     @Test
-    void anAnticipateMarketWhoseOwnModeIsDisabledDoesNotOpenTheGate() {
+    void anAnticipateMarketWhoseOwnModeIsDisabledDoesNotHoldTheRebalancerBack() {
         mode.set(Mode.SHADOW);
         markets.set(List.of(anticipate(NIGHT, Mode.DISABLED), market(USDM, Action.CONVERT)));
-        assertBlocked(rebalancer(true), "the only ANTICIPATE market has mode: DISABLED");
+        assertRebalancedOnce(rebalancer(true), "the only ANTICIPATE market has mode: DISABLED");
+        assertTrue(at(Level.INFO).get(0).getFormattedMessage().contains("relevant []"),
+                at(Level.INFO).get(0).getFormattedMessage());
     }
 
     /**
@@ -350,6 +365,65 @@ class WalletRebalancerTest {
         assertRebalancedOnce(rebalancer(true), "market LIVE under global SHADOW");
     }
 
+    // ---- CONVERT_BEFORE_ANTICIPATE (FAB-194 D7) -------------------------------------------------------------
+
+    private static Market convertBeforeAnticipate(String unit, Mode marketMode) {
+        Market m = market(unit, Action.CONVERT_BEFORE_ANTICIPATE);
+        m.setCap(BigInteger.valueOf(1_000_000_000_000L));
+        m.setMode(marketMode);
+        return m;
+    }
+
+    /**
+     * A CONVERT_BEFORE_ANTICIPATE market's fallback fronts the principal exactly as ANTICIPATE does, so at an
+     * effective mode of SHADOW or LIVE its token is relevant — lower-cased — and a lovelace one never is.
+     */
+    @ParameterizedTest
+    @EnumSource(value = Mode.class, names = {"SHADOW", "LIVE"})
+    void aConvertBeforeAnticipateMarketsTokenIsRelevantAtShadowOrLive(Mode marketMode) {
+        mode.set(Mode.LIVE);
+        markets.set(List.of(convertBeforeAnticipate(NIGHT.toUpperCase(), marketMode),
+                convertBeforeAnticipate("lovelace", marketMode), market(USDM, Action.CONVERT)));
+        assertRebalancedOnce(rebalancer(true), "a CONVERT_BEFORE_ANTICIPATE market at effective " + marketMode);
+        assertTrue(at(Level.INFO).get(0).getFormattedMessage().contains("relevant [" + NIGHT + "]"),
+                at(Level.INFO).get(0).getFormattedMessage());
+    }
+
+    /** ... and at an effective mode of DISABLED it can never liquidate, so its token is not relevant. */
+    @Test
+    void aDisabledConvertBeforeAnticipateMarketsTokenIsNotRelevant() {
+        mode.set(Mode.SHADOW);
+        markets.set(List.of(convertBeforeAnticipate(NIGHT, Mode.DISABLED), market(USDM, Action.CONVERT)));
+        assertRebalancedOnce(rebalancer(true), "the only CONVERT_BEFORE_ANTICIPATE market has mode: DISABLED");
+        assertTrue(at(Level.INFO).get(0).getFormattedMessage().contains("relevant []"),
+                at(Level.INFO).get(0).getFormattedMessage());
+    }
+
+    /**
+     * In the built transaction: beside an ANTICIPATE market (a market with no mode of its own inherits the node's
+     * LIVE), each market's token gets its own exactly-10-ADA output and the other tokens keep their bundle.
+     */
+    @Test
+    void aConvertBeforeAnticipateMarketBesideAnAnticipateOneIsIsolatedOnItsOwnOutput() throws Exception {
+        mode.set(Mode.LIVE);
+        markets.set(List.of(convertBeforeAnticipate(NIGHT, null), anticipate(USDM)));
+        walletContents.set(List.of(utxo(1_180_000, NIGHT, 15_000_000_000L), utxo(1_500_000, USDM, 1_000_000L),
+                utxo(1_300_000, JUNK, 5L), utxo(200_000_000)));
+
+        assertRebalancedOnce(rebalancer(true), "a CONVERT_BEFORE_ANTICIPATE market beside an ANTICIPATE one");
+        Transaction tx = Transaction.deserialize(submitted.get(0));
+        List<Map<String, BigInteger>> outputs = new ArrayList<>();
+        for (TransactionOutput output : tx.getBody().getOutputs()) {
+            outputs.add(WalletShapeTransactions.unitsOf(output.getValue()));
+        }
+        assertTrue(outputs.contains(Map.of("lovelace", TEN_ADA, NIGHT, BigInteger.valueOf(15_000_000_000L))),
+                "the CONVERT_BEFORE_ANTICIPATE market's token is isolated on exactly 10 ADA: " + outputs);
+        assertTrue(outputs.contains(Map.of("lovelace", TEN_ADA, USDM, BigInteger.valueOf(1_000_000L))),
+                "the ANTICIPATE market's token is isolated on exactly 10 ADA: " + outputs);
+        assertTrue(outputs.contains(Map.of("lovelace", TEN_ADA, JUNK, BigInteger.valueOf(5L))),
+                "the other tokens stay in their own bundle: " + outputs);
+    }
+
     @Test
     void syncingBlocks() {
         syncing.set(true);
@@ -371,7 +445,7 @@ class WalletRebalancerTest {
         assertEquals(Set.of(), WalletShape.reasons(walletContents.get(), Set.of(NIGHT), C),
                 "the fixture must already be in shape");
 
-        rebalancer(true).onCommit();
+        rebalancer(true).housekeep(SubmitFence.OPEN);
         assertEquals(1, reads.get());
         assertEquals(0, signs.get(), "a shaped wallet is not signed for");
         assertEquals(0, submits.get(), "a shaped wallet is not submitted for");
@@ -386,8 +460,8 @@ class WalletRebalancerTest {
                 WalletShape.reasons(walletContents.get(), Set.of(NIGHT), C), "the fixture's one reason");
         WalletRebalancer rebalancer = rebalancer(true);
 
-        rebalancer.onCommit();
-        rebalancer.onCommit();
+        rebalancer.housekeep(SubmitFence.OPEN);
+        rebalancer.housekeep(SubmitFence.OPEN);
 
         assertEquals(2, reads.get());
         assertEquals(0, signs.get(), "a refusal is never signed");
@@ -408,7 +482,7 @@ class WalletRebalancerTest {
     void theNightReproductionSubmitsTheShapedSelfSpendOfTheWholeWallet() throws Exception {
         List<Utxo> walletUtxos = walletContents.get();
         WalletRebalancer rebalancer = rebalancer(true);
-        rebalancer.onCommit();
+        rebalancer.housekeep(SubmitFence.OPEN);
         assertEquals(1, submitted.size());
 
         Transaction tx = Transaction.deserialize(submitted.get(0));
@@ -441,8 +515,8 @@ class WalletRebalancerTest {
         walletFailure.set(new IllegalStateException("database down"));
         WalletRebalancer rebalancer = rebalancer(true);
 
-        assertDoesNotThrow(rebalancer::onCommit);
-        assertDoesNotThrow(() -> rebalancer.processCommit(event()));
+        assertDoesNotThrow(() -> rebalancer.housekeep(SubmitFence.OPEN));
+        assertDoesNotThrow(() -> rebalancer.housekeep(SubmitFence.OPEN));
 
         assertEquals(2, reads.get());
         assertEquals(0, signs.get());
@@ -458,7 +532,7 @@ class WalletRebalancerTest {
         submitterBehaviour.set(bytes -> Result.error("BadInputsUTxO"));
         WalletRebalancer rebalancer = rebalancer(true);
 
-        assertDoesNotThrow(() -> rebalancer.processCommit(event()));
+        assertDoesNotThrow(() -> rebalancer.housekeep(SubmitFence.OPEN));
         assertEquals(1, submits.get());
         assertEquals(1, at(Level.ERROR).size(), String.valueOf(logs.list));
         assertTrue(at(Level.ERROR).get(0).getFormattedMessage().contains("BadInputsUTxO"),
@@ -473,12 +547,53 @@ class WalletRebalancerTest {
         });
         WalletRebalancer rebalancer = rebalancer(true);
 
-        assertDoesNotThrow(() -> rebalancer.processCommit(event()));
-        assertDoesNotThrow(rebalancer::onCommit);
+        assertDoesNotThrow(() -> rebalancer.housekeep(SubmitFence.OPEN));
+        assertDoesNotThrow(() -> rebalancer.housekeep(SubmitFence.OPEN));
         assertEquals(2, submits.get());
         assertEquals(2, at(Level.ERROR).size(), String.valueOf(logs.list));
         assertTrue(at(Level.ERROR).get(0).getFormattedMessage().contains("connection reset"),
                 at(Level.ERROR).get(0).getFormattedMessage());
+    }
+
+    // ---- the housekeeping stage's fence and outcome (FAB-183) ---------------------------------------------------
+
+    /**
+     * A closed fence, read immediately before the submit: the shaped self-send is built and signed, nothing is
+     * submitted, one INFO says so, and the stage reports that nothing went out.
+     */
+    @Test
+    void aClosedFenceBuildsButSubmitsNothing() {
+        AtomicInteger fenceReads = new AtomicInteger();
+        WorkResult result = rebalancer(true).housekeep(() -> {
+            fenceReads.incrementAndGet();
+            return false;
+        });
+
+        assertEquals(WorkResult.DEFINITE_FAILURE, result, "a fenced stage sent nothing");
+        assertEquals(1, reads.get(), "the wallet is read");
+        assertEquals(1, signs.get(), "the shaped self-send is built and signed");
+        assertEquals(1, fenceReads.get(), "the fence is read once, before the submit");
+        assertEquals(0, submits.get(), "a closed fence submits nothing");
+        List<ILoggingEvent> info = at(Level.INFO);
+        assertEquals(1, info.size(), String.valueOf(logs.list));
+        assertEquals("[REBALANCE] fenced: nothing submitted", info.get(0).getFormattedMessage());
+        assertEquals(List.of(), atOrAbove(Level.WARN), "a fenced stage is not a failure");
+    }
+
+    @Test
+    void aSuccessfulSubmitIsSubmitted() {
+        assertEquals(WorkResult.SUBMITTED, rebalancer(true).housekeep(SubmitFence.OPEN));
+        assertEquals(1, submits.get());
+    }
+
+    /** The bytes may have reached Blockfrost before the submit threw: never reported as nothing sent. */
+    @Test
+    void aThrowingSubmitIsAmbiguous() {
+        submitterBehaviour.set(bytes -> {
+            throw new java.io.IOException("connection reset");
+        });
+        assertEquals(WorkResult.AMBIGUOUS, rebalancer(true).housekeep(SubmitFence.OPEN));
+        assertEquals(1, submits.get());
     }
 
     @Test
@@ -490,12 +605,12 @@ class WalletRebalancerTest {
                 () -> {
                     throw new IllegalStateException("markets unreadable");
                 }, effectiveMode, true);
-        assertDoesNotThrow(() -> gateFailure.processCommit(event()));
+        assertDoesNotThrow(() -> gateFailure.housekeep(SubmitFence.OPEN));
         assertTrue(at(Level.ERROR).stream().anyMatch(e -> e.getFormattedMessage().contains("markets unreadable")),
                 String.valueOf(logs.list));
 
         markets.set(List.of(anticipate(NIGHT)));
-        assertDoesNotThrow(() -> rebalancer(true).processCommit(event()));
+        assertDoesNotThrow(() -> rebalancer(true).housekeep(SubmitFence.OPEN));
         assertEquals(1, submits.get());
         assertTrue(at(Level.ERROR).stream().anyMatch(e -> e.getFormattedMessage().contains("unexpected")),
                 String.valueOf(logs.list));
@@ -520,6 +635,305 @@ class WalletRebalancerTest {
         assertFalse(rebalancer(false).state().effective());
     }
 
+    // ---- FAB-188: every shadow/live node keeps its wallet shaped ----------------------------------------------
+
+    /**
+     * (a) A convert-only node with a fragmented ada-only wallet — three UTxOs, none holding exactly C — gets ONE
+     * self-send that shapes it: the SUBMITTED bytes spend exactly those three and pay exactly C ada-only plus one
+     * ada-only change, and nothing else (CCL trap 21: a merged body would be a single output).
+     */
+    @ParameterizedTest
+    @EnumSource(value = Mode.class, names = {"LIVE", "SHADOW"})
+    void aConvertOnlyNodeShapesAFragmentedWalletWithOneSelfSend(Mode nodeMode) throws Exception {
+        mode.set(nodeMode);
+        markets.set(List.of(market(NIGHT, Action.CONVERT), market("lovelace", Action.CONVERT)));
+        BigInteger collateral = engine.collateralLovelace();
+        List<Utxo> fragmented = List.of(utxo(40_000_000), utxo(25_000_000), utxo(7_000_000));
+        for (Utxo u : fragmented) {
+            assertFalse(u.getAmount().get(0).getQuantity().equals(collateral),
+                    "no fixture UTxO may already be the collateral");
+        }
+        walletContents.set(fragmented);
+
+        assertRebalancedOnce(rebalancer(true), "convert-only, " + nodeMode);
+        assertEquals(1, submitted.size(), "exactly one submission");
+        Transaction tx = Transaction.deserialize(submitted.get(0));
+
+        Set<String> spent = tx.getBody().getInputs().stream().map(i -> i.getTransactionId() + "#" + i.getIndex())
+                .collect(Collectors.toCollection(TreeSet::new));
+        Set<String> three = fragmented.stream().map(u -> u.getTxHash() + "#" + u.getOutputIndex())
+                .collect(Collectors.toCollection(TreeSet::new));
+        assertEquals(3, three.size(), "three distinct fixture UTxOs");
+        assertEquals(three, spent, "the inputs are exactly the three wallet UTxOs");
+
+        BigInteger fee = tx.getBody().getFee();
+        assertTrue(fee.signum() > 0, "the fee is positive: " + fee);
+        List<TransactionOutput> outputs = tx.getBody().getOutputs();
+        assertEquals(2, outputs.size(), "exactly two outputs, no other: " + outputs);
+        for (TransactionOutput output : outputs) {
+            assertEquals(wallet, output.getAddress(), "every output goes back to the wallet");
+        }
+        assertEquals(Map.of("lovelace", collateral), WalletShapeTransactions.unitsOf(outputs.get(0).getValue()),
+                "the first output is the ada-only collateral of exactly C");
+        BigInteger inputs = BigInteger.valueOf(72_000_000L);
+        assertEquals(Map.of("lovelace", inputs.subtract(collateral).subtract(fee)),
+                WalletShapeTransactions.unitsOf(outputs.get(1).getValue()),
+                "the second output is the ada-only change: everything else, less the fee");
+    }
+
+    /** (b) No market, and a null market list: armed, and the pass reads the wallet. */
+    @Test
+    void noMarketAndANullMarketListAreArmedAndReadTheWallet() {
+        List<List<Market>> configurations = new ArrayList<>();
+        configurations.add(List.of());
+        configurations.add(null);
+        for (List<Market> configured : configurations) {
+            markets.set(configured);
+            reads.set(0);
+            WalletRebalancer rebalancer = rebalancer(true);
+            assertTrue(rebalancer.activity().armed(), configured + ": armed");
+            rebalancer.housekeep(SubmitFence.OPEN);
+            assertEquals(1, reads.get(), configured + ": housekeep reads the wallet");
+        }
+    }
+
+    /** One pass on an open fence, then what {@code lastOutcome()} says about it. */
+    private static String outcomeOf(WalletRebalancer rebalancer) {
+        rebalancer.housekeep(SubmitFence.OPEN);
+        return rebalancer.lastOutcome();
+    }
+
+    private static String assertOutcome(WalletRebalancer rebalancer, String prefix) {
+        String outcome = outcomeOf(rebalancer);
+        assertTrue(outcome.startsWith(prefix), "expected the prefix '" + prefix + "': " + outcome);
+        return outcome;
+    }
+
+    /** (e) {@code lastOutcome()} names each ending of {@code housekeep}, starting from "not run yet". */
+    @Test
+    void lastOutcomeNamesEveryEnding() {
+        WalletRebalancer first = rebalancer(false);
+        assertEquals("not run yet", first.lastOutcome(), "the initial value");
+        assertEquals("idle: ENV_DISABLED", outcomeOf(first));
+
+        WalletRebalancer suspended = rebalancer(true);
+        suspended.suspend();
+        assertEquals("idle: SUSPENDED", outcomeOf(suspended));
+        mode.set(Mode.DISABLED);
+        assertEquals("idle: MODE_NOT_SHADOW_OR_LIVE", outcomeOf(rebalancer(true)));
+        mode.set(Mode.LIVE);
+        syncing.set(true);
+        assertEquals("idle: SYNCING", outcomeOf(rebalancer(true)));
+        syncing.set(false);
+
+        walletFailure.set(new IllegalStateException("database down"));
+        String readFailure = assertOutcome(rebalancer(true), "could not read the wallet: ");
+        assertTrue(readFailure.contains("database down"), readFailure);
+        walletFailure.set(null);
+        walletContents.set(null);
+        assertOutcome(rebalancer(true), "could not read the wallet: ");
+
+        walletContents.set(List.of(utxo(TEN_ADA.longValueExact(), NIGHT, 15_000_000_000L),
+                utxo(C.longValueExact()), utxo(150_000_000)));
+        assertEquals("in shape (3 UTxOs)", outcomeOf(rebalancer(true)));
+
+        walletContents.set(List.of(utxo(1_180_000, NIGHT, 15_000_000_000L), utxo(5_000_000)));
+        assertOutcome(rebalancer(true), "REFUSED: ");
+        walletContents.set(List.of());
+        assertOutcome(rebalancer(true), "NOTHING_TO_DO: ");
+
+        walletContents.set(nightWallet());
+        WalletRebalancer fenced = rebalancer(true);
+        fenced.housekeep(() -> false);
+        assertEquals("fenced: nothing submitted", fenced.lastOutcome());
+
+        assertEquals("submitted " + "f".repeat(64), outcomeOf(rebalancer(true)));
+
+        submitterBehaviour.set(bytes -> Result.error("BadInputsUTxO"));
+        assertEquals("submission rejected: BadInputsUTxO", outcomeOf(rebalancer(true)));
+        submitterBehaviour.set(bytes -> null);
+        assertEquals("submission rejected: no result", outcomeOf(rebalancer(true)));
+
+        submitterBehaviour.set(bytes -> {
+            throw new java.io.IOException("connection reset");
+        });
+        String threw = assertOutcome(rebalancer(true), "submission threw: ");
+        assertTrue(threw.contains("connection reset"), threw);
+
+        WalletRebalancer unreadableMarkets = new WalletRebalancer(engine, walletContents::get, syncing::get,
+                mode::get, () -> {
+                    throw new IllegalStateException("markets unreadable");
+                }, effectiveMode, true);
+        String failed = assertOutcome(unreadableMarkets, "failed: ");
+        assertTrue(failed.contains("markets unreadable"), failed);
+    }
+
+    // ---- FAB-195: what each ending tells the pass line -------------------------------------------------------
+
+    /** submitted, would-submit, attempted, error, no-op — in the pass line's order. */
+    private static List<Integer> counts(StageTally tally) {
+        return List.of(tally.submitted(), tally.wouldSubmit(), tally.attempted(), tally.error(), tally.noOp());
+    }
+
+    /** One pass on {@code fence}, counted on a fresh tally; what it counted. */
+    private static List<Integer> countsOf(WalletRebalancer rebalancer, SubmitFence fence) {
+        StageTally tally = new StageTally();
+        rebalancer.housekeep(fence, tally);
+        return counts(tally);
+    }
+
+    /**
+     * (H1) At most one count per pass, by ending: a closed gate and a wallet in shape count nothing; a build that was
+     * not built and a closed fence are no-ops; an accepted submit is submitted; a decoded Blockfrost 400 envelope is
+     * attempted; a raw {@code Result.error} (no clear answer) and a submit that threw are submitted — a display
+     * merge of AMBIGUOUS.
+     */
+    @Test
+    void eachEndingCountsAtMostOnce() {
+        assertEquals(List.of(0, 0, 0, 0, 0), countsOf(rebalancer(false), SubmitFence.OPEN), "idle");
+
+        walletContents.set(List.of(utxo(TEN_ADA.longValueExact(), NIGHT, 15_000_000_000L),
+                utxo(C.longValueExact()), utxo(150_000_000)));
+        assertEquals(List.of(0, 0, 0, 0, 0), countsOf(rebalancer(true), SubmitFence.OPEN), "in shape");
+
+        walletContents.set(List.of(utxo(1_180_000, NIGHT, 15_000_000_000L), utxo(5_000_000)));
+        assertEquals(List.of(0, 0, 0, 0, 1), countsOf(rebalancer(true), SubmitFence.OPEN), "not built");
+
+        walletContents.set(nightWallet());
+        assertEquals(List.of(0, 0, 0, 0, 1), countsOf(rebalancer(true), () -> false), "fenced");
+        assertEquals(List.of(1, 0, 0, 0, 0), countsOf(rebalancer(true), SubmitFence.OPEN), "submitted");
+
+        submitterBehaviour.set(bytes -> Result.<String>error(
+                "{\"status_code\":400,\"error\":\"Bad Request\",\"message\":\"opaque\"}").code(400));
+        StageTally decoded = new StageTally();
+        assertEquals(WorkResult.DEFINITE_FAILURE, rebalancer(true).housekeep(SubmitFence.OPEN, decoded));
+        assertEquals(List.of(0, 0, 1, 0, 0), counts(decoded), "a decoded 400 envelope");
+
+        submitterBehaviour.set(bytes -> Result.error("BadInputsUTxO"));
+        StageTally raw = new StageTally();
+        assertEquals(WorkResult.AMBIGUOUS, rebalancer(true).housekeep(SubmitFence.OPEN, raw));
+        assertEquals(List.of(1, 0, 0, 0, 0), counts(raw), "a raw Result.error");
+
+        submitterBehaviour.set(bytes -> {
+            throw new java.io.IOException("connection reset");
+        });
+        assertEquals(List.of(1, 0, 0, 0, 0), countsOf(rebalancer(true), SubmitFence.OPEN), "submit threw");
+    }
+
+    /** Runs {@code action} with this class's logger at DEBUG, restoring its level after. */
+    private void atDebug(Runnable action) {
+        Level previous = logger.getLevel();
+        logger.setLevel(Level.DEBUG);
+        try {
+            action.run();
+        } finally {
+            logger.setLevel(previous);
+        }
+    }
+
+    /** The DEBUG events carrying a throwable — where a stack trace goes. */
+    private List<ILoggingEvent> stackTracesAtDebug() {
+        return logs.list.stream().filter(e -> e.getLevel() == Level.DEBUG)
+                .filter(e -> e.getThrowableProxy() != null).toList();
+    }
+
+    /**
+     * (H2) A thrown wallet read whose root cause is distinct from its wrapper counts error 1, in ONE ERROR line that
+     * carries the whole cause chain, down to the root, with no throwable; one DEBUG event carries it.
+     */
+    @Test
+    void aThrownWalletReadCountsOneErrorInOneErrorLine() {
+        walletFailure.set(new IllegalStateException("the index is unreadable",
+                new java.io.IOException("segment 000042 is corrupt")));
+        StageTally tally = new StageTally();
+
+        atDebug(() -> rebalancer(true).housekeep(SubmitFence.OPEN, tally));
+
+        assertEquals(List.of(0, 0, 0, 1, 0), counts(tally));
+        List<ILoggingEvent> errors = at(Level.ERROR);
+        assertEquals(1, errors.size(), String.valueOf(logs.list));
+        String line = errors.get(0).getFormattedMessage();
+        assertTrue(line.startsWith("[REBALANCE]") && line.contains("the index is unreadable")
+                && line.contains("segment 000042 is corrupt"), line);
+        assertNull(errors.get(0).getThrowableProxy(), "no throwable on the ERROR line");
+        assertEquals(1, stackTracesAtDebug().size(), String.valueOf(logs.list));
+    }
+
+    /**
+     * (H3) The catch-all (the markets cannot be read) counts error 1 under the same rule; the submit-threw ERROR is a
+     * different site and still carries its throwable.
+     */
+    @Test
+    void theCatchAllCountsOneErrorInOneErrorLineAndASubmitThatThrewKeepsItsThrowable() {
+        WalletRebalancer unreadableMarkets = new WalletRebalancer(engine, walletContents::get, syncing::get,
+                mode::get, () -> {
+                    throw new IllegalStateException("markets unreadable",
+                            new java.io.IOException("config segment 7 is corrupt"));
+                }, effectiveMode, true);
+        StageTally tally = new StageTally();
+
+        atDebug(() -> unreadableMarkets.housekeep(SubmitFence.OPEN, tally));
+
+        assertEquals(List.of(0, 0, 0, 1, 0), counts(tally));
+        List<ILoggingEvent> errors = at(Level.ERROR);
+        assertEquals(1, errors.size(), String.valueOf(logs.list));
+        String line = errors.get(0).getFormattedMessage();
+        assertTrue(line.startsWith("[REBALANCE] failed") && line.contains("markets unreadable")
+                && line.contains("config segment 7 is corrupt"), line);
+        assertNull(errors.get(0).getThrowableProxy(), "no throwable on the ERROR line");
+        assertEquals(1, stackTracesAtDebug().size(), String.valueOf(logs.list));
+
+        logs.list.clear();
+        submitterBehaviour.set(bytes -> {
+            throw new java.io.IOException("connection reset");
+        });
+        rebalancer(true).housekeep(SubmitFence.OPEN, new StageTally());
+        List<ILoggingEvent> threw = at(Level.ERROR);
+        assertEquals(1, threw.size(), String.valueOf(logs.list));
+        assertNotNull(threw.get(0).getThrowableProxy(), "the submit-threw ERROR keeps its throwable");
+    }
+
+    /**
+     * (f) B1: an environment-disabled or suspended rebalancer on a SHADOW or LIVE node WARNs once per pass that
+     * liquidation depends on a shaped wallet; on any other mode those gates stay at DEBUG.
+     */
+    @Test
+    void anOffOrSuspendedRebalancerOnAShadowOrLiveNodeWarnsOncePerPass() {
+        mode.set(Mode.LIVE);
+        rebalancer(false).housekeep(SubmitFence.OPEN);
+        List<ILoggingEvent> warns = at(Level.WARN);
+        assertEquals(1, warns.size(), "env off + LIVE: exactly one WARN: " + logs.list);
+        String message = warns.get(0).getFormattedMessage();
+        for (String fragment : List.of("[REBALANCE]", "ENV_DISABLED", "LIVE", "liquidation depends on a shaped wallet")) {
+            assertTrue(message.contains(fragment), "the WARN carries '" + fragment + "': " + message);
+        }
+
+        logs.list.clear();
+        mode.set(Mode.SHADOW);
+        WalletRebalancer suspended = rebalancer(true);
+        suspended.suspend();
+        suspended.housekeep(SubmitFence.OPEN);
+        warns = at(Level.WARN);
+        assertEquals(1, warns.size(), "suspended + SHADOW: exactly one WARN: " + logs.list);
+        message = warns.get(0).getFormattedMessage();
+        for (String fragment : List.of("[REBALANCE]", "SUSPENDED", "SHADOW", "liquidation depends on a shaped wallet")) {
+            assertTrue(message.contains(fragment), "the WARN carries '" + fragment + "': " + message);
+        }
+
+        logs.list.clear();
+        mode.set(Mode.DISABLED);
+        rebalancer(false).housekeep(SubmitFence.OPEN);
+        assertEquals(List.of(), atOrAbove(Level.WARN), "env off + DISABLED: no WARN: " + logs.list);
+        WalletRebalancer suspendedDisabled = rebalancer(true);
+        suspendedDisabled.suspend();
+        suspendedDisabled.housekeep(SubmitFence.OPEN);
+        assertEquals(List.of(), atOrAbove(Level.WARN), "suspended + DISABLED: no WARN: " + logs.list);
+        mode.set(null);
+        rebalancer(false).housekeep(SubmitFence.OPEN);
+        assertEquals(List.of(), atOrAbove(Level.WARN), "env off + no mode: no WARN: " + logs.list);
+        assertEquals(0, reads.get(), "no blocked pass read the wallet");
+    }
+
     // ---- the readiness page's reading of the gates (FAB-132) ---------------------------------------------
 
     /** One gate scenario: what the rebalancer is configured with, and the first closed gate it must report. */
@@ -529,7 +943,7 @@ class WalletRebalancerTest {
 
     /**
      * ⛔ The page and the bot read ONE evaluation. For every gate scenario above, {@code activity()} names the
-     * first closed gate, and {@code armed()} is true exactly when {@code onCommit()} goes on to read the wallet
+     * first closed gate, and {@code armed()} is true exactly when {@code housekeep()} goes on to read the wallet
      * — so the page can never say ARMED over a bot that is idle, nor idle over a bot that is acting.
      */
     @Test
@@ -543,20 +957,17 @@ class WalletRebalancerTest {
                         WalletRebalancer.Idle.MODE_NOT_SHADOW_OR_LIVE),
                 new Scenario("mode null", true, false, null, night, false,
                         WalletRebalancer.Idle.MODE_NOT_SHADOW_OR_LIVE),
-                new Scenario("only CONVERT markets", true, false, Mode.LIVE, onlyConvert, false,
-                        WalletRebalancer.Idle.NO_ANTICIPATE_MARKET),
-                new Scenario("no market", true, false, Mode.LIVE, List.of(), false,
-                        WalletRebalancer.Idle.NO_ANTICIPATE_MARKET),
+                // FAB-188: the markets arm nothing and hold nothing back.
+                new Scenario("only CONVERT markets", true, false, Mode.LIVE, onlyConvert, false, null),
+                new Scenario("no market", true, false, Mode.LIVE, List.of(), false, null),
                 new Scenario("an ANTICIPATE market whose own mode is DISABLED", true, false, Mode.SHADOW,
-                        List.of(anticipate(NIGHT, Mode.DISABLED), market(USDM, Action.CONVERT)), false,
-                        WalletRebalancer.Idle.NO_ANTICIPATE_MARKET),
+                        List.of(anticipate(NIGHT, Mode.DISABLED), market(USDM, Action.CONVERT)), false, null),
                 new Scenario("a LIVE market under a SHADOW node", true, false, Mode.SHADOW,
                         List.of(anticipate(NIGHT, Mode.LIVE)), false, null),
                 new Scenario("syncing", true, false, Mode.LIVE, night, true, WalletRebalancer.Idle.SYNCING),
                 new Scenario("all open", true, false, Mode.LIVE, night, false, null)));
-        // ⚠ A null market list is a gate input too: the page must read it as "no market", never throw.
-        scenarios.add(new Scenario("market list null", true, false, Mode.LIVE, null, false,
-                WalletRebalancer.Idle.NO_ANTICIPATE_MARKET));
+        // ⚠ A null market list must never throw, on the page or in the bot: it reads as "no market", and arms.
+        scenarios.add(new Scenario("market list null", true, false, Mode.LIVE, null, false, null));
 
         for (Scenario s : scenarios) {
             mode.set(s.mode());
@@ -577,9 +988,9 @@ class WalletRebalancerTest {
             assertEquals(s.mode(), activity.mode(), s.name() + ": the mode is the supplier's, null included");
             assertEquals(0, reads.get(), s.name() + ": activity() reads no wallet");
 
-            rebalancer.onCommit();
+            rebalancer.housekeep(SubmitFence.OPEN);
             assertEquals(activity.armed() ? 1 : 0, reads.get(),
-                    s.name() + ": armed() must be true exactly when onCommit() reads the wallet");
+                    s.name() + ": armed() must be true exactly when housekeep() reads the wallet");
             assertEquals(activity.armed() ? 1 : 0, submits.get(), s.name() + ": and submits");
         }
     }
@@ -639,7 +1050,7 @@ class WalletRebalancerTest {
 
         post(page, "suspend");
         assertEquals(WalletRebalancer.Idle.SUSPENDED, rebalancer.activity().idle());
-        rebalancer.onCommit();
+        rebalancer.housekeep(SubmitFence.OPEN);
         assertEquals(0, reads.get(), "suspended from the page: no wallet read");
         assertEquals(0, signs.get(), "suspended from the page: nothing signed");
         assertEquals(0, submits.get(), "suspended from the page: nothing submitted");
@@ -656,7 +1067,7 @@ class WalletRebalancerTest {
         var page = readinessPage(rebalancer);
 
         post(page, "resume");
-        rebalancer.onCommit();
+        rebalancer.housekeep(SubmitFence.OPEN);
         assertEquals(0, reads.get(), "env off, resumed from the page: no wallet read");
         assertEquals(0, submits.get(), "env off, resumed from the page: nothing submitted");
         assertEquals(WalletRebalancer.Idle.ENV_DISABLED, rebalancer.activity().idle());

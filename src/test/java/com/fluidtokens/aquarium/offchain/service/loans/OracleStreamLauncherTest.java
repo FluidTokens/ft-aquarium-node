@@ -9,7 +9,9 @@ import com.bloxbean.cardano.client.common.model.Networks;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
+import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
 import com.fluidtokens.aquarium.offchain.service.StakerService;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -68,12 +70,14 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * FAB-174: when the shadow oracle stream starts, and that starting it never touches production.
+ * FAB-174: when the oracle stream starts, and what its pushes may change (FAB-183-1: the default
+ * {@code loans.oracle.source=stream} merges them into the prices; {@code source=api} keeps them out).
  *
  * <p>Every OFF state says why in exactly one line and opens nothing; the one {@link FluidOracleClient} bean
- * stays the one bean and its prices and refresh time do not move while the shadow receives a push; {@code start}
- * returns at once; {@code stop} leaves no stream thread behind; and the shipped YAML and env-var binding are
- * pinned as shipped (officina {@code spring-boot-config-binding-traps} §4–§5).
+ * stays the one bean, and with {@code source=api} its prices and refresh time do not move while the stream
+ * receives a push; with {@code source=stream} a newer push changes that entry and a disconnect drops what only
+ * the stream held; {@code start} returns at once; {@code stop} leaves no stream thread behind; and the shipped
+ * YAML and env-var binding are pinned as shipped (officina {@code spring-boot-config-binding-traps} §4–§5).
  */
 class OracleStreamLauncherTest {
 
@@ -398,7 +402,8 @@ class OracleStreamLauncherTest {
         server = new OracleStreamTestServer().authorize(account.stakeAddress()).start();
         String push = resource(PREVIEW_PUSH);
         new ApplicationContextRunner()
-                .withPropertyValues("network=preview", "loans.oracle.stream.url=" + server.uri())
+                .withPropertyValues("network=preview", "loans.oracle.stream.url=" + server.uri(),
+                        "loans.oracle.source=api")
                 .withBean(FluidOracleClient.class, () -> {
                     try {
                         return OracleClients.mainnetTwoVersions();
@@ -433,7 +438,8 @@ class OracleStreamLauncherTest {
                     assertEquals(entriesBefore, Set.copyOf(oracle.entries()), "the shadow changed the prices");
                     assertEquals(refreshedBefore, oracle.lastRefresh(), "the shadow refreshed the oracle client");
                     assertTrue(messages(streamLines()).stream().anyMatch(l -> l.contains("[oracle-stream] on ")
-                            && l.endsWith(" network=preview host=127.0.0.1 node_ver=-")), messages(streamLines()).toString());
+                            && l.endsWith(" network=preview host=127.0.0.1 node_ver=- source=api")),
+                            messages(streamLines()).toString());
                     assertEquals(List.of(), server.authFailures());
                 });
         assertEquals(List.of(), streamThreadsAfterAWhile(), "closing the context stops the stream");
@@ -452,7 +458,8 @@ class OracleStreamLauncherTest {
         JsonNode api = new ObjectMapper().readTree(resource(PREVIEW_API));
         Set<OracleEntry> apiParsed = Set.copyOf(OracleClients.fromFixture(PREVIEW_API).entries());
         new ApplicationContextRunner()
-                .withPropertyValues("network=preview", "loans.oracle.stream.url=" + server.uri())
+                .withPropertyValues("network=preview", "loans.oracle.stream.url=" + server.uri(),
+                        "loans.oracle.source=api")
                 .withBean(FluidOracleClient.class, () -> {
                     try {
                         return OracleClients.mainnetTwoVersions();
@@ -759,7 +766,7 @@ class OracleStreamLauncherTest {
                     assertEquals(List.of(), server.authFailures());
                     List<String> on = onLines();
                     assertEquals(1, on.size(), on.toString());
-                    assertTrue(on.getFirst().endsWith(" network=preview host=127.0.0.1 node_ver=ac2c009c6f40"),
+                    assertTrue(on.getFirst().endsWith(" network=preview host=127.0.0.1 node_ver=ac2c009c6f40 source=stream"),
                             on.getFirst());
                 });
     }
@@ -778,7 +785,7 @@ class OracleStreamLauncherTest {
             assertEquals(List.of(), server.authFailures());
             List<String> on = onLines();
             assertEquals(1, on.size(), on.toString());
-            assertTrue(on.getFirst().endsWith(" network=preview host=127.0.0.1 node_ver=-"), on.getFirst());
+            assertTrue(on.getFirst().endsWith(" network=preview host=127.0.0.1 node_ver=- source=stream"), on.getFirst());
         });
     }
 
@@ -813,6 +820,9 @@ class OracleStreamLauncherTest {
                 .orElseThrow(() -> new AssertionError("no document activates the preview profile"));
 
         assertEquals("${LOANS_ORACLE_STREAM_ENABLED:true}", String.valueOf(base.getProperty("loans.oracle.stream.enabled")));
+        assertEquals("${LOANS_ORACLE_SOURCE:stream}", String.valueOf(base.getProperty("loans.oracle.source")),
+                "FAB-183: the price source, stream by default");
+        assertNull(preview.getProperty("loans.oracle.source"), "preview must not override the source");
         String baseUrl = String.valueOf(base.getProperty("loans.oracle.stream.url"));
         assertEquals("${LOANS_ORACLE_STREAM_URL:wss://25mxd4whnj.execute-api.eu-west-1.amazonaws.com/prod}", baseUrl);
         String previewUrl = String.valueOf(preview.getProperty("loans.oracle.stream.url"));
@@ -838,6 +848,7 @@ class OracleStreamLauncherTest {
                 .map(Value::value)
                 .toList();
         assertEquals(List.of("${loans.oracle.stream.enabled:true}", "${loans.oracle.stream.url:}",
+                "${loans.oracle.source:stream}",
                 "${aquarium.build.commitShort:unknown}", "${aquarium.build.dirty:unknown}"), values);
         assertTrue(Arrays.stream(constructor.getParameters()).map(Parameter::getType)
                 .anyMatch(ObjectProvider.class::equals), "FluidOracleClient only through an ObjectProvider");
@@ -874,6 +885,273 @@ class OracleStreamLauncherTest {
         assertEquals("true", unset.resolvePlaceholders("${loans.oracle.stream.enabled:true}"));
         assertEquals("wss://25mxd4whnj.execute-api.eu-west-1.amazonaws.com/prod",
                 unset.resolvePlaceholders("${loans.oracle.stream.url:}"));
+    }
+
+    // ======================================================================================
+    // FAB-183: loans.oracle.source — what the stream drives
+    // ======================================================================================
+
+    /**
+     * {@code source=stream}, the default (no property set): a real push whose first entry carries a NEWER
+     * {@code validFrom} replaces that NFT's entry in the context's one {@link FluidOracleClient} — every other entry
+     * and the API refresh time stay — while the comparator, which hears the API's own loads, still says its one
+     * MATCHED {@code cmp} line when the poller loads the same content. That load changes nothing the stream had not
+     * pushed, so no {@code missed} line.
+     */
+    @Test
+    void sourceStreamAPushWithANewerValidFromChangesThatEntryWhileTheComparatorStillSaysItsOneCmpLine() throws Exception {
+        server = new OracleStreamTestServer().authorize(account.stakeAddress()).start();
+        String push = bumpedPush();
+        JsonNode api = bumpedApi();
+        Set<OracleEntry> apiParsed = Set.copyOf(OracleRegistryParser.parse(api).entries());
+        AssetType nft = firstNft(api);
+        new ApplicationContextRunner()
+                .withPropertyValues("network=preview", "loans.oracle.stream.url=" + server.uri())
+                .withBean(FluidOracleClient.class, () -> {
+                    try {
+                        return OracleClients.fromFixture(PREVIEW_API);
+                    } catch (Exception e) {
+                        throw new IllegalStateException(e);
+                    }
+                })
+                .withBean(Account.class, () -> account)
+                .withBean(StakerService.class, OracleStreamLauncherTest::staker)
+                .withBean(MeterRegistry.class, SimpleMeterRegistry::new)
+                .withBean(AppConfig.Network.class, () -> network("preview"))
+                .withBean(OracleStreamLauncher.class)
+                .run(context -> {
+                    assertNull(context.getStartupFailure(), "the context started");
+                    FluidOracleClient oracle = context.getBean(FluidOracleClient.class);
+                    OracleEntry before = oracle.findEntryByOracleToken(nft).orElseThrow();
+                    Set<OracleEntry> others = oracle.entries().stream().filter(e -> !e.equals(before))
+                            .collect(java.util.stream.Collectors.toSet());
+                    Instant refreshedBefore = oracle.lastRefresh();
+                    assertEquals(5, oracle.entries().size(), "fixture: the preview snapshot");
+
+                    OracleStreamLauncher bean = context.getBean(OracleStreamLauncher.class);
+                    bean.start();
+                    server.awaitSession(0, WAIT).sendText(push);
+                    await(() -> bean.pushes() == 1, WAIT, "the comparator's onPush");
+                    await(() -> oracle.findEntryByOracleToken(nft).orElseThrow().feed().validFrom()
+                            == before.feed().validFrom() + BUMP_MS, WAIT, "the push merged into the prices");
+                    assertEquals(5, oracle.entries().size());
+                    assertTrue(oracle.entries().containsAll(others), "every other NFT kept its entry");
+                    assertEquals(refreshedBefore, oracle.lastRefresh(), "a push is not an API load");
+                    assertEquals(List.of(), cmpLines(), "the push waits for the API");
+
+                    oracle.load(api); // the poller's load, on this thread
+                    await(() -> !cmpLines().isEmpty(), WAIT, "the cmp line");
+                    List<String> cmp = cmpLines();
+                    assertEquals(1, cmp.size(), cmp.toString());
+                    assertTrue(cmp.getFirst().contains(
+                            " push=1 out=MATCHED n=5 h=" + OracleStreamComparator.hash(apiParsed) + " lag_s="),
+                            cmp.getFirst());
+                    assertEquals(apiParsed, Set.copyOf(oracle.entries()), "the push and the API now agree");
+                    assertEquals(List.of(), missedLines(), "the load changed nothing the stream had not pushed");
+                    assertEquals(1, onLines().size());
+                    assertTrue(onLines().getFirst().endsWith(" node_ver=- source=stream"), onLines().getFirst());
+                    assertEquals(List.of(), server.authFailures());
+                });
+        assertEquals(List.of(), streamThreadsAfterAWhile(), "closing the context stops the stream");
+    }
+
+    /**
+     * {@code source=stream}: an API load that changes a price while the stream is CONNECTED means the stream missed
+     * that push — counted under {@code stream=connected} and said as one {@code missed} INFO line naming the NFT.
+     */
+    @Test
+    void sourceStreamAnApiChangeWhileConnectedIsCountedAndSaidAsOneMissedLine() throws Exception {
+        server = new OracleStreamTestServer().authorize(account.stakeAddress()).start();
+        FluidOracleClient oracle = OracleClients.fromFixture(PREVIEW_API);
+        MeterRegistry registry = new SimpleMeterRegistry();
+        launcher = new OracleStreamLauncher(account, network("preview"), present(oracle), staker(), registry, "true",
+                server.uri().toString());
+        launcher.start();
+        server.awaitSession(0, WAIT);
+        await(() -> oracle.snapshot().streamConnected(), WAIT, "the prices hear the open");
+        JsonNode api = bumpedApi();
+
+        oracle.load(api); // a change no push carried
+
+        List<ILoggingEvent> missed = streamLines().stream()
+                .filter(e -> e.getFormattedMessage().startsWith("[oracle-stream] missed ")).toList();
+        assertEquals(1, missed.size(), messages(missed).toString());
+        assertEquals(Level.INFO, missed.getFirst().getLevel());
+        assertTrue(missed.getFirst().getFormattedMessage().endsWith(" n=1 units=" + firstNft(api).toUnit()),
+                missed.getFirst().getFormattedMessage());
+        assertEquals(1.0, missedCount(registry, "connected"));
+        assertEquals(0.0, missedCount(registry, "disconnected"));
+    }
+
+    /** {@code source=stream}: the same change while the stream is NOT connected is counted and never said. */
+    @Test
+    void sourceStreamAnApiChangeWhileNotConnectedIsCountedOnly() throws Exception {
+        hanging = new OracleStreamTestServer.Hanging();
+        FluidOracleClient oracle = OracleClients.fromFixture(PREVIEW_API);
+        MeterRegistry registry = new SimpleMeterRegistry();
+        launcher = new OracleStreamLauncher(account, network("preview"), present(oracle), staker(), registry, "true",
+                hanging.uri().toString());
+        launcher.start();
+        await(() -> hanging.accepted() >= 1, WAIT, "the connect attempt");
+        assertFalse(oracle.snapshot().streamConnected(), "fixture: the handshake hangs");
+
+        oracle.load(bumpedApi());
+
+        assertEquals(List.of(), missedLines());
+        assertEquals(1.0, missedCount(registry, "disconnected"));
+        assertEquals(0.0, missedCount(registry, "connected"));
+    }
+
+    /**
+     * {@code source=stream}: the server ENDS a connected session whose last push listed an NFT the API does not. The
+     * launcher forwards that close to the prices, so the stream-only NFT is dropped and the prices report the stream
+     * disconnected. Reconnects are slowed so the next session cannot reopen it before the assertions.
+     */
+    @Test
+    void sourceStreamAServerCloseDropsTheStreamOnlyNftAndThePricesReportDisconnected() throws Exception {
+        server = new OracleStreamTestServer().authorize(account.stakeAddress()).start();
+        FluidOracleClient oracle = new FluidOracleClient("http://unused.invalid");
+        AssetType streamOnly = withoutTheFirstEntryLoaded(oracle);
+        launcher = new OracleStreamLauncher(account, network("preview"), present(oracle), staker(), meters(), "true",
+                server.uri().toString());
+        launcher.useForTest(slowReconnects(), Clock.systemUTC());
+        launcher.start();
+        OracleStreamTestServer.Session session = server.awaitSession(0, WAIT);
+        await(() -> oracle.snapshot().streamConnected(), WAIT, "the prices hear the open");
+        session.sendText(resource(PREVIEW_PUSH));
+        await(() -> oracle.findEntryByOracleToken(streamOnly).isPresent(), WAIT, "the push holds the stream-only NFT");
+        assertEquals(5, oracle.entries().size(), "fixture: the API's 4 and the stream's own");
+
+        session.close(1000);
+
+        await(() -> !oracle.snapshot().streamConnected(), WAIT, "the prices hear the close");
+        assertTrue(oracle.findEntryByOracleToken(streamOnly).isEmpty(), "the stream-only NFT is dropped");
+        assertEquals(4, oracle.entries().size(), "the API's entries stay");
+        assertEquals(Set.of(), oracle.snapshot().streamNfts());
+        assertEquals(1, server.requests(), "fixture: no reconnect reopened the stream");
+    }
+
+    /**
+     * {@code source=stream}: {@code stop()} — the client says no onClose for its own shutdown — tells the prices the
+     * stream is disconnected, so the stream-only NFT is dropped at once.
+     */
+    @Test
+    void sourceStreamStopDropsTheStreamOnlyNftAndThePricesReportDisconnected() throws Exception {
+        server = new OracleStreamTestServer().authorize(account.stakeAddress()).start();
+        FluidOracleClient oracle = new FluidOracleClient("http://unused.invalid");
+        AssetType streamOnly = withoutTheFirstEntryLoaded(oracle);
+        launcher = new OracleStreamLauncher(account, network("preview"), present(oracle), staker(), meters(), "true",
+                server.uri().toString());
+        launcher.start();
+        server.awaitSession(0, WAIT).sendText(resource(PREVIEW_PUSH));
+        await(() -> oracle.findEntryByOracleToken(streamOnly).isPresent(), WAIT, "the push holds the stream-only NFT");
+        assertTrue(oracle.snapshot().streamConnected(), "fixture: connected");
+
+        launcher.stop();
+
+        assertFalse(oracle.snapshot().streamConnected(), "the prices report the stream disconnected");
+        assertTrue(oracle.findEntryByOracleToken(streamOnly).isEmpty(), "the stream-only NFT is dropped");
+        assertEquals(4, oracle.entries().size(), "the API's entries stay");
+    }
+
+    /** Loads the preview API snapshot WITHOUT its first entry into {@code oracle}; returns that entry's NFT. */
+    private static AssetType withoutTheFirstEntryLoaded(FluidOracleClient oracle) throws IOException {
+        com.fasterxml.jackson.databind.node.ArrayNode api =
+                (com.fasterxml.jackson.databind.node.ArrayNode) new ObjectMapper().readTree(resource(PREVIEW_API));
+        AssetType first = firstNft(api);
+        api.remove(0);
+        oracle.load(api);
+        assertEquals(4, oracle.entries().size(), "fixture: the preview snapshot less one");
+        assertTrue(oracle.findEntryByOracleToken(first).isEmpty(), "fixture: the API does not list it");
+        return first;
+    }
+
+    /** Production timings with every retry delay ×1000: a closed session is not reopened within a test. */
+    private static OracleStreamClient.Timings slowReconnects() {
+        OracleStreamClient.Timings production = OracleStreamClient.Timings.PRODUCTION;
+        return new OracleStreamClient.Timings(production.tcpConnectTimeout(), production.handshakeTimeout(),
+                production.pingInterval(), production.pongTimeout(), production.proactiveReconnectAfter(), 1000);
+    }
+
+    /** An unrecognised {@code loans.oracle.source} is API — the stream drives nothing — with one WARN. */
+    @Test
+    void anUnrecognisedSourceIsApiWithOneWarn() {
+        server = new OracleStreamTestServer().authorize(account.stakeAddress()).start();
+        nodeVersionContext("loans.oracle.source= Side ways ").run(context -> {
+            assertNull(context.getStartupFailure(), "the context started");
+            context.getBean(OracleStreamLauncher.class).start();
+            server.awaitSession(0, WAIT);
+
+            List<ILoggingEvent> source = streamLines().stream()
+                    .filter(e -> e.getFormattedMessage().startsWith("[oracle-stream] source ")).toList();
+            assertEquals(1, source.size(), messages(source).toString());
+            assertEquals(Level.WARN, source.getFirst().getLevel());
+            assertTrue(source.getFirst().getFormattedMessage().endsWith(" reason=unrecognised value=Side_ways"),
+                    source.getFirst().getFormattedMessage());
+            assertEquals(1, onLines().size());
+            assertTrue(onLines().getFirst().endsWith(" node_ver=- source=api"), onLines().getFirst());
+        });
+    }
+
+    /**
+     * {@code LOANS_ORACLE_SOURCE} blank means stream, as Docker Compose forwards {@code LOANS_ORACLE_SOURCE=}; and
+     * that env var is the one that binds {@code loans.oracle.source}. Resolved through a real
+     * {@link SystemEnvironmentPropertySource} over the shipped file, then handed to the launcher.
+     */
+    @Test
+    void aBlankLoansOracleSourceMeansStream() throws IOException {
+        server = new OracleStreamTestServer().authorize(account.stakeAddress()).start();
+        PropertySource<?> base = new YamlPropertySourceLoader().load(RESOURCE, new ClassPathResource(RESOURCE)).getFirst();
+        String blank = environment(base, Map.of("LOANS_ORACLE_SOURCE", ""))
+                .resolvePlaceholders("${loans.oracle.source:stream}");
+        assertEquals("", blank, "the blank env var reaches the property");
+
+        launcher = new OracleStreamLauncher(account, network("preview"), present(), staker(), meters(), "true",
+                server.uri().toString(), blank, "unknown", "unknown");
+        launcher.start();
+        server.awaitSession(0, WAIT);
+        assertEquals(1, onLines().size());
+        assertTrue(onLines().getFirst().endsWith(" node_ver=- source=stream"), onLines().getFirst());
+        assertTrue(messages(streamLines()).stream().noneMatch(l -> l.startsWith("[oracle-stream] source ")));
+
+        assertEquals("api", environment(base, Map.of("LOANS_ORACLE_SOURCE", "api"))
+                .resolvePlaceholders("${loans.oracle.source:stream}"), "LOANS_ORACLE_SOURCE binds loans.oracle.source");
+        assertEquals("stream", environment(base, Map.of()).resolvePlaceholders("${loans.oracle.source:stream}"));
+    }
+
+    private static final long BUMP_MS = 60_000;
+
+    /** The preview push with its FIRST entry's feed moved {@link #BUMP_MS} later: a newer validFrom for that NFT. */
+    private static String bumpedPush() throws IOException {
+        ObjectNode push = (ObjectNode) new ObjectMapper().readTree(resource(PREVIEW_PUSH));
+        bump((ObjectNode) push.get("tokens").get(0));
+        return push.toString();
+    }
+
+    /** The preview API snapshot parse-equal to {@link #bumpedPush()}. */
+    private static JsonNode bumpedApi() throws IOException {
+        JsonNode api = new ObjectMapper().readTree(resource(PREVIEW_API));
+        bump((ObjectNode) api.get(0));
+        return api;
+    }
+
+    private static void bump(ObjectNode entry) {
+        ObjectNode feed = (ObjectNode) entry.get("supportedOracle").get(entry.get("preferredOracle").asText());
+        feed.put("validFrom", feed.get("validFrom").asLong() + BUMP_MS);
+        feed.put("validTo", feed.get("validTo").asLong() + BUMP_MS);
+    }
+
+    private static AssetType firstNft(JsonNode api) {
+        JsonNode oracle = api.get(0).get("fluidOracle");
+        return new AssetType(oracle.get("policyId").asText(), oracle.get("assetName").asText());
+    }
+
+    private static double missedCount(MeterRegistry registry, String stream) {
+        return registry.get(OracleStreamLauncher.METER_MISSED).tag("stream", stream).counter().count();
+    }
+
+    private List<String> missedLines() {
+        return messages(streamLines()).stream().filter(l -> l.startsWith("[oracle-stream] missed ")).toList();
     }
 
     // ======================================================================================

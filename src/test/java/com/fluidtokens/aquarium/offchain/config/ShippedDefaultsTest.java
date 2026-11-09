@@ -1,8 +1,14 @@
 package com.fluidtokens.aquarium.offchain.config;
 
+import com.bloxbean.cardano.yaci.store.starter.core.YaciStoreProperties;
 import com.bloxbean.cardano.yaci.store.starter.utxo.UtxoStoreAutoConfigProperties;
 import org.junit.jupiter.api.Test;
+import org.springframework.boot.context.properties.bind.BindContext;
+import org.springframework.boot.context.properties.bind.BindHandler;
+import org.springframework.boot.context.properties.bind.Bindable;
 import org.springframework.boot.context.properties.bind.Binder;
+import org.springframework.boot.context.properties.source.ConfigurationPropertyName;
+import org.springframework.boot.context.properties.source.ConfigurationPropertySource;
 import org.springframework.boot.context.properties.source.ConfigurationPropertySources;
 import org.springframework.boot.env.YamlPropertySourceLoader;
 import org.springframework.core.env.EnumerablePropertySource;
@@ -18,11 +24,15 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -484,7 +494,6 @@ class ShippedDefaultsTest {
      */
     private static final Map<String, String> SHIPPED_LIQUIDATION_DEFAULTS = Map.ofEntries(
             Map.entry("mode", "${AQUARIUM_LIQUIDATION_MODE:disabled}"),
-            Map.entry("delay-seconds", "${AQUARIUM_LIQUIDATION_DELAY_SECONDS:60}"),
             Map.entry("validity-window-seconds", "${AQUARIUM_LIQUIDATION_VALIDITY_WINDOW_SECONDS:120}"),
             Map.entry("oracle-window-margin-seconds", "${AQUARIUM_LIQUIDATION_ORACLE_MARGIN_SECONDS:30}"),
             Map.entry("profit-margin-lovelace", "${AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE:5000000}"),
@@ -543,10 +552,36 @@ class ShippedDefaultsTest {
     }
 
     /**
-     * ⛔ FAB-137 T2a: <b>UTxO pruning is ON every 600 s, and the key is spelled the way Yaci 0.1.7 binds it.</b>
+     * ⛔ FAB-183: the liquidation and compound delays are GONE, from every document. The stages run on committed
+     * blocks and oracle price changes, so nothing reads either key; one that came back would be a setting an
+     * operator can change that changes nothing, which reads exactly like it working. {@link ObsoleteSettingsWarning}
+     * WARNs at boot when an operator still sets one, and a shipped one would make that WARN fire on every node.
+     *
+     * <p>Each document is flattened by Spring's own YAML loader and looked up both literally and through
+     * {@link ConfigurationPropertySources}, so neither a re-nesting nor a relaxed spelling ({@code delaySeconds})
+     * slips past.
+     */
+    @Test
+    void noDocumentShipsTheLiquidationOrCompoundDelay() throws IOException {
+        List<PropertySource<?>> documents = new YamlPropertySourceLoader()
+                .load(RESOURCE, new ClassPathResource(RESOURCE));
+        assertEquals(documents().size(), documents.size(), "Spring and SnakeYAML disagree on the document count");
+        for (PropertySource<?> document : documents) {
+            ConfigurationPropertySource relaxed = ConfigurationPropertySources.from(document).iterator().next();
+            for (String removed : List.of("loans.liquidation.delay-seconds", "loans.compound.delay-seconds")) {
+                assertNull(document.getProperty(removed), document.getName() + " ships " + removed
+                        + ", which FAB-183 removed: nothing reads it");
+                assertNull(relaxed.getConfigurationProperty(ConfigurationPropertyName.of(removed)),
+                        document.getName() + " ships a relaxed spelling of " + removed);
+            }
+        }
+    }
+
+    /**
+     * ⛔ FAB-137 T2a: <b>UTxO pruning is ON every 600 s, and the key is spelled the way Yaci 0.1.7 and 2.0.7 bind it.</b>
      *
      * <p>The Minswap pool credential churns on every swap, so without pruning {@code address_utxo} and
-     * {@code tx_input} grow with every batch forever. The 0.1.7 fields are {@code pruningEnabled},
+     * {@code tx_input} grow with every batch forever. The 0.1.7 and 2.0.7 fields are {@code pruningEnabled},
      * {@code pruningInterval} and {@code pruningSafeBlocks} on {@code UtxoStoreAutoConfigProperties.Utxo},
      * so the keys are {@code store.utxo.pruning-enabled} / {@code -interval} / {@code -safe-blocks}.
      * <b>{@code store.utxo.pruning.interval} binds to NOTHING</b> — Spring ignores the unknown key and
@@ -596,6 +631,117 @@ class ShippedDefaultsTest {
                 .filter(name -> name.startsWith("store.utxo."))
                 .toList();
         assertEquals(List.of(), previewUtxoKeys, "the preview document must not override store.utxo.*");
+    }
+
+    /**
+     * ⛔ FAB-203: <b>no {@code store.*} key the node ships is silently ignored.</b>
+     *
+     * <p>Yaci binds {@code store.*} into {@code YaciStoreProperties} and {@code UtxoStoreAutoConfigProperties},
+     * both {@code ignoreUnknownFields = true}, so a key neither declares is dropped without a word and reads,
+     * to anyone editing the file, exactly like a setting in force. {@code store.blocks.epoch-calculation-interval=14400}
+     * was such a key: the {@code =} made it a different name, and nothing ever read it.
+     *
+     * <p>So the raw names are enumerated straight off each document — never through
+     * {@link ConfigurationPropertySources}, whose adapter silently drops a name containing {@code =}, which is the
+     * defect itself — and each must be one Spring's {@link Binder} actually bound into one of the two classes, or
+     * one of the two keys Yaci reads directly from the {@code Environment} ({@code store.core.api-enabled} in
+     * {@code CoreApiConfiguration}, {@code store.auto-index-management} in {@code DBIndexProcessor}).
+     */
+    @Test
+    void noShippedStoreKeyIsSilentlyIgnored() throws IOException {
+        Set<String> readDirectlyByYaci = Set.of("store.core.api-enabled", "store.auto-index-management");
+        List<PropertySource<?>> documents = new YamlPropertySourceLoader()
+                .load(RESOURCE, new ClassPathResource(RESOURCE));
+        assertEquals(documents().size(), documents.size(), "Spring and SnakeYAML disagree on the document count");
+
+        List<String> ignored = new ArrayList<>();
+        for (PropertySource<?> document : documents) {
+            assertTrue(document instanceof EnumerablePropertySource<?>,
+                    "fixture: " + document.getName() + " must be enumerable");
+            List<String> storeKeys = Arrays.stream(((EnumerablePropertySource<?>) document).getPropertyNames())
+                    .filter(name -> name.startsWith("store."))
+                    .toList();
+            assertFalse(storeKeys.isEmpty(),
+                    "fixture: " + document.getName() + " ships no store.* key — this test would be vacuous");
+
+            Set<ConfigurationPropertyName> bound = new HashSet<>();
+            BindHandler recordEveryBoundName = new BindHandler() {
+                @Override
+                public Object onSuccess(ConfigurationPropertyName name, Bindable<?> target, BindContext context,
+                                        Object result) {
+                    bound.add(name);
+                    return result;
+                }
+            };
+            Binder binder = new Binder(ConfigurationPropertySources.from(document));
+            binder.bind("store", Bindable.of(YaciStoreProperties.class), recordEveryBoundName);
+            binder.bind("store", Bindable.of(UtxoStoreAutoConfigProperties.class), recordEveryBoundName);
+
+            for (String key : storeKeys) {
+                boolean wasBound = ConfigurationPropertyName.isValid(key)
+                        && bound.contains(ConfigurationPropertyName.of(key));
+                if (!wasBound && !readDirectlyByYaci.contains(key)) {
+                    ignored.add(key + " (" + document.getName() + ")");
+                }
+            }
+        }
+        assertEquals(List.of(), ignored,
+                "these shipped store.* keys bind to nothing Yaci declares and nothing reads them directly, so "
+                        + "Yaci silently ignores them: fix the spelling or delete them");
+    }
+
+    /**
+     * ⛔ FAB-203 (D1): <b>the base document switches off every Yaci Store 2.x default the node does not adopt.</b>
+     *
+     * <p>2.0.7 turns on its plugin framework ({@code store.plugins.enabled}), the plugin admin API
+     * ({@code store.plugins.api-enabled}), the core admin API ({@code store.core.api-enabled}) and automatic index
+     * management ({@code store.auto-index-management}) unless told otherwise; parallel block processing
+     * ({@code store.executor.enable-parallel-processing}) is off by default and is pinned off so a future default
+     * cannot flip it. The first three bind through Yaci's own properties class; the last two are also, or only, read
+     * straight from the {@code Environment}, so they are resolved that way too. Every key must be present in the file,
+     * not merely default to the right value, and the preview document must set none of them: it inherits the base.
+     * {@code YaciStoreSwitchesTest} proves what they do once Yaci's auto-configuration reads them.
+     */
+    @Test
+    void theBaseDocumentSwitchesOffEveryYaci2DefaultTheNodeDoesNotAdopt() throws IOException {
+        List<String> switches = List.of(
+                "store.plugins.enabled",
+                "store.plugins.api-enabled",
+                "store.core.api-enabled",
+                "store.auto-index-management",
+                "store.executor.enable-parallel-processing");
+        List<PropertySource<?>> documents = new YamlPropertySourceLoader()
+                .load(RESOURCE, new ClassPathResource(RESOURCE));
+        PropertySource<?> baseDocument = documents.getFirst();
+        for (String key : switches) {
+            assertEquals(Boolean.FALSE, baseDocument.getProperty(key), "the base document must ship " + key + ": false");
+        }
+
+        YaciStoreProperties bound = new Binder(ConfigurationPropertySources.from(baseDocument))
+                .bindOrCreate("store", YaciStoreProperties.class);
+        assertFalse(bound.getPlugins().isEnabled(), "store.plugins.enabled must bind false");
+        assertFalse(bound.getPlugins().isApiEnabled(), "store.plugins.api-enabled must bind false");
+        assertFalse(bound.getExecutor().isEnableParallelProcessing(),
+                "store.executor.enable-parallel-processing must bind false");
+
+        var environment = new StandardEnvironment();
+        environment.getPropertySources().addFirst(baseDocument);
+        ConfigurationPropertySources.attach(environment);
+        assertEquals("false", environment.getProperty("store.core.api-enabled"),
+                "CoreApiConfiguration's @ConditionalOnProperty reads this exact key");
+        assertEquals("false", environment.getProperty("store.auto-index-management"),
+                "DBIndexProcessor reads this exact key from the Environment");
+
+        PropertySource<?> previewDocument = documents.stream()
+                .filter(d -> "preview".equals(d.getProperty("spring.config.activate.on-profile")))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("no document activates the preview profile"));
+        assertTrue(previewDocument instanceof EnumerablePropertySource<?>, "fixture: preview must be enumerable");
+        List<String> previewOverrides = Arrays.stream(((EnumerablePropertySource<?>) previewDocument).getPropertyNames())
+                .filter(name -> name.startsWith("store.plugins.") || name.startsWith("store.core.")
+                        || name.startsWith("store.auto-index-management") || name.startsWith("store.executor."))
+                .toList();
+        assertEquals(List.of(), previewOverrides, "the preview document must not override any of " + switches);
     }
 
     private static Object liquidationBlockOf(Map<String, Object> document) {

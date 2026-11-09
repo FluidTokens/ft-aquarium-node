@@ -230,12 +230,14 @@ public class LiquidationReadinessController {
     /**
      * ⛔ FAB-145: the book above the table — the FILTERED list's counts and the collateral it locks (TVL),
      * an ESTIMATE at oracle prices. Giovanni's rulings (2026-10-18): TVL is collateral only, never debt;
-     * USD comes from the USDM oracle feed alone; and the summary follows the active filters.
+     * USD comes from the reference stablecoin's oracle feed alone (USDCx by default since FAB-182, the page's
+     * one ADA/USD rate); and the summary follows the active filters.
      *
      * @param totalLovelace         the PRICED loans' collateral in lovelace; null when there are loans and
      *                              none could be priced — unknown, never zero
      * @param unpricedLoans         loans excluded from every total because their collateral has no price
-     * @param usdDisplay            {@code totalLovelace} in USDM, scaled; null when USD is unavailable
+     * @param usdDisplay            {@code totalLovelace} in the reference stablecoin, scaled; null when USD is
+     *                              unavailable. Its label is the token's own, which is what the page names
      * @param usdUnavailableReason  why {@code usdDisplay} is null; null when it is not
      */
     public record BookSummary(long loans, long liquidatable, long blocked, List<TokenTvl> tokens,
@@ -251,6 +253,38 @@ public class LiquidationReadinessController {
      */
     public record TokenTvl(String unit, long loans, AssetDisplay amount, BigInteger valueLovelace,
                            AssetDisplay valueDisplay, long unpricedLoans) {
+    }
+
+    /**
+     * ⛔ FAB-182: the prices strip under the wallet — every token the oracle registry prices, priced with the
+     * feed the bot holds for it, plus ADA's own USD rate first. Display only: nothing decides on it.
+     *
+     * @param entries              the ADA entry, then one per distinct registry token, by label
+     * @param usdReference         the reference stablecoin's own label (USDCx, …), which the strip's caveat names
+     *                             so every view — the phone's included — says in words that USD is an estimate;
+     *                             null when no reference unit is configured
+     * @param usdUnavailableReason why every USD cell is {@code —}; null when USD is available
+     * @param serverNow            the render instant (epoch ms) every age is measured from, so the page's
+     *                             script ticks from the server's clock and not the browser's
+     */
+    public record PriceStrip(List<TokenPrice> entries, String usdReference, String usdUnavailableReason,
+                             long serverNow) {
+    }
+
+    /**
+     * One entry of the strip.
+     *
+     * @param adaText         the price of one WHOLE token in ADA, 4 significant digits — per raw BASE UNIT when
+     *                        {@code metadataUnknown}, because a scale nobody published is never guessed; null for
+     *                        the ADA entry
+     * @param usdText         {@code $…}, or {@code —} when USD is unavailable
+     * @param metadataUnknown no decimals are known, so both figures are per base unit and the page marks them
+     * @param stale           no feed for this token is usable now; the figures are the last one held
+     * @param validFrom       the shown feed's {@code validFrom} (epoch ms); null for the ADA entry, which has no age
+     * @param ageText         {@code now − validFrom} as {@code XmYs}, or {@code XhYm} from one hour
+     */
+    public record TokenPrice(String unit, String label, String policyId, String adaText, String usdText,
+                             boolean metadataUnknown, boolean stale, Long validFrom, String ageText) {
     }
 
     /**
@@ -270,8 +304,9 @@ public class LiquidationReadinessController {
             boolean suspended = a.state().suspended();
             if (a.armed()) {
                 return new RebalanceView(env, suspended, "ARMED",
-                        "after each block, if the wallet has drifted out of shape, the node signs and submits "
-                                + "one self-send of its whole wallet, in shadow as well as live", true, false);
+                        "on each pass — after a committed block or an oracle price change — in which no liquidation "
+                                + "or compound went out, if the wallet has drifted out of shape, the node signs and "
+                                + "submits one self-send of its whole wallet, in shadow as well as live", true, false);
             }
             return switch (a.idle()) {
                 case ENV_DISABLED -> new RebalanceView(env, suspended, "OFF",
@@ -283,9 +318,6 @@ public class LiquidationReadinessController {
                 case MODE_NOT_SHADOW_OR_LIVE -> new RebalanceView(env, suspended, "IDLE",
                         "the liquidation mode is " + (a.mode() == null ? "not set" : a.mode().name())
                                 + "; rebalancing runs only in shadow or live", true, false);
-                case NO_ANTICIPATE_MARKET -> new RebalanceView(env, suspended, "IDLE",
-                        "no action: ANTICIPATE market has an effective mode of shadow or live, so there is no "
-                                + "token to keep ready", true, false);
                 case SYNCING -> new RebalanceView(env, suspended, "IDLE",
                         "the node is syncing; rebalancing starts once it has caught up", true, false);
             };
@@ -329,8 +361,9 @@ public class LiquidationReadinessController {
     private boolean compoundEnabled;
     @org.springframework.beans.factory.annotation.Value("${scheduling.transaction-processor.enabled:false}")
     private boolean processorEnabled;
-    // FAB-145: the stablecoin the book's USD estimate is priced through. Display only, like the three
-    // above; blank means USD is shown as unavailable, never guessed.
+    // FAB-145: the stablecoin the book's USD estimate is priced through — and, since FAB-182, the prices
+    // strip's too: the page's ONE ADA/USD rate. Display only, like the three above; blank means USD is
+    // shown as unavailable, never guessed.
     @org.springframework.beans.factory.annotation.Value("${loans.ui.usd-reference-unit:}")
     private String usdReferenceUnit = "";
 
@@ -426,9 +459,9 @@ public class LiquidationReadinessController {
     }
 
     /**
-     * FAB-174: the shadow oracle stream's status, for one line on the page. The page only READS it; no decision
-     * reads the stream. Setter-injected and REQUIRED in the container; null only in a direct test construction,
-     * where no line renders.
+     * FAB-174: the oracle stream's status, for one line on the page. The page only READS it; by default
+     * ({@code loans.oracle.source=stream}) the bot's prices merge the stream's pushes in {@code FluidOracleClient}.
+     * Setter-injected and REQUIRED in the container; null only in a direct test construction, where no line renders.
      */
     private com.fluidtokens.aquarium.offchain.service.loans.OracleStreamLauncher oracleStreamLauncher;
 
@@ -517,6 +550,11 @@ public class LiquidationReadinessController {
         walletNow.byUnit().forEach((unit, amount) ->
                 walletDisplay.put(unit, display(unit, amount, walletMeta)));
         model.addAttribute("walletDisplay", walletDisplay);
+        // ⛔ FAB-182: ONE USD reference feed per render, shared by the prices strip and the book below — the
+        // page shows one ADA/USD rate, never two.
+        String usdUnit = usdReferenceUnit();
+        Optional<OraclePriceFeed> usd = usdFeed(usdUnit, now);
+        model.addAttribute("prices", prices(usd, usdUnit, metadataMemo, now));
         // ⚠ The SELECT options come from the loans actually present, never from a fixed list: an
         // option that matches nothing is a filter an operator can set and then wonder about.
         model.addAttribute("principals", all.stream().map(Row::principalUnit).distinct().sorted().toList());
@@ -540,7 +578,7 @@ public class LiquidationReadinessController {
         // ⛔ FAB-145: the book, from the FILTERED list and never the page, like the counts above. The USD
         // feed is resolved once per render; labels go through the same memo as the table's.
         model.addAttribute("book", summarise(arranged, (unit, amount) -> display(unit, amount, metadataMemo),
-                usdFeed(now), usdReferenceUnit));
+                usd, usdUnit));
 
         int pages = Math.max(1, (arranged.size() + PAGE_SIZE - 1) / PAGE_SIZE);
         // ⚠ CLAMPED, not trusted. A stale ?page= from a bookmark, or one left behind when a filter
@@ -657,10 +695,11 @@ public class LiquidationReadinessController {
      * and loan count, and OUT of every value and total; {@link BookSummary#unpricedLoans} says how many.
      * Token lines are ordered by value descending, valueless tokens last, ties by unit.
      *
-     * <p>⚠ USD is {@code totalLovelace} through the USDM feed, and it is UNAVAILABLE — with the reason, in
-     * place of the figure — rather than wrong: no reference unit configured, no usable feed, a conversion
-     * that throws, or a USDM display with no published decimals (an unscaled figure is not dollars). None
-     * of that touches the ADA figures.
+     * <p>⚠ USD is {@code totalLovelace} through the reference stablecoin's feed, and it is UNAVAILABLE — with
+     * the reason, in place of the figure — rather than wrong: no reference unit configured, no usable feed, a
+     * conversion that throws, or a reference display with no published decimals (an unscaled figure is not
+     * dollars). None of that touches the ADA figures. Every reason names the reference by its own label
+     * (FAB-182), never by a hard-coded ticker.
      */
     static BookSummary summarise(List<Row> rows, BiFunction<String, BigInteger, AssetDisplay> display,
                                  Optional<OraclePriceFeed> usdFeed, String usdUnit) {
@@ -695,10 +734,11 @@ public class LiquidationReadinessController {
         AssetDisplay usd = null;
         AssetDisplay rate = null;
         String usdUnavailable;
-        if (usdUnit == null || usdUnit.isBlank()) {
-            usdUnavailable = "turned off: no USDM unit is set (LOANS_UI_USD_REFERENCE_UNIT is empty, or unset on preview)";
+        String reference = usdUnit == null || usdUnit.isBlank() ? null : referenceLabel(display, usdUnit);
+        if (reference == null) {
+            usdUnavailable = USD_TURNED_OFF;
         } else if (usdFeed.isEmpty()) {
-            usdUnavailable = "no usable USDM oracle price right now";
+            usdUnavailable = noUsdFeed(reference);
         } else if (totalLovelace == null) {
             usdUnavailable = "no loan's collateral could be priced, so there is nothing to convert";
         } else {
@@ -709,10 +749,10 @@ public class LiquidationReadinessController {
                 rate = display.apply(usdUnit,
                         LoanFinance.fromLovelace(Rational.fromInt(1_000_000L), usdFeed.get()).floor());
             } catch (RuntimeException e) {
-                usdUnavailable = "the USDM price could not be converted (" + e.getClass().getSimpleName() + ")";
+                usdUnavailable = usdNotConverted(reference, e);
             }
             if (usdUnavailable == null && (usd.metadataUnknown() || rate.metadataUnknown())) {
-                usdUnavailable = "USDM has no published decimals here, so a dollar figure cannot be scaled";
+                usdUnavailable = usdNoDecimals(reference);
             }
             if (usdUnavailable != null) {
                 usd = null;
@@ -729,21 +769,204 @@ public class LiquidationReadinessController {
     }
 
     /**
-     * The USDM feed for the book, loan-free at the highest usable version; empty when no reference unit
-     * is configured, no oracle client is present, or the unit cannot be read. Never throws: a USD failure
-     * must not take the page down.
+     * ⛔ The configured reference unit, trimmed ONCE, here, where it enters the controller — the book, the
+     * strip and the feed lookup all take it from this, so a padded {@code LOANS_UI_USD_REFERENCE_UNIT} cannot
+     * give the book one unit and the strip another (FAB-182 r2). Blank stays blank: USD turned off.
      */
-    private Optional<OraclePriceFeed> usdFeed(long now) {
+    private String usdReferenceUnit() {
+        return usdReferenceUnit == null ? "" : usdReferenceUnit.trim();
+    }
+
+    /**
+     * The reference stablecoin's feed — the page's one ADA/USD rate, for the book AND the prices strip —
+     * loan-free at the highest usable version; empty when no reference unit is configured, no oracle client
+     * is present, or the unit cannot be read. Never throws: a USD failure must not take the page down.
+     */
+    private Optional<OraclePriceFeed> usdFeed(String usdUnit, long now) {
         FluidOracleClient client = oracleClient.getIfAvailable();
-        if (client == null || usdReferenceUnit == null || usdReferenceUnit.isBlank()) {
+        if (client == null || usdUnit == null || usdUnit.isBlank()) {
             return Optional.empty();
         }
         try {
-            return client.findFeed(AssetType.fromUnit(usdReferenceUnit.trim()), now);
+            return client.findFeed(AssetType.fromUnit(usdUnit), now);
         } catch (RuntimeException e) {
-            log.debug("the USD reference unit {} could not be priced: {}", usdReferenceUnit, e.toString());
+            log.debug("the USD reference unit {} could not be priced: {}", usdUnit, e.toString());
             return Optional.empty();
         }
+    }
+
+    // ---- FAB-182: the USD wording the book and the strip share, naming the reference by its own label ----
+
+    static final String USD_TURNED_OFF =
+            "turned off: no USD reference unit is set (LOANS_UI_USD_REFERENCE_UNIT is empty, or unset on preview)";
+
+    private static String noUsdFeed(String reference) {
+        return "no usable " + reference + " oracle price right now";
+    }
+
+    private static String usdNotConverted(String reference, RuntimeException e) {
+        return "the " + reference + " price could not be converted (" + e.getClass().getSimpleName() + ")";
+    }
+
+    private static String usdNoDecimals(String reference) {
+        return reference + " has no published decimals here, so a dollar figure cannot be scaled";
+    }
+
+    /**
+     * What the page calls the reference stablecoin: its label from the SAME metadata lookup every amount
+     * uses (USDCx, USDM, …), never a hard-coded ticker — so the words follow whatever unit is configured.
+     * Falls back to the unit itself rather than failing the page.
+     */
+    private static String referenceLabel(BiFunction<String, BigInteger, AssetDisplay> display, String usdUnit) {
+        try {
+            String label = display.apply(usdUnit, BigInteger.ZERO).label();
+            return label == null || label.isBlank() ? usdUnit : label;
+        } catch (RuntimeException e) {
+            return usdUnit;
+        }
+    }
+
+    /**
+     * The strip for this render, or null when there is no oracle client or it could not be built. {@code usd}
+     * and {@code usdUnit} are the book's own — the page's one rate.
+     */
+    private PriceStrip prices(Optional<OraclePriceFeed> usd, String usdUnit, Map<String, TokenMetadata> metadataMemo,
+                              long now) {
+        FluidOracleClient client = oracleClient.getIfAvailable();
+        if (client == null) {
+            return null;
+        }
+        try {
+            return priceStrip(client, unit -> metadata(unit, metadataMemo), usd, usdUnit, now);
+        } catch (RuntimeException e) {
+            // ⚠ DEBUG: the strip is a convenience, and its absence is visible on the page itself.
+            log.debug("the readiness prices strip could not be built: {}", e.toString());
+            return null;
+        }
+    }
+
+    /**
+     * ⛔ FAB-182: the prices strip, from the SAME oracle client the bot prices with and its loan-free
+     * selection — no second source. Package-private and static so it can be tested without Spring.
+     *
+     * <ul>
+     *   <li>One entry per distinct {@code entry.token()} in {@link FluidOracleClient#entries()}: the feed
+     *       {@link FluidOracleClient#findFeed} picks (usable now, highest version), else the one
+     *       {@link FluidOracleClient#findEntry} holds, flagged {@code stale}.</li>
+     *   <li>ADA per WHOLE token = lovelace per base unit × 10^decimals ÷ 10^6. With no published decimals the
+     *       figure stays per base unit and is marked — a scale nobody published is never guessed.</li>
+     *   <li>USD = ADA × USD per ADA, where USD per ADA = 1 ÷ the ADA price of one whole reference token, through
+     *       {@code usdFeed} — the book's feed, so the page has one rate. Unavailable ⇒ every USD cell is
+     *       {@code —} and the reason is stated once, in the book's words.</li>
+     *   <li>Exact rational arithmetic throughout; only the rendered text is rounded, to 4 significant digits.</li>
+     * </ul>
+     *
+     * <p>A token that cannot be priced is left out and logged at DEBUG; the strip is then partial, never wrong.
+     *
+     * @return null when {@code client} is null (lending off: no strip)
+     */
+    static PriceStrip priceStrip(FluidOracleClient client, Function<String, TokenMetadata> metadataOf,
+                                 Optional<OraclePriceFeed> usdFeed, String usdUnit, long now) {
+        if (client == null) {
+            return null;
+        }
+        // ---- USD per ADA: one rate, or a reason ---------------------------------------------------------
+        Rational usdPerAda = null;
+        String usdUnavailable;
+        String reference = usdUnit == null || usdUnit.isBlank() ? null
+                : referenceLabel((unit, amount) -> AssetDisplay.of(amount, metadataOf.apply(unit)), usdUnit);
+        if (reference == null) {
+            usdUnavailable = USD_TURNED_OFF;
+        } else if (usdFeed.isEmpty()) {
+            usdUnavailable = noUsdFeed(reference);
+        } else {
+            TokenMetadata referenceMeta = metadataOf.apply(usdUnit);
+            if (!referenceMeta.hasDecimals()) {
+                usdUnavailable = usdNoDecimals(reference);
+            } else {
+                try {
+                    usdPerAda = adaPerWholeToken(usdFeed.get(), referenceMeta.decimals()).reciprocal()
+                            .orElseThrow(() -> new ArithmeticException("oracle price is zero"));
+                    usdUnavailable = null;
+                } catch (RuntimeException e) {
+                    usdUnavailable = usdNotConverted(reference, e);
+                }
+            }
+        }
+
+        // ---- one row per distinct token, labelled and ordered like the filter dropdowns -------------------
+        Map<AssetType, OraclePriceFeed> feeds = new LinkedHashMap<>();
+        Map<AssetType, Boolean> staleness = new HashMap<>();
+        for (OracleEntry entry : client.entries()) {
+            AssetType token = entry.token();
+            if (token == null || token.isAda() || feeds.containsKey(token)) {
+                continue;
+            }
+            Optional<OraclePriceFeed> usable = client.findFeed(token, now);
+            Optional<OraclePriceFeed> held = usable.isPresent() ? usable
+                    : client.findEntry(token).map(OracleEntry::feed);
+            if (held.isPresent()) {
+                feeds.put(token, held.get());
+                staleness.put(token, usable.isEmpty());
+            }
+        }
+        Map<String, AssetType> byUnit = new LinkedHashMap<>();
+        feeds.keySet().forEach(token -> byUnit.put(token.toUnit(), token));
+        List<String> units = new ArrayList<>(byUnit.keySet());
+        units.add("lovelace");
+        Map<String, String> labels = optionLabels(units, unit -> metadataOf.apply(unit).displayLabel());
+
+        List<TokenPrice> entries = new ArrayList<>();
+        entries.add(new TokenPrice("lovelace", labels.get("lovelace"), "", null, usd(usdPerAda),
+                false, false, null, null));
+        for (Map.Entry<String, String> labelled : labels.entrySet()) {
+            AssetType token = byUnit.get(labelled.getKey());
+            if (token == null) {
+                continue;
+            }
+            OraclePriceFeed feed = feeds.get(token);
+            try {
+                TokenMetadata meta = metadataOf.apply(labelled.getKey());
+                // ⛔ No published decimals: per BASE UNIT, marked — never scaled by a guess.
+                Rational ada = adaPerWholeToken(feed, meta.hasDecimals() ? meta.decimals() : 0);
+                entries.add(new TokenPrice(labelled.getKey(), labelled.getValue(), meta.policyId(),
+                        significant(ada), usd(usdPerAda == null ? null : ada.mul(usdPerAda)),
+                        !meta.hasDecimals(), staleness.get(token), feed.validFrom(),
+                        age(now - feed.validFrom())));
+            } catch (RuntimeException e) {
+                log.debug("the prices strip left out {}: {}", labelled.getKey(), e.toString());
+            }
+        }
+        return new PriceStrip(List.copyOf(entries), reference, usdUnavailable, now);
+    }
+
+    /** ADA per {@code 10^decimals} base units: lovelace per base unit × 10^decimals ÷ 1,000,000. */
+    private static Rational adaPerWholeToken(OraclePriceFeed feed, int decimals) {
+        return feed.price().mul(Rational.required(BigInteger.TEN.pow(decimals), BigInteger.valueOf(1_000_000L)));
+    }
+
+    /** {@code $…} at 4 significant digits, or {@code —} when there is no USD rate. */
+    private static String usd(Rational value) {
+        return value == null ? "—" : "$" + significant(value);
+    }
+
+    /** ⚠ 4 significant digits, so a tiny price (HOSKY) stays readable rather than rounding to zero. */
+    static String significant(Rational value) {
+        return new java.math.BigDecimal(value.numerator())
+                .divide(new java.math.BigDecimal(value.denominator()),
+                        new java.math.MathContext(4, java.math.RoundingMode.HALF_UP))
+                .stripTrailingZeros().toPlainString();
+    }
+
+    /**
+     * A feed's age as {@code XmYs}, or {@code XhYm} from one hour — the format the page's script also writes.
+     * A {@code validFrom} after the render instant reads as zero rather than negative.
+     */
+    static String age(long millis) {
+        long seconds = Math.max(0L, millis) / 1000L;
+        return seconds < 3600L
+                ? seconds / 60L + "m" + seconds % 60L + "s"
+                : seconds / 3600L + "h" + (seconds % 3600L) / 60L + "m";
     }
 
     /** Re-labels with {@code longer} every unit whose current text another unit shares. */
@@ -1010,28 +1233,32 @@ public class LiquidationReadinessController {
                 routeDetail = "ada collateral on a convert bond — neither the convert nor the "
                         + "pay-in-advance route builds a liquidation for it, and the bond rules out "
                         + "the plain route";
-            } else if (action == AppConfig.LiquidationConfiguration.Action.CONVERT && usability.usable()) {
-                route = "CONVERT";
-                routeDetail = "a Minswap pool is deep enough to clear this loan's debt, so the bot "
-                        + "creates a swap order and fronts no capital";
-            } else if (action == AppConfig.LiquidationConfiguration.Action.CONVERT) {
-                // ⛔ FAB-126: a CONVERT market whose pool verdict is not USABLE. The executor goes to the
-                // convert router and refuses on the pool, or as CONVERT_UNAVAILABLE when the node cannot
-                // convert; it NEVER falls back to pay-in-advance, which would front capital nobody
-                // authorised (LiquidationExecutor's action split). So the label is CONVERT, and fronting
-                // the principal is the operator's switch to flip, not ours. The advance is still
-                // computed: it is what ANTICIPATE would need, if they flip it.
-                route = "CONVERT";
-                routeDetail = convertNotUsableDetail(usability);
-                advance = advanceAmount(loan, bond, now);
             } else {
-                route = "CAPITAL IN ADVANCE";
-                // ⛔ The market's configuration and the pool's state are DIFFERENT reasons, and an
-                // operator acts on them differently: a setting will not change by itself, a thin pool
-                // may. So both are reported, never one standing in for the other.
-                routeDetail = "this market is configured action: ANTICIPATE, so the bot fronts the principal "
-                        + "whatever the pool says";
-                advance = advanceAmount(loan, bond, now);
+                // Exhaustive, no default: a new action does not compile until it names its route here.
+                RouteChoice choice = switch (action) {
+                    case CONVERT -> usability.usable()
+                            ? new RouteChoice("CONVERT", "a Minswap pool is deep enough to clear this loan's "
+                                    + "debt, so the bot creates a swap order and fronts no capital", false)
+                            // ⛔ FAB-126: a CONVERT market whose pool verdict is not USABLE. The executor goes
+                            // to the convert router and refuses on the pool, or as CONVERT_UNAVAILABLE when
+                            // the node cannot convert; it NEVER falls back to pay-in-advance, which would
+                            // front capital nobody authorised (LiquidationExecutor's action split). So the
+                            // label is CONVERT, and fronting the principal is the operator's switch to flip,
+                            // not ours. The advance is still computed: it is what a capital-fronting action
+                            // would need, if they flip it.
+                            : new RouteChoice("CONVERT", convertNotUsableDetail(usability), true);
+                    // ⛔ The market's configuration and the pool's state are DIFFERENT reasons, and an
+                    // operator acts on them differently: a setting will not change by itself, a thin pool
+                    // may. So both are reported, never one standing in for the other.
+                    case ANTICIPATE -> new RouteChoice("CAPITAL IN ADVANCE", "this market is configured "
+                            + "action: ANTICIPATE, so the bot fronts the principal whatever the pool says", true);
+                    case CONVERT_BEFORE_ANTICIPATE -> convertBeforeAnticipateRoute(convertEnabled, usability);
+                };
+                route = choice.route();
+                routeDetail = choice.detail();
+                if (choice.computesAdvance()) {
+                    advance = advanceAmount(loan, bond, now);
+                }
             }
 
             // ⛔ SHOWN ON EVERY CONVERTIBLE ROW, not only where CONVERT was refused. The operator's
@@ -1060,7 +1287,7 @@ public class LiquidationReadinessController {
         ProcessingBlocker blocker = ProcessingBlocker.of(
                 gate.effectiveMode(datum.principalAsset()), gate.actionFor(datum.principalAsset()),
                 gate.marketFor(datum.principalAsset()), convertEnabled, bondRoute,
-                new ProcessingBlocker.PoolUsabilityView(usability.usable(), usability.detail()),
+                new ProcessingBlocker.PoolUsabilityView(usability.verdict(), usability.detail()),
                 advance, funds.balance(), wallet.known(), funds.label(), funds.detail());
 
         ActionNow actionNow = gatedAction(lendingConfigGate,
@@ -1070,7 +1297,7 @@ public class LiquidationReadinessController {
                                         gate.effectiveMode(datum.principalAsset()),
                                         gate.actionFor(datum.principalAsset()),
                                         gate.marketFor(datum.principalAsset()), convertEnabled,
-                                        usability.usable(), advance)),
+                                        usability.verdict(), advance)),
                         health.liquidatable(), assessment));
 
         return new Row(loan.loanId(), loan.utxoRef(),
@@ -1136,10 +1363,22 @@ public class LiquidationReadinessController {
 
     /**
      * ⛔ FAB-126 slice 2 r2: the route detail of a CONVERT market whose pool verdict is not USABLE, which
-     * follows the VERDICT, not merely "not usable". Only a verdict about the POOL earns the ANTICIPATE
-     * remedy: a failed lookup ({@code CHECK_FAILED}) is not evidence that no pool exists — the executor
-     * may convert this loan on the next cycle — and an unpriced loan ({@code UNKNOWN}) says nothing about
-     * any pool, so advising capital-fronting on either would turn "could not ask" into "no pool".
+     * follows the VERDICT, not merely "not usable". The remedy each verdict earns is the one the executor
+     * would actually honour (FAB-194-4 r2):
+     * <ul>
+     *   <li>{@code NO_POOL}, {@code TOO_THIN} and {@code NOT_CONFIGURED} earn the CONVERT_BEFORE_ANTICIPATE
+     *       remedy: the executor falls back to pay-in-advance on exactly these (the router's
+     *       {@code NoPoolException} — which a missing Minswap configuration also throws — and
+     *       {@code POOL_TOO_THIN}), so that market would front the principal under its cap.</li>
+     *   <li>{@code WRONG_PAIR} and {@code CANNOT_QUOTE} earn only the ANTICIPATE remedy: the convert route
+     *       refuses them and a CONVERT_BEFORE_ANTICIPATE market would refuse them too, never falling back, so
+     *       advising it would promise a capital route the bot does not take — and contradict this page's own
+     *       CONVERT_BEFORE_ANTICIPATE rows.</li>
+     *   <li>{@code CHECK_FAILED} and {@code UNKNOWN} earn no remedy: a failed lookup is not evidence that no
+     *       pool exists — the executor may convert this loan on the next cycle — and an unpriced loan says
+     *       nothing about any pool, so advising capital-fronting on either would turn "could not ask" into
+     *       "no pool".</li>
+     * </ul>
      *
      * <p>The switch is exhaustive so that a new verdict fails to compile here rather than falling into a
      * wrong text. {@code USABLE} cannot reach this branch (the caller routes it to the usable-pool
@@ -1149,25 +1388,71 @@ public class LiquidationReadinessController {
     static String convertNotUsableDetail(PoolUsability usability) {
         String noCapital = "; the bot fronts no capital on a CONVERT market";
         return switch (usability.verdict()) {
-            case NO_POOL, TOO_THIN, WRONG_PAIR, CANNOT_QUOTE ->
+            case NO_POOL, TOO_THIN ->
                     "the pool cannot fill this loan's swap, so the convert route will refuse it: "
                             + usability.detail() + noCapital
-                            + " — to front the principal instead, set this market to action: ANTICIPATE "
-                            + "with a cap";
+                            + " — to front the principal instead, set this market to action: "
+                            + "CONVERT_BEFORE_ANTICIPATE with a cap";
+            case WRONG_PAIR, CANNOT_QUOTE ->
+                    "the pool cannot fill this loan's swap, so the convert route will refuse it: "
+                            + usability.detail() + noCapital
+                            + " — to front the principal instead, set this market to action: ANTICIPATE with a cap";
             case CHECK_FAILED ->
                     "the pool check could not complete, which is NOT evidence that no pool exists; the bot "
                             + "checks again next cycle: " + usability.detail() + noCapital;
             case NOT_CONFIGURED ->
                     "this node cannot convert (no Minswap configuration for its network), so the convert "
                             + "route refuses every loan on this market: " + usability.detail() + noCapital
-                            + " — configure loans.minswap.*, or set this market to action: ANTICIPATE "
-                            + "with a cap";
+                            + " — configure loans.minswap.*, or set this market to action: "
+                            + "CONVERT_BEFORE_ANTICIPATE with a cap";
             case UNKNOWN ->
                     "whether a pool can fill this swap is not known, because the loan's figures could not "
                             + "be priced: " + usability.detail() + noCapital;
             case USABLE ->
                     "the pool check reports a usable pool, but this row was not routed as one: "
                             + usability.detail() + noCapital;
+        };
+    }
+
+    /** A convert-bond row's route, its detail, and whether the advance is computed for it. */
+    record RouteChoice(String route, String detail, boolean computesAdvance) { }
+
+    /**
+     * ⛔ FAB-194-4: the route a {@code CONVERT_BEFORE_ANTICIPATE} market's token-collateral row would take,
+     * read from the pool verdict this page computed from the node's own index — the executor's split, never
+     * the ANTICIPATE market's fixed text. Convert switched off, or a verdict saying convert is IMPOSSIBLE
+     * ({@code NO_POOL}, {@code TOO_THIN}, {@code NOT_CONFIGURED}), pays in advance; {@code USABLE} converts;
+     * {@code WRONG_PAIR} and {@code CANNOT_QUOTE} are refused by the convert route and never fall back; a
+     * verdict that could not be reached ({@code CHECK_FAILED}, {@code UNKNOWN}) leaves the route unknown. The
+     * advance is computed wherever capital is, or might be, the question. The page tests every indexed pool
+     * now while the bot resolves one pool when it builds, so each pool-driven detail ends with
+     * {@link ActionNow#ESTIMATE_NOTE}.
+     */
+    static RouteChoice convertBeforeAnticipateRoute(boolean convertEnabled, PoolUsability usability) {
+        String market = "this market is action: CONVERT_BEFORE_ANTICIPATE";
+        PoolUsability.Verdict verdict = usability.verdict() == null
+                ? PoolUsability.Verdict.UNKNOWN : usability.verdict();
+        if (!convertEnabled) {
+            return new RouteChoice("CAPITAL IN ADVANCE", market + " and convert is disabled on this node, so "
+                    + "the bot pays in advance, fronting the principal under the market's cap, whatever the "
+                    + "pool verdict (" + verdict + ") says", true);
+        }
+        return switch (verdict) {
+            case USABLE -> new RouteChoice("CONVERT", market + " and a Minswap pool is deep enough to clear this "
+                    + "loan's debt (" + verdict + "), so the bot converts first: it creates a swap order and "
+                    + "fronts no capital" + ActionNow.ESTIMATE_NOTE, false);
+            case NO_POOL, TOO_THIN, NOT_CONFIGURED -> new RouteChoice("CAPITAL IN ADVANCE", market
+                    + " and convert is impossible for this loan (" + verdict + ": " + usability.detail()
+                    + "), so the bot pays in advance instead, fronting the principal under the market's cap"
+                    + ActionNow.ESTIMATE_NOTE, true);
+            case WRONG_PAIR, CANNOT_QUOTE -> new RouteChoice("CONVERT", market + " and the convert route will "
+                    + "refuse this loan (" + verdict + ": " + usability.detail() + "); that refusal is not a "
+                    + "reason to pay in advance, so the bot fronts no capital — the figure shown is what an "
+                    + "advance would need" + ActionNow.ESTIMATE_NOTE, true);
+            case CHECK_FAILED, UNKNOWN -> new RouteChoice("UNKNOWN", market + " and whether convert is possible "
+                    + "is not known (" + verdict + ": " + usability.detail() + "), so whether the bot would "
+                    + "convert or pay in advance is not known either — this is not evidence that capital is "
+                    + "needed" + ActionNow.ESTIMATE_NOTE, true);
         };
     }
 
@@ -1289,14 +1574,18 @@ public class LiquidationReadinessController {
     }
 
     private AssetDisplay display(String unit, BigInteger amount, Map<String, TokenMetadata> memo) {
-        TokenMetadata metadata = memo.computeIfAbsent(unit, u -> {
+        return AssetDisplay.of(amount, metadata(unit, memo));
+    }
+
+    /** The metadata {@link #display} renders with — one lookup per unit per render, through the memo. */
+    private TokenMetadata metadata(String unit, Map<String, TokenMetadata> memo) {
+        return memo.computeIfAbsent(unit, u -> {
             TokenMetadataService service = tokenMetadata.getIfAvailable();
             if (service != null) {
                 return service.lookup(u);
             }
             return "lovelace".equals(u) ? TokenMetadata.ada() : TokenMetadata.unknown(u);
         });
-        return AssetDisplay.of(amount, metadata);
     }
 
     /**

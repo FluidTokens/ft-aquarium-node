@@ -321,6 +321,119 @@ class OracleStreamClientLivenessTest {
     }
 
     // ======================================================================================
+    // Due, then replaced right after a push (FAB-183-11)
+    // ======================================================================================
+
+    /**
+     * A push before {@code proactiveReconnectAfter} replaces nothing; the first push after it reaches the listener
+     * and THEN the connection is replaced, break-then-make, logged {@code trigger=push}. The deadline is an hour
+     * away, so only the push can have closed it.
+     */
+    @Test
+    void aPushWhileDueReachesTheListenerAndThenReplacesTheConnection() throws IOException {
+        server = new OracleStreamTestServer().start();
+        Duration after = Duration.ofSeconds(2);
+        Sequence sequence = startDue(dueTimings(after, LONG),
+                new MutableClock(Instant.parse("2026-10-29T12:00:00Z")));
+        OracleStreamTestServer.Session first = server.awaitSession(0, WAIT);
+        await(() -> sequence.count("open") == 1, WAIT, "open 1 on the client");
+        Instant opened = Instant.now();
+
+        first.sendText(resource(PREVIEW_PUSH));
+        await(() -> sequence.count("push") == 1, WAIT, "the push before due");
+        assertTrue(Instant.now().isBefore(opened.plus(after).minusMillis(500)),
+                "fixture: the first push was handled well before the connection became due");
+        assertTrue(first.open(), "a push before due replaces nothing");
+        assertEquals(List.of(), linesOf("closed"), "no closed line before due");
+
+        Instant due = opened.plus(after).plusMillis(300);
+        await(() -> !Instant.now().isBefore(due), WAIT, "the connection is due");
+        assertTrue(first.open(), "due is not closed: no push has come since");
+        Instant pushed = Instant.now();
+        first.sendText(resource(PREVIEW_PUSH));
+        OracleStreamTestServer.Session second = server.awaitSession(1, WAIT);
+        await(() -> sequence.count("open") == 2, WAIT, "open 2 on the client");
+
+        List<String> events = List.copyOf(sequence.events);
+        assertEquals(List.of("open", "push", "push", "close:proactive", "open"), events.subList(0, 5),
+                "the push reached the listener BEFORE the connection was replaced: " + events);
+        assertNotNull(first.closedAt, "connection 1 was closed");
+        assertFalse(first.closedAt.isAfter(second.openedAt), "break-then-make: never two sockets at once");
+        assertTrue(Duration.between(pushed, first.closedAt).toMillis()
+                        < OracleStreamClient.CLOSE_GRACE.toMillis() + 1_500,
+                "closed right after the push: " + Duration.between(pushed, first.closedAt).toMillis() + " ms");
+        assertEquals(2, server.sessions().size());
+        await(() -> !infoLines("closed").isEmpty(), WAIT, "the closed line");
+        assertEquals(1, linesOf("closed").size(), lines().toString());
+        assertTrue(infoLines("closed").getFirst().endsWith(" reason=proactive up_s=0 trigger=push"),
+                infoLines("closed").getFirst());
+    }
+
+    /** No push while due: the connection is replaced at the deadline, logged {@code trigger=deadline}. */
+    @Test
+    void noPushWhileDueReplacesTheConnectionAtTheDeadline() {
+        server = new OracleStreamTestServer().start();
+        Duration after = Duration.ofMillis(300);
+        Duration deadline = Duration.ofMillis(1_500); // 12:00:01.5, outside seconds [15, 35): not postponed
+        Sequence sequence = startDue(dueTimings(after, deadline),
+                new MutableClock(Instant.parse("2026-10-29T12:00:00Z")));
+        OracleStreamTestServer.Session first = server.awaitSession(0, WAIT);
+        OracleStreamTestServer.Session second = server.awaitSession(1, WAIT);
+        await(() -> sequence.count("open") == 2, WAIT, "open 2 on the client");
+
+        assertNotNull(first.closedAt, "connection 1 was closed");
+        long lived = Duration.between(first.openedAt, first.closedAt).toMillis();
+        assertTrue(lived >= deadline.toMillis() - 100, "closed at the deadline, not when due: " + lived + " ms");
+        assertTrue(lived < deadline.toMillis() + OracleStreamClient.CLOSE_GRACE.toMillis() + 1_500,
+                "closed at the deadline: " + lived + " ms");
+        assertFalse(first.closedAt.isAfter(second.openedAt), "break-then-make: never two sockets at once");
+        List<String> events = List.copyOf(sequence.events);
+        assertEquals(List.of("open", "close:proactive", "open"), events.subList(0, 3), events.toString());
+        await(() -> !infoLines("closed").isEmpty(), WAIT, "the closed line");
+        assertTrue(infoLines("closed").getFirst().endsWith(" reason=proactive up_s=0 trigger=deadline"),
+                infoLines("closed").getFirst());
+    }
+
+    /**
+     * A deadline at second 34 of its minute — inside the push window, seconds [15, 35) — is postponed to second
+     * 40: the connection opened at 12:00:33 on the client's clock with a 1 s deadline lives about 7 s, not 1 s.
+     */
+    @Test
+    void aDeadlineInsideThePushWindowIsPostponedToSecondForty() {
+        server = new OracleStreamTestServer().start();
+        Duration deadline = Duration.ofSeconds(1);
+        Duration postponed = Duration.ofSeconds(7); // 12:00:34 → 12:00:40
+        Duration wait = WAIT.plus(postponed);
+        Sequence sequence = startDue(dueTimings(Duration.ofMillis(300), deadline),
+                new MutableClock(Instant.parse("2026-10-29T12:00:33Z")));
+        OracleStreamTestServer.Session first = server.awaitSession(0, wait);
+        OracleStreamTestServer.Session second = server.awaitSession(1, wait);
+        await(() -> sequence.count("open") == 2, wait, "open 2 on the client");
+
+        assertNotNull(first.closedAt, "connection 1 was closed");
+        long lived = Duration.between(first.openedAt, first.closedAt).toMillis();
+        assertTrue(lived >= postponed.toMillis() - 150, "closed at second 40, not at second 34: " + lived + " ms");
+        assertFalse(first.closedAt.isAfter(second.openedAt), "break-then-make: never two sockets at once");
+        await(() -> !infoLines("closed").isEmpty(), wait, "the closed line");
+        assertTrue(infoLines("closed").getFirst().endsWith(" trigger=deadline"), infoLines("closed").getFirst());
+    }
+
+    /** Amendment A4: the postponement rule itself, at the edges of seconds [15, 35). */
+    @Test
+    void theDeadlineIsPostponedToSecondFortyOnlyInsideSecondsFifteenToThirtyFive() {
+        Instant forty = Instant.parse("2026-10-29T12:00:40Z");
+        assertEquals(forty, OracleStreamClient.proactiveCloseAt(Instant.parse("2026-10-29T12:00:20Z"), ZoneOffset.UTC));
+        assertEquals(forty, OracleStreamClient.proactiveCloseAt(Instant.parse("2026-10-29T12:00:15Z"), ZoneOffset.UTC));
+        assertEquals(forty,
+                OracleStreamClient.proactiveCloseAt(Instant.parse("2026-10-29T12:00:34.999Z"), ZoneOffset.UTC));
+        for (String unchanged : List.of("2026-10-29T12:00:14.999Z", "2026-10-29T12:00:35Z", "2026-10-29T12:00:00Z",
+                "2026-10-29T12:00:59.999Z")) {
+            Instant at = Instant.parse(unchanged);
+            assertEquals(at, OracleStreamClient.proactiveCloseAt(at, ZoneOffset.UTC), unchanged);
+        }
+    }
+
+    // ======================================================================================
     // Refusals
     // ======================================================================================
 
@@ -710,6 +823,24 @@ class OracleStreamClientLivenessTest {
                 OracleStreamClient.Timings.PRODUCTION.handshakeTimeout(), ping, pong, proactive, scale);
     }
 
+    /** A due window: due at {@code after}, replaced at {@code deadline} with no push; long pings, scale 1. */
+    private static OracleStreamClient.Timings dueTimings(Duration after, Duration deadline) {
+        return new OracleStreamClient.Timings(OracleStreamClient.Timings.PRODUCTION.tcpConnectTimeout(),
+                OracleStreamClient.Timings.PRODUCTION.handshakeTimeout(), Duration.ofSeconds(30), Duration.ofSeconds(10),
+                after, 1.0, deadline);
+    }
+
+    /** Starts a client against {@link #server} whose listener records the order of its callbacks. */
+    private Sequence startDue(OracleStreamClient.Timings timings, Clock clock) {
+        Sequence sequence = new Sequence();
+        scheduler = newScheduler();
+        io = Executors.newCachedThreadPool(r -> daemon(r, "oracle-stream-io"));
+        client = new OracleStreamClient(server.uri(), new OracleStreamAuth(account), timings, clock, sequence,
+                new OracleStreamLog(), scheduler, io, () -> false, registry, new OracleStreamRetryPolicy(MID));
+        client.start();
+        return sequence;
+    }
+
     private void start(URI uri, OracleStreamClient.Timings timings) {
         start(uri, timings, () -> false, Clock.systemUTC(), newScheduler());
     }
@@ -825,6 +956,31 @@ class OracleStreamClientLivenessTest {
             }
         }
         return out;
+    }
+
+    /** Every {@link OracleStreamClient.Listener} callback, in the order the client made it. */
+    static final class Sequence implements OracleStreamClient.Listener {
+
+        final List<String> events = new CopyOnWriteArrayList<>();
+
+        @Override
+        public void onOpen(Instant at) {
+            events.add("open");
+        }
+
+        @Override
+        public void onClose(Instant at, String reason) {
+            events.add("close:" + reason);
+        }
+
+        @Override
+        public void onPush(Instant at, long serverTimestamp, OracleRegistryParser.Parsed parsed, int chars) {
+            events.add("push");
+        }
+
+        long count(String event) {
+            return events.stream().filter(event::equals).count();
+        }
     }
 
     /** A clock that stands still until told to move. */

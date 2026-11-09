@@ -34,6 +34,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <p>This drives Flyway directly against an in-memory H2 using the real
  * {@code classpath:db/migration/h2} location, so the file that ships is the file that runs.
+ * Yaci Store's {@code classpath:db/store/h2} runs ahead of it, in production's order, because the
+ * node's own {@code V1001} indexes Yaci's {@code address_utxo} table and fails on a schema without it.
  *
  * <h2>⚠ What it does not prove</h2>
  * Production is PostgreSQL. This exercises the H2 copy, so it proves the SQL is valid and the shape is
@@ -51,7 +53,7 @@ class TokenMetadataMigrationTest {
         String url = url();
         Flyway.configure()
                 .dataSource(url, "sa", "")
-                .locations("classpath:db/migration/h2")
+                .locations("classpath:db/store/h2", "classpath:db/migration/h2")
                 .load()
                 .migrate();
         return DriverManager.getConnection(url, "sa", "");
@@ -97,7 +99,7 @@ class TokenMetadataMigrationTest {
         String url = url();
         for (int i = 0; i < 2; i++) {
             Flyway.configure().dataSource(url, "sa", "")
-                    .locations("classpath:db/migration/h2").load().migrate();
+                    .locations("classpath:db/store/h2", "classpath:db/migration/h2").load().migrate();
         }
     }
 
@@ -126,7 +128,7 @@ class TokenMetadataMigrationTest {
     private static DataSource migratedDataSource() {
         String url = url();
         Flyway.configure().dataSource(url, "sa", "")
-                .locations("classpath:db/migration/h2").load().migrate();
+                .locations("classpath:db/store/h2", "classpath:db/migration/h2").load().migrate();
         JdbcDataSource ds = new JdbcDataSource();
         ds.setURL(url);
         ds.setUser("sa");

@@ -15,6 +15,8 @@ import java.nio.ByteBuffer;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -39,8 +41,8 @@ import static java.nio.charset.StandardCharsets.UTF_8;
  * One WebSocket to FluidTokens' oracle stream (FAB-174): connect with a freshly signed query, reassemble
  * {@code oracle-tokens} pushes, parse each with {@link OracleRegistryParser} and hand it to a {@link Listener};
  * ping while open and treat a missing pong as a dead connection; reconnect proactively before the server's
- * two-hour cap; and after every end, wait as {@link OracleStreamRetryPolicy} says. A SHADOW: nothing here
- * reads or writes {@link FluidOracleClient}.
+ * two-hour cap, right after a push where one comes; and after every end, wait as {@link OracleStreamRetryPolicy}
+ * says. A SHADOW: nothing here reads or writes {@link FluidOracleClient}.
  *
  * <p><b>Transport: the JDK's {@code java.net.http.WebSocket}, not Reactor Netty — decided.</b> A refused
  * handshake carries the reason in its body ({@code {"message":"connection limit reached: 1 per bond held"}}),
@@ -67,6 +69,15 @@ import static java.nio.charset.StandardCharsets.UTF_8;
  * aborted after {@link #CLOSE_GRACE} if the server does not answer — and only then opens the next one, with a
  * fresh {@code ts}: a bond grants ONE connection, and a second socket opened first would be refused with 429.
  *
+ * <p>⛔ <b>Due, then closed right after a push (FAB-183-11).</b> A push missed while the connection is being
+ * replaced costs a liquidation a block, and pushes come in bursts at a known second of the minute. So from
+ * {@code proactiveReconnectAfter} the connection is only DUE: the first parsed push that arrives while it is due
+ * reaches the {@link Listener} and THEN the connection is replaced ({@code trigger=push}). With no push by
+ * {@code proactiveReconnectDeadline} it is replaced at the deadline ({@code trigger=deadline}) — moved to second
+ * {@value #POSTPONED_TO_SECOND} of its minute when it falls in seconds [{@value #POSTPONE_FROM_SECOND},
+ * {@value #POSTPONE_UNTIL_SECOND}), away from the push window. A deadline equal to {@code proactiveReconnectAfter}
+ * replaces it at that instant, as before.
+ *
  * <p>⛔ <b>One WARN per state change.</b> A refusal or an end is said at WARN when its state key differs from
  * the last one said, and at DEBUG while it repeats. The latch is this client's own and is cleared by every
  * successful open, so the same refusal after a connection is a new state and WARNs again.
@@ -83,6 +94,12 @@ public final class OracleStreamClient {
 
     /** How long {@link #stop()} and the proactive reconnect wait for the closing handshake before they abort. */
     static final Duration CLOSE_GRACE = Duration.ofSeconds(1);
+
+    /** A proactive deadline in seconds [this, {@link #POSTPONE_UNTIL_SECOND}) of its minute is postponed. */
+    static final int POSTPONE_FROM_SECOND = 15;
+    static final int POSTPONE_UNTIL_SECOND = 35;
+    /** The second of the same minute a postponed deadline moves to. */
+    static final int POSTPONED_TO_SECOND = 40;
 
     static final String PUSH_TYPE = "oracle-tokens";
 
@@ -106,16 +123,33 @@ public final class OracleStreamClient {
      *                                authorizer's on-chain bond lookup alone took 0.6–2.5 s in the probe
      * @param pingInterval            the RFC 6455 ping period while open
      * @param pongTimeout             no pong this long after a ping means the connection is dead
-     * @param proactiveReconnectAfter how long a connection stays open before it is replaced, break-then-make;
-     *                                under the server's two-hour cap
-     * @param retryScale              every delay {@link OracleStreamRetryPolicy} computes, and the stake re-check
-     *                                interval, is multiplied by this; 1.0 in production
+     * @param proactiveReconnectAfter    how long a connection stays open before it is DUE to be replaced,
+     *                                   break-then-make: the first push after it triggers the replacement
+     * @param retryScale                 every delay {@link OracleStreamRetryPolicy} computes, and the stake re-check
+     *                                   interval, is multiplied by this; 1.0 in production
+     * @param proactiveReconnectDeadline when a due connection is replaced with no push, possibly postponed by up to
+     *                                   25 s off the push window; at least {@code proactiveReconnectAfter}, and
+     *                                   with the postponement under the server's two-hour cap
      */
     public record Timings(Duration tcpConnectTimeout, Duration handshakeTimeout, Duration pingInterval,
-                          Duration pongTimeout, Duration proactiveReconnectAfter, double retryScale) {
+                          Duration pongTimeout, Duration proactiveReconnectAfter, double retryScale,
+                          Duration proactiveReconnectDeadline) {
 
         public static final Timings PRODUCTION = new Timings(Duration.ofSeconds(10), Duration.ofSeconds(20),
-                Duration.ofSeconds(45), Duration.ofSeconds(10), Duration.ofMinutes(115), 1.0);
+                Duration.ofSeconds(45), Duration.ofSeconds(10), Duration.ofMinutes(115), 1.0, Duration.ofMinutes(118));
+
+        public Timings {
+            if (proactiveReconnectDeadline.compareTo(proactiveReconnectAfter) < 0) {
+                throw new IllegalArgumentException("proactiveReconnectDeadline is before proactiveReconnectAfter");
+            }
+        }
+
+        /** No due window: the connection is replaced at {@code proactiveReconnectAfter} exactly, push or not. */
+        public Timings(Duration tcpConnectTimeout, Duration handshakeTimeout, Duration pingInterval,
+                       Duration pongTimeout, Duration proactiveReconnectAfter, double retryScale) {
+            this(tcpConnectTimeout, handshakeTimeout, pingInterval, pongTimeout, proactiveReconnectAfter, retryScale,
+                    proactiveReconnectAfter);
+        }
     }
 
     /**
@@ -433,8 +467,42 @@ public final class OracleStreamClient {
         long period = timings.pingInterval().toMillis();
         connection.ping = scheduler.scheduleAtFixedRate(guarded("ping", () -> ping(connection)),
                 period, period, TimeUnit.MILLISECONDS);
-        connection.proactive = scheduler.schedule(guarded("proactive", this::reconnectProactively),
-                timings.proactiveReconnectAfter().toMillis(), TimeUnit.MILLISECONDS);
+        scheduleProactive(connection);
+    }
+
+    /**
+     * The proactive reconnect of a connection that just opened. With a deadline equal to
+     * {@code proactiveReconnectAfter}: replaced at that instant. Otherwise: due at {@code proactiveReconnectAfter}
+     * (the next push replaces it), and replaced at the deadline — postponed off the push window — if no push did.
+     */
+    private void scheduleProactive(Connection connection) {
+        Duration after = timings.proactiveReconnectAfter();
+        Duration deadline = timings.proactiveReconnectDeadline();
+        if (deadline.compareTo(after) <= 0) {
+            connection.proactive = scheduler.schedule(guarded("proactive",
+                    () -> reconnectProactively(connection, "deadline")), after.toMillis(), TimeUnit.MILLISECONDS);
+            return;
+        }
+        connection.proactive = scheduler.schedule(guarded("proactive-due", () -> connection.due = true),
+                after.toMillis(), TimeUnit.MILLISECONDS);
+        Instant closeAt = proactiveCloseAt(connection.openedAt.plus(deadline), clock.getZone());
+        connection.proactiveDeadline = scheduler.schedule(guarded("proactive",
+                        () -> reconnectProactively(connection, "deadline")),
+                Duration.between(connection.openedAt, closeAt).toMillis(), TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * When a proactive deadline falling at {@code deadline} replaces the connection: {@code deadline} itself, or —
+     * when it falls in seconds [{@value #POSTPONE_FROM_SECOND}, {@value #POSTPONE_UNTIL_SECOND}) of its minute in
+     * {@code zone}, the push window — second {@value #POSTPONED_TO_SECOND} of that minute, at most 25 s later.
+     */
+    static Instant proactiveCloseAt(Instant deadline, ZoneId zone) {
+        ZonedDateTime at = deadline.atZone(zone);
+        int second = at.getSecond();
+        if (second < POSTPONE_FROM_SECOND || second >= POSTPONE_UNTIL_SECOND) {
+            return deadline;
+        }
+        return at.withSecond(POSTPONED_TO_SECOND).withNano(0).toInstant();
     }
 
     /**
@@ -524,6 +592,7 @@ public final class OracleStreamClient {
         }
         cancel(connection.ping);
         cancel(connection.proactive);
+        cancel(connection.proactiveDeadline);
         if (abort && connection.socket != null) {
             connection.socket.abort();
         }
@@ -607,22 +676,25 @@ public final class OracleStreamClient {
     }
 
     /**
-     * {@code proactiveReconnectAfter} after the open: close first, open the next connection only once the close
-     * has completed or been aborted. ⛔ Never two sockets at once — the bond grants one.
+     * The planned replacement of {@code connection}, by {@code trigger}: {@code push} — the first push while it was
+     * due, already handed to the listener — or {@code deadline}. Close first, open the next connection only once
+     * the close has completed or been aborted. ⛔ Never two sockets at once — the bond grants one. ⛔ Only the live
+     * connection: a task left behind by an ended one must never close its successor.
      */
-    private void reconnectProactively() {
-        Connection connection = live;
-        if (stopped || connection == null || connection.ended || connection.socket == null) {
+    private void reconnectProactively(Connection connection, String trigger) {
+        if (stopped || connection != live || connection.ended || connection.socket == null) {
             return;
         }
         connection.ended = true;
         live = null;
         cancel(connection.ping);
+        cancel(connection.proactive);
+        cancel(connection.proactiveDeadline);
         connectedGauge.set(0);
         Instant now = clock.instant();
         Duration up = Duration.between(connection.openedAt, now);
         count(disconnectCounters, "proactive");
-        events.info("closed", "reason=proactive up_s=" + up.toSeconds());
+        events.info("closed", "reason=proactive up_s=" + up.toSeconds() + " trigger=" + trigger);
         Status last = status;
         status = new Status(Status.State.RETRYING, "proactive", now, last.lastPushAt(), last.pushes(), null, null,
                 now.plus(CLOSE_GRACE));
@@ -694,7 +766,8 @@ public final class OracleStreamClient {
 
     /**
      * One complete text message: an {@code oracle-tokens} push goes to the listener, anything else is counted.
-     * {@code at} and {@code xferMs} were read on the I/O side as its parts arrived, never here.
+     * {@code at} and {@code xferMs} were read on the I/O side as its parts arrived, never here. A push on a
+     * connection that is due replaces it — ⛔ only AFTER the listener has it.
      */
     private void message(Connection connection, String text, Instant at, long xferMs) {
         if (connection.ended) {
@@ -733,6 +806,9 @@ public final class OracleStreamClient {
         long serverTimestamp = timestamp.longValue();
         int chars = text.length();
         notifyListener("onPush", () -> listener.onPush(at, serverTimestamp, xferMs, parsed, chars));
+        if (connection.due) {
+            reconnectProactively(connection, "push");
+        }
     }
 
     /** Counts a message the stream could not use and says so on change — ⛔ never echoing it. */
@@ -833,7 +909,12 @@ public final class OracleStreamClient {
         volatile WebSocket socket;
         volatile Instant openedAt;
         ScheduledFuture<?> ping;
+        /** The due mark, or — with no due window — the proactive reconnect itself. */
         ScheduledFuture<?> proactive;
+        /** The proactive reconnect at the (possibly postponed) deadline; null with no due window. */
+        ScheduledFuture<?> proactiveDeadline;
+        /** Past {@code proactiveReconnectAfter}: the next push replaces this connection. */
+        boolean due;
         boolean ended;
         /** The global ping sequence when this connection opened: its own pings are numbered above it. */
         long pingSeqBase;

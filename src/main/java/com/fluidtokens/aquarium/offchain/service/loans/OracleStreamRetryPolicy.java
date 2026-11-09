@@ -24,11 +24,15 @@ import java.util.random.RandomGenerator;
  *       when the stake presence read every {@link #STAKE_RECHECK_INTERVAL} differs from the one recorded at
  *       the refusal ({@link #holdStarted}, {@link #stakeChanged}).</li>
  *   <li><b>429</b> — another node on this bond holds the one connection it grants:
- *       {@link #BACKOFF_LADDER_SECONDS}, its own ladder.</li>
+ *       {@link #BACKOFF_LADDER_SECONDS}, its own ladder. Except right after a planned close (FAB-183-11): the
+ *       old connection's slot may not be released yet, so while the last end was a proactive reconnect and
+ *       nothing but 429s has followed it, the first three 429s wait {@link #FAST_429_AFTER_PLANNED_SECONDS}
+ *       ±{@value #LADDER_JITTER} and advance no ladder; further 429s take the 429 ladder from where it stands.
+ *       Any end that is neither a 429 nor proactive, and a successful open, clear that record.</li>
  *   <li><b>Proactive reconnect</b> — no wait, and no ladder advances.</li>
  * </ul>
- * A successful open ({@link #onConnected}) restarts the auth and 429 ladders and re-arms the immediate 401
- * re-sign. It does NOT restart the transport ladder: only a connection that stayed open long enough does —
+ * A successful open ({@link #onConnected}) restarts the auth and 429 ladders, clears the planned-close record and
+ * re-arms the immediate 401 re-sign. It does NOT restart the transport ladder: only a connection that stayed open long enough does —
  * whatever ended it, a proactive reconnect included (FAB-174-3 r3 ruling F4), so a failure right after a
  * proactive reconnect waits the first transport step, not the step earlier failures left behind.
  *
@@ -41,6 +45,9 @@ public final class OracleStreamRetryPolicy {
 
     /** Seconds before auth (400, re-signed 401) or 429 retry n (then the 1800 s cap repeated). */
     static final int[] BACKOFF_LADDER_SECONDS = {60, 120, 240, 480, 960, 1800};
+
+    /** Seconds before each of the first 429 retries after a planned close; then {@link #BACKOFF_LADDER_SECONDS}. */
+    static final int[] FAST_429_AFTER_PLANNED_SECONDS = {2, 4, 8};
 
     /** A connection that had been open this long restarts the transport ladder when it ends. */
     static final Duration LADDER_RESET_AFTER = Duration.ofSeconds(60);
@@ -102,6 +109,10 @@ public final class OracleStreamRetryPolicy {
     private int backoff429Step;
     /** A 401 has already been retried at once since the last successful open. */
     private boolean resigned;
+    /** The last end was a proactive reconnect, and only 429s have followed it. */
+    private boolean afterPlannedClose;
+    /** The fast 429 steps taken since that planned close. */
+    private int fast429Step;
 
     /** The stake presence recorded for the current 403 hold; null while unknown. */
     private Boolean stakeAtRefusal;
@@ -114,16 +125,23 @@ public final class OracleStreamRetryPolicy {
     Decision next(Outcome outcome) {
         return switch (outcome.kind()) {
             case PROACTIVE -> proactive(outcome.up());
-            case TRANSPORT -> transport(outcome.up(), "closed:" + outcome.reason());
+            case TRANSPORT -> {
+                clearPlannedClose();
+                yield transport(outcome.up(), "closed:" + outcome.reason());
+            }
             case REFUSED -> refused(outcome.status());
         };
     }
 
-    /** A connection opened: the auth and 429 ladders restart and the next 401 is re-signed at once. */
+    /**
+     * A connection opened: the auth and 429 ladders restart, the planned-close record is cleared and the next 401
+     * is re-signed at once.
+     */
     void onConnected() {
         authStep = 0;
         backoff429Step = 0;
         resigned = false;
+        clearPlannedClose();
     }
 
     /** A 403 hold began; {@code stakePresent} is what the node read then, null when it could not tell. */
@@ -148,6 +166,9 @@ public final class OracleStreamRetryPolicy {
 
     private Decision refused(int status) {
         String key = "refused:" + status;
+        if (status != 429) {
+            clearPlannedClose();
+        }
         switch (status) {
             case 401 -> {
                 if (!resigned) {
@@ -163,6 +184,9 @@ public final class OracleStreamRetryPolicy {
                 return new Decision(jitter(REFUSED_403_HOLD.toMillis(), HOLD_JITTER), key, Rule.HOLD_403);
             }
             case 429 -> {
+                if (afterPlannedClose && fast429Step < FAST_429_AFTER_PLANNED_SECONDS.length) {
+                    return new Decision(ladder(FAST_429_AFTER_PLANNED_SECONDS, fast429Step++), key, Rule.BACKOFF_429);
+                }
                 return new Decision(ladder(BACKOFF_LADDER_SECONDS, backoff429Step++), key, Rule.BACKOFF_429);
             }
             default -> {
@@ -171,10 +195,20 @@ public final class OracleStreamRetryPolicy {
         }
     }
 
-    /** No wait and no step taken; a connection open long enough still restarts the transport ladder. */
+    /**
+     * No wait and no step taken; a connection open long enough still restarts the transport ladder. The 429s that
+     * follow take the fast steps.
+     */
     private Decision proactive(Duration up) {
         restartTransportLadderIfLongOpen(up);
+        afterPlannedClose = true;
         return new Decision(Duration.ZERO, "proactive", Rule.PROACTIVE);
+    }
+
+    /** The 429s that follow wait the 429 ladder, not the fast steps. */
+    private void clearPlannedClose() {
+        afterPlannedClose = false;
+        fast429Step = 0;
     }
 
     private Decision transport(Duration up, String key) {

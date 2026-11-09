@@ -70,10 +70,14 @@ public final class MarketGate {
         MARKET_DISABLED,
         /** The market's action is {@code CONVERT}, so pay-in-advance is not the chosen mechanism here. */
         MARKET_ACTION_IS_CONVERT,
-        /** {@code ANTICIPATE}, but the cap is below what the protocol requires the bot to front. */
+        /**
+         * {@code ANTICIPATE} — or {@code CONVERT_BEFORE_ANTICIPATE} falling back to pay-in-advance — but the
+         * cap is below what the protocol requires the bot to front.
+         */
         ABOVE_MARKET_CAP,
         /**
-         * {@code ANTICIPATE}, under the cap, but the bot's own NOMINABLE wallet balance of the
+         * {@code ANTICIPATE} or {@code CONVERT_BEFORE_ANTICIPATE}, under the cap, but the bot's own NOMINABLE
+         * wallet balance of the
          * principal asset is below what the protocol requires it to front. Distinct from
          * {@link #ABOVE_MARKET_CAP} on purpose — the two demand different operator responses ("fund
          * the wallet" vs "raise the cap") and collapsing them into one refusal would hide which is
@@ -157,15 +161,24 @@ public final class MarketGate {
         // only the submission. Refusing here would turn the rehearsal back into a refusal.
 
         Action action = actionFor(principal);
-        if (action != Action.ANTICIPATE) {
+        // Exhaustive, no default: a new action does not compile until it says whether it may pay in
+        // advance. CONVERT_BEFORE_ANTICIPATE reaches here only when convert was impossible (FAB-194-3), and
+        // its pay-in-advance is then capped and balanced exactly as ANTICIPATE's.
+        boolean paysInAdvance = switch (action) {
+            case CONVERT -> false;
+            case ANTICIPATE, CONVERT_BEFORE_ANTICIPATE -> true;
+        };
+        if (!paysInAdvance) {
             return refuse(Refusal.MARKET_ACTION_IS_CONVERT, required,
                     "market " + unit + " is action: " + action + ", so pay-in-advance is not the "
-                            + "mechanism here; set action: ANTICIPATE with a cap to force it");
+                            + "mechanism here; set action: ANTICIPATE (always pay in advance) or "
+                            + "CONVERT_BEFORE_ANTICIPATE (pay in advance only when no pool can convert), with a cap");
         }
 
-        // ANTICIPATE is validated at startup to carry a cap, so this cannot be null on a live node.
+        // Both pay-in-advance actions are validated at startup to carry a cap, so this cannot be null on a
+        // live node.
         BigInteger cap = Objects.requireNonNull(marketFor(principal).getCap(),
-                "action: ANTICIPATE without a cap should have aborted startup");
+                () -> "action: " + action + " without a cap should have aborted startup");
 
         // ⛔ anticipatable = min(balance, cap) — MADE TRUE, not merely claimed. Before Part 3 the code
         // was `required.min(cap)`, so a bot holding ZERO of the principal with a generous cap still

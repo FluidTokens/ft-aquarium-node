@@ -1,7 +1,7 @@
 package com.fluidtokens.aquarium.offchain.service;
 
 import com.bloxbean.cardano.client.account.Account;
-import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
+import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
@@ -33,7 +33,7 @@ class SyncingGateTest {
     private static ScheduledTransactionService tankProcessor(StakerService staker, BlockEventListener listener) {
         return new ScheduledTransactionService(
                 new AppConfig.Network(), mock(AppConfig.AquariumConfiguration.class), mock(Account.class),
-                mock(QuickTxBuilder.class), mock(BFBackendService.class), LoanFixtures.protocolParams(),
+                mock(QuickTxBuilder.class), mock(TransactionEvaluator.class), LoanFixtures.protocolParams(),
                 mock(com.bloxbean.cardano.client.api.UtxoSupplier.class), mock(UtxoRepository.class), staker,
                 LoanFixtures.converters(), mock(ParametersService.class), mock(TankContractService.class),
                 mock(AppUtxoService.class), listener);

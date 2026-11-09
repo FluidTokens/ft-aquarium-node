@@ -37,6 +37,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletShape;
 import lombok.extern.slf4j.Slf4j;
 import org.cardanofoundation.conversions.ClasspathConversionsFactory;
 import org.cardanofoundation.conversions.domain.NetworkType;
@@ -185,7 +186,7 @@ class CompoundMainnetGateTest {
         Exception refused = org.junit.jupiter.api.Assertions.assertThrows(Exception.class,
                 () -> rig.builder().build(new CompoundTransactionBuilder.Request(candidate, refs,
                         rig.bond(), rig.config(), rig.lmConfig(), rig.wallet(), rig.bot(), legacyFee,
-                        180_000_000L, 180_000_300L)));
+                        180_000_000L, 180_000_300L, rig.collateral())));
         String why = causeChain(refused);
         log.info("FAB-167 legacy fee refused: {}", why);
         // The evaluator names a reward redeemer by its WITHDRAWAL position, not its self.redeemers position.
@@ -410,7 +411,7 @@ class CompoundMainnetGateTest {
     private record Rig(CompoundExecutor executor, CompoundTransactionBuilder builder, CompoundCandidateScanner scanner,
                        List<byte[]> submitted, List<Utxo> universe, ScriptSupplier scripts, String bot,
                        Utxo escrow, Utxo bond, Utxo pool, Utxo poolManager, Utxo config, Utxo lmConfig,
-                       Utxo wallet) {
+                       Utxo wallet, Utxo collateral) {
     }
 
     private static Rig rig(Case c) throws Exception {
@@ -432,8 +433,10 @@ class CompoundMainnetGateTest {
                 fixture("mainnet-lm-config-datum-2026-10-26.hex"));
         Utxo wallet = Utxo.builder().txHash("9e".repeat(32)).outputIndex(0).address(bot)
                 .amount(List.of(Amount.lovelace(BigInteger.valueOf(20_000_000L)))).build();
+        // FAB-185 — wallet role C: exactly WalletShape.collateralLovelace of this rig's params (5 ADA here).
         Utxo collateral = Utxo.builder().txHash("c0".repeat(32)).outputIndex(0).address(bot)
-                .amount(List.of(Amount.lovelace(BigInteger.valueOf(5_000_000L)))).build();
+                .amount(List.of(Amount.lovelace(WalletShape.collateralLovelace(
+                        LoanFixtures.protocolParams().getProtocolParams())))).build();
 
         List<Utxo> universe = new ArrayList<>(List.of(escrow, bond, pool, poolManager, config, lmConfig,
                 wallet, collateral));
@@ -523,13 +526,13 @@ class CompoundMainnetGateTest {
                             }
                         })),
                 builder, resolver, utxoSupplier,
-                ClasspathConversionsFactory.createConverters(NetworkType.MAINNET),
+                ClasspathConversionsFactory.createConverters(NetworkType.MAINNET), LoanFixtures.protocolParams(),
                 bytes -> {
                     submitted.add(bytes);
                     return Result.success("rig").withValue("rig");
                 });
         return new Rig(executor, builder, scanner, submitted, frozen, provider, bot, escrow, bond, pool,
-                poolManager, config, lmConfig, wallet);
+                poolManager, config, lmConfig, wallet, collateral);
     }
 
     // ---- the candidate, re-targeted onto mainnet ------------------------------------------------

@@ -290,11 +290,93 @@ jobs:
       # those four classes (one day line per midnight; every recipe FAIL reason, no-pushes and lost-lines among
       # them): re-measured cold keyless, 219 files / 2212 tests / 0 failures / 0 errors / 51 skipped, 0 orphans.
       #
+      # FAB-185-1 (WalletRolesTest: the wallet roles one liquidation check resolves; plus role cases in the
+      # liquidation executor classes) re-measured cold keyless on feat/fab-183-event-driven-pipeline, 2026-11-02:
+      # 227 files / 2470 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 227.
+      #
+      # FAB-185-2 (DesignatedInputUtxoSupplierTest: the view in which the wallet holds only the plain
+      # liquidation's designated input; plus cases in the plain builder and production-wiring classes)
+      # re-measured cold keyless on feat/fab-183-event-driven-pipeline, 2026-11-02:
+      # 228 files / 2484 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 228.
+      #
+      # FAB-185-4 DELETED CollateralSelectionTest with the static collateralInputsFor it tested: no liquidation
+      # builder chooses collateral any more, each pins wallet role C (compound keeps its own private rule until
+      # FAB-185-5). Its properties are now pinned by
+      # WalletRolesTest (how C is selected) and by each builder's built-collateral tests (collateral == [C] off the
+      # built body: LiquidateProductionWiringTest, LiquidatePayInAdvanceDryEvalTest, ConvertProductionWiringTest,
+      # OracleProbeRoutesProductionTest). Re-measured cold keyless on feat/fab-183-event-driven-pipeline,
+      # 2026-11-02: 227 files / 2490 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 227.
+      #
+      # FAB-38 (TransactionEvaluatorWiringTest: one TransactionEvaluator bean held by the four loans builders,
+      # the tank QuickTxBuilder's processor slot and the dump wrapper; plus cases in YaciConfigWiringTest,
+      # ContainerWiringTest and TankProductionWiringTest) re-measured cold keyless on
+      # feat/fab-189-composable-node, 2026-11-02: 228 files / 2542 tests / 0 failures / 0 errors / 51 skipped,
+      # 0 orphans. Floor 228.
+      #
+      # FAB-196-1 (OracleReferenceInputProbeVerdictPinTest: the oracle probe's verdicts pinned exactly; plus
+      # cases in TankUtxoStorageTest and StorageFilterSoundnessTest for the oracle NFT policy index clause)
+      # re-measured cold keyless on feat/fab-189-composable-node, 2026-11-02: 229 files / 2571 tests /
+      # 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 229.
+      #
+      # FAB-196-2 (OracleReferenceInputProbeIndexFirstTest: the probe asks the index first -- LIVE and SPENT
+      # with no Blockfrost call, UNKNOWN exactly as before; TankUtxoStorageOracleOutRefIndexTest: the index's
+      # LIVE / SPENT / UNKNOWN on the real-JPA seam; plus four cases in OracleReferenceInputProbeVerdictPinTest)
+      # re-measured cold keyless on feat/fab-189-composable-node, 2026-11-02: 231 files / 2602 tests /
+      # 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 231.
+      #
+      # FAB-196-3 (OracleProbeIndexFirstProductionWiringTest: the probe bean over the real TankUtxoStorage and
+      # Yaci tables -- an indexed feed costs no Blockfrost call, a recorded spend is refused from the index, the
+      # rest goes to Blockfrost as before; plus a case in ContainerWiringTest) re-measured cold keyless on
+      # feat/fab-189-composable-node, 2026-11-02: 232 files / 2609 tests / 0 failures / 0 errors / 51 skipped,
+      # 0 orphans. Floor 232.
+      #
+      # FAB-194-1 (MarketActionRoutePinTest: what a CONVERT and an ANTICIPATE market record and log, pinned
+      # exactly on the code before CONVERT_BEFORE_ANTICIPATE existed; ConvertBeforeAnticipateConvertsLikeConvertTest:
+      # the new action converts exactly as CONVERT; plus cases in MarketGateTest and MarketBindingTest)
+      # re-measured cold keyless on feat/fab-194-convert-before-anticipate, 2026-11-02: 234 files / 2658 tests /
+      # 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 234.
+      #
+      # FAB-194-2 (UStaysInTheCheckTest: U is never taken out of the check by an accepted or node-shadow
+      # liquidation; a token output still is) re-measured cold keyless on feat/fab-194-convert-before-anticipate,
+      # 2026-11-03: 235 files / 2667 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 235.
+      #
+      # FAB-194-3 (ConvertBeforeAnticipateFallbackTest: a CONVERT_BEFORE_ANTICIPATE market falls back to
+      # pay-in-advance in the same check only when convert is impossible; plus cases in MarketGateTest and
+      # ConvertLiquidationRouterTest, and RiderIsScopedToTheRouteTest rewritten to the route built)
+      # re-measured cold keyless on feat/fab-194-convert-before-anticipate, 2026-11-03: 236 files / 2716 tests /
+      # 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 236.
+      #
+      # FAB-194-5 (ConvertBeforeAnticipateBootLinesTest: through the container, the verifier's per-market WARN when
+      # convert is unavailable and ConvertEconomics' INIT line when convert is disabled, for each
+      # CONVERT_BEFORE_ANTICIPATE market; plus cases in WalletShapeTest and WalletRebalancerTest) re-measured cold
+      # keyless on feat/fab-194-convert-before-anticipate, 2026-11-03: 237 files / 2752 tests / 0 failures /
+      # 0 errors / 51 skipped, 0 orphans. Floor 237.
+      #
+      # FAB-203-1 (UtxoProcessorPinTest: Yaci Store's own UtxoProcessor and UtxoRollbackProcessor drive
+      # TankUtxoStorage over real H2 -- what the storage is handed, keeps, spends, caches and returns, and what a
+      # rollback restores; written to pass unchanged on Yaci Store 2.0.7) re-measured cold keyless on
+      # feat/fab-203-yaci-2.0.7, 2026-11-04: 238 files / 2760 tests / 0 failures / 0 errors / 51 skipped,
+      # 0 orphans. Floor 238.
+      # FAB-203-2 (Yaci Store 2.0.7: YaciStoreSwitchesTest -- every 2.x default the node does not adopt is off as
+      # Yaci's real auto-configuration reads the shipped YAML, and the exact Yaci routes served; ActuatorHealthTest
+      # -- /actuator/health stays 200 UP with a stalled tip, no relay and mid-sync) re-measured cold keyless on
+      # feat/fab-203-yaci-2.0.7, 2026-11-04: 240 files / 2775 tests / 0 failures / 0 errors / 51 skipped,
+      # 0 orphans. Floor 240.
+      # FAB-203-3 (TankUtxoStorageInYaciContextTest -- in Yaci 2.0.7's real auto-configuration the node's storage
+      # is the one Yaci's UtxoProcessor writes through, unadvised by plugins, its cache cleared on commit)
+      # re-measured cold keyless on feat/fab-203-yaci-2.0.7, 2026-11-04: 241 files / 2779 tests / 0 failures /
+      # 0 errors / 51 skipped, 0 orphans. Floor 241.
+      # FAB-203-4 (AddressUtxoIndexMigrationTest -- V1001 gives address_utxo exactly the two indexes the node's reads
+      # use; Yaci017DatabaseRefusalTest -- the shipped Flyway configuration refuses a Yaci Store 0.1.7 database and
+      # applies nothing, and a pre-upgrade image refuses a 2.0.7 one) re-measured cold keyless on
+      # feat/fab-203-yaci-2.0.7, 2026-11-04: 243 files / 2788 tests / 0 failures / 0 errors / 51 skipped,
+      # 0 orphans. Floor 243.
+      #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '219'
+          RESULT_FILE_FLOOR: '243'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET

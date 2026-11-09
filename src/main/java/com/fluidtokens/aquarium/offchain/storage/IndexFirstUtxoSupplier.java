@@ -44,13 +44,17 @@ import java.util.regex.Pattern;
  *         <li><b>INDEX-backed</b> — the index holds the row and its reference-script hash is faithful. The
  *             index always wins, even over a held answer, and a hit never fills the hold. Every UTxO at a
  *             watched credential lands here: the bot's wallet and collateral, loans, bonds, pools, the
- *             config and parameters/staker reference inputs.</li>
+ *             config and parameters/staker reference inputs. So, at ANY address, do the oracle feed and
+ *             Charli3 provider outputs that hold a token of a configured oracle NFT policy
+ *             ({@link TankUtxoStorage#indexedOracleNftPolicies()}, FAB-196), once the index has seen the
+ *             block that created them.</li>
  *         <li><b>HOLD-backed</b> — a miss whose out-ref is in the CURRENT static set
  *             ({@code StaticReferenceInputs#current()}, recomputed on each miss): the FluidTokens-published
  *             reference scripts ({@code loans.liquidation.reference-scripts.*},
  *             {@code loans.compound.reference-scripts}), the tank reference input, and each oracle registry
- *             entry's feed, script and Charli3 provider UTxOs. Read from the provider on the first request
- *             and held by out-ref after that; an ABSENT answer is never held; an out-ref that leaves the
+ *             entry's feed, script and Charli3 provider UTxOs that the index does not hold (one holding
+ *             no token of a configured oracle NFT policy, or created before the cursor). Read from the
+ *             provider on the first request and held by out-ref after that; an ABSENT answer is never held; an out-ref that leaves the
  *             static set is dropped on the next miss, so the hold is bounded by the set. Call sites:
  *             cardano-client-lib's {@code ReferenceScriptResolver} and {@code FeeCalculators} (every
  *             balancing pass) in the liquidation, pay-in-advance, convert and tank builds;

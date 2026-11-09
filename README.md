@@ -6,7 +6,8 @@ A Java service that operators run against the Cardano chain. It does **two** job
    transactions when the conditions are met.
 2. **Lending v4 auto-liquidation** — watches lending-v4 loans and, when one becomes liquidatable,
    either sells the collateral through Minswap (`CONVERT`) or repays the lender from your own wallet
-   and keeps the collateral (`ANTICIPATE`).
+   and keeps the collateral (`ANTICIPATE`) — or converts first and repays from your wallet only when a
+   convert is impossible (`CONVERT_BEFORE_ANTICIPATE`).
 
 Both reuse the same indexer, scheduler and wallet. **Both ship switched off** — see
 [docs/deploying.md](docs/deploying.md) §8.

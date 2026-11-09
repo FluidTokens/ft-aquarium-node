@@ -22,6 +22,10 @@ import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
+import com.fluidtokens.aquarium.offchain.service.StageTally;
+import com.fluidtokens.aquarium.offchain.service.SubmitFence;
+import com.fluidtokens.aquarium.offchain.service.WorkResult;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletShape;
 import okhttp3.OkHttpClient;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
@@ -56,9 +60,11 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -101,16 +107,23 @@ class CompoundExecutorTest {
         }
     }
 
+    /**
+     * Wallet role U: the largest ada-only output that is not C. FAB-185: it must hold the fee ceiling of the
+     * executor's parameters ({@code LedgerCeilings.maxPossibleFee}, 45,684,181 lovelace under
+     * {@link EvalFixtures#protocolParams()}), so it is 100 ADA.
+     */
     private static Utxo wallet() {
         return Utxo.builder().txHash("9e".repeat(32)).outputIndex(0)
                 .address(ACCOUNT.baseAddress())
-                .amount(List.of(Amount.lovelace(BigInteger.valueOf(20_000_000L)))).build();
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(100_000_000L)))).build();
     }
 
+    /** FAB-185 — wallet role C: ada-only, exactly {@code WalletShape.collateralLovelace} of this rig's params. */
     private static Utxo collateral() {
         return Utxo.builder().txHash("c0".repeat(32)).outputIndex(0)
                 .address(ACCOUNT.baseAddress())
-                .amount(List.of(Amount.lovelace(BigInteger.valueOf(5_000_000L)))).build();
+                .amount(List.of(Amount.lovelace(WalletShape.collateralLovelace(
+                        EvalFixtures.protocolParams().getProtocolParams())))).build();
     }
 
     private static List<Utxo> universe() {
@@ -187,11 +200,52 @@ class CompoundExecutorTest {
         var executor = new CompoundExecutor(configuration, network, blockEventListener,
                 new FakeAppUtxoService(walletUtxos), ACCOUNT,
                 new FakeScanner(candidates), new CompoundEconomics(configuration, network, pricingService()),
-                builder, new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(), submitter);
+                builder, new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(),
+                EvalFixtures.protocolParams(), submitter);
         return new Wiring(executor, submitted);
     }
 
     // ---- the tests ---------------------------------------------------------------------------
+
+    @Test
+    void submissionOutcomeIsOwnedAndClassifiedByTheCommonApi() throws Exception {
+        String source = java.nio.file.Files.readString(java.nio.file.Path.of(
+                "src/main/java/com/fluidtokens/aquarium/offchain/service/loans/CompoundExecutor.java"));
+
+        assertAll(
+                () -> {
+                    Class<?> outcome = Class.forName(
+                            "com.fluidtokens.aquarium.offchain.service.WorkResult");
+                    assertTrue(outcome.isEnum(), "the common outcome API must be an enum");
+                    assertTrue(java.lang.reflect.Modifier.isPublic(outcome.getModifiers()),
+                            "the common outcome API must be public");
+                    assertEquals(List.of("DEFINITE_FAILURE", "SUBMITTED", "WOULD_SUBMIT", "AMBIGUOUS"),
+                            Arrays.stream(outcome.getEnumConstants()).map(Object::toString).toList());
+                    assertTrue(java.lang.reflect.Modifier.isPublic(
+                            outcome.getMethod("terminal").getModifiers()));
+                    var classify = outcome.getMethod("classify", Result.class);
+                    assertTrue(java.lang.reflect.Modifier.isPublic(classify.getModifiers()));
+                    assertTrue(java.lang.reflect.Modifier.isStatic(classify.getModifiers()));
+                    assertEquals(outcome, classify.getReturnType());
+                },
+                () -> assertFalse(source.contains("enum CandidateOutcome"),
+                        "the executor must not retain a local outcome type"),
+                () -> assertAll("the executor must not retain a local provider decoder",
+                        () -> assertFalse(source.contains("isDecodedBlockfrostProviderSubmitRefusal")),
+                        () -> assertFalse(source.contains("MAX_PROVIDER_RESPONSE_LENGTH")),
+                        () -> assertFalse(source.contains("BLOCKFROST_ERROR_MAPPER")),
+                        () -> assertFalse(source.contains("JsonParser"))),
+                () -> assertAll("the executor must delegate its one result classification to WorkResult",
+                        () -> assertTrue(source.contains(
+                                "WorkResult outcome = WorkResult.classify(result);")),
+                        () -> assertEquals(source.indexOf("WorkResult.classify(result)"),
+                                source.lastIndexOf("WorkResult.classify(result)")),
+                        () -> assertFalse(source.contains("result.isSuccessful()")),
+                        () -> assertFalse(source.contains("\"WOULD_SUBMIT\".equals(result"))),
+                () -> assertEquals(WorkResult.class,
+                        CompoundExecutor.class.getDeclaredMethod("cycle").getReturnType(),
+                        "a cycle reports the outcome that ended its walk"));
+    }
 
     /**
      * ⛔ Disarmed is the default, and a READY candidate must still be reported. Silence here is the
@@ -477,6 +531,127 @@ class CompoundExecutorTest {
                 "WOULD_SUBMIT represents a terminal intent, not a refusal");
     }
 
+    /**
+     * {@code cycle()} returns the terminal outcome that ended the walk, and DEFINITE_FAILURE when nothing
+     * terminal happened. The submit count pins where the walk stopped, so the value cannot be right by a
+     * different route.
+     */
+    @Test
+    void aCycleReturnsTheOutcomeThatEndedItsWalk() {
+        assertCycleOutcome(bytes -> Result.<String>success("ok").withValue("deadbeef"),
+                WorkResult.SUBMITTED, 1, "a submission ends the walk");
+        assertCycleOutcome(bytes -> Result.<String>success("WOULD_SUBMIT").withValue("WOULD_SUBMIT"),
+                WorkResult.WOULD_SUBMIT, 1, "a withheld submission ends the walk");
+        assertCycleOutcome(bytes -> Result.<String>error(
+                        blockfrostError(500, "Internal Server Error", "opaque")).code(500),
+                WorkResult.AMBIGUOUS, 1, "a provider 500 has unknown acceptance and ends the walk");
+        assertCycleOutcome(bytes -> {
+                    throw new java.io.IOException("acceptance unknown");
+                },
+                WorkResult.AMBIGUOUS, 1, "a transport throw has unknown acceptance and ends the walk");
+        assertCycleOutcome(bytes -> blockfrostRejection(400, "opaque"),
+                WorkResult.DEFINITE_FAILURE, 2, "every candidate refused: nothing terminal happened");
+
+        assertEquals(WorkResult.DEFINITE_FAILURE, wiring(List.of(), true, -2_000_000L).executor().cycle(),
+                "an empty scan returns before the walk");
+        Wiring disarmed = wiring(List.of(ready(0L)), false, 0L);
+        assertEquals(WorkResult.DEFINITE_FAILURE, disarmed.executor().cycle(),
+                "a disarmed walk reaches nothing terminal");
+        assertTrue(disarmed.submitted().isEmpty());
+    }
+
+    /**
+     * FAB-195 (K1): the {@link #aCycleReturnsTheOutcomeThatEndedItsWalk} cases through the tally — one count per
+     * ready candidate the walk reaches. AMBIGUOUS (a provider 500, or a transport throw) is counted submitted, a
+     * display merge; a decoded 400 on each of two candidates is attempted 2; a disarmed walk's ready candidate is a
+     * no-op; an empty scan counts nothing.
+     */
+    @Test
+    void eachReadyCandidateTheWalkReachesIsCountedOnce() {
+        assertCycleTally(bytes -> Result.<String>success("ok").withValue("deadbeef"),
+                List.of(1, 0, 0, 0, 0), "a submission");
+        assertCycleTally(bytes -> Result.<String>success("WOULD_SUBMIT").withValue("WOULD_SUBMIT"),
+                List.of(0, 1, 0, 0, 0), "a withheld submission");
+        assertCycleTally(bytes -> Result.<String>error(
+                        blockfrostError(500, "Internal Server Error", "opaque")).code(500),
+                List.of(1, 0, 0, 0, 0), "a provider 500 may have gone out");
+        assertCycleTally(bytes -> {
+                    throw new java.io.IOException("acceptance unknown");
+                },
+                List.of(1, 0, 0, 0, 0), "a transport throw may have gone out");
+        assertCycleTally(bytes -> blockfrostRejection(400, "opaque"),
+                List.of(0, 0, 2, 0, 0), "both candidates submitted and refused");
+
+        StageTally empty = new StageTally();
+        wiring(List.of(), true, -2_000_000L).executor().cycle(SubmitFence.OPEN, empty);
+        assertEquals(List.of(0, 0, 0, 0, 0), counts(empty), "an empty scan returns before the walk");
+        StageTally disarmed = new StageTally();
+        wiring(List.of(ready(0L)), false, 0L).executor().cycle(SubmitFence.OPEN, disarmed);
+        assertEquals(List.of(0, 0, 0, 0, 1), counts(disarmed), "a disarmed walk's ready candidate is a no-op");
+    }
+
+    private static void assertCycleTally(CompoundExecutor.TransactionSubmitter response, List<Integer> expected,
+                                         String message) {
+        CompoundExecutor executor = executor(twoReadyCandidates(), realBuilder(twoReadyCandidates()), response);
+        StageTally tally = new StageTally();
+        executor.cycle(SubmitFence.OPEN, tally);
+        assertEquals(expected, counts(tally), message);
+    }
+
+    /**
+     * FAB-195 (K3): protocol parameters the walk cannot read are a failure of ours, not a missing role — each of
+     * the two ready candidates they refuse counts error 1 (error 2), and the walk says it in exactly ONE ERROR line,
+     * with the cause chain and no throwable; the stack trace is one DEBUG event, and the second refusal is DEBUG.
+     */
+    @Test
+    void unusableParametersCountAnErrorPerReadyCandidateInOneErrorLinePerWalk() {
+        var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.valueOf(-2_000_000L));
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("preview");
+        var blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+        List<Utxo> universe = new ArrayList<>(universe());
+        twoReadyCandidates().forEach(candidate -> universe.add(candidate.escrow()));
+        CompoundExecutor executor = new CompoundExecutor(configuration, network, blockEventListener,
+                new FakeAppUtxoService(List.of(wallet(), collateral())), ACCOUNT,
+                new FakeScanner(twoReadyCandidates()), new CompoundEconomics(configuration, network, pricingService()),
+                realBuilder(twoReadyCandidates()), new FakeResolver(), LoanFixtures.utxoSupplier(universe),
+                LoanFixtures.converters(),
+                () -> {
+                    throw new IllegalStateException("cannot fetch protocol parameters",
+                            new SocketTimeoutException("connect timed out"));
+                },
+                bytes -> {
+                    throw new AssertionError("C cannot be sized, so nothing may be submitted");
+                });
+        StageTally tally = new StageTally();
+
+        List<ILoggingEvent> events = eventsOf(() -> executor.cycle(SubmitFence.OPEN, tally));
+
+        assertEquals(List.of(0, 0, 0, 2, 0), counts(tally), "error 2");
+        List<ILoggingEvent> errors = events.stream().filter(event -> event.getLevel() == Level.ERROR).toList();
+        assertEquals(1, errors.size(), "one ERROR line for the walk: " + events);
+        String line = errors.getFirst().getFormattedMessage();
+        assertTrue(line.contains("role C") && line.contains("connect timed out"), line);
+        assertNull(errors.getFirst().getThrowableProxy(), "no throwable on the ERROR line");
+        assertEquals(1, events.stream().filter(event -> event.getLevel() == Level.DEBUG)
+                        .filter(event -> event.getThrowableProxy() != null).count(),
+                "one DEBUG event carries the stack trace: " + events);
+        assertTrue(events.stream().noneMatch(event -> event.getLevel() == Level.WARN), String.valueOf(events));
+    }
+
+    private static void assertCycleOutcome(CompoundExecutor.TransactionSubmitter response, WorkResult expected,
+                                           int expectedSubmits, String message) {
+        AtomicInteger submits = new AtomicInteger();
+        CompoundExecutor executor = executor(twoReadyCandidates(), realBuilder(twoReadyCandidates()),
+                bytes -> {
+                    submits.incrementAndGet();
+                    return response.submit(bytes);
+                });
+        assertEquals(expected, executor.cycle(), message);
+        assertEquals(expectedSubmits, submits.get(), message + " (submits)");
+    }
+
     @Test
     void evidenceNativeZeroFeeCandidateBuildsAndSubmitsWithoutAnOracleCall() {
         var token = new com.fluidtokens.aquarium.offchain.model.AssetType("d0".repeat(28), "5553444d");
@@ -514,7 +689,8 @@ class CompoundExecutorTest {
                 new FakeAppUtxoService(List.of(wallet(), collateral())), ACCOUNT,
                 new FakeScanner(List.of(nativeCandidate)),
                 new CompoundEconomics(configuration, network, new PricingService(throwingClient)), builder,
-                new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(), bytes -> {
+                new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(),
+                EvalFixtures.protocolParams(), bytes -> {
                     submits.incrementAndGet();
                     return Result.success("ok").withValue("native-offline");
                 });
@@ -648,6 +824,7 @@ class CompoundExecutorTest {
                 new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
                         LoanFixtures.utxoSupplier(universe()), EvalFixtures.protocolParams(), null),
                 new FakeResolver(), LoanFixtures.utxoSupplier(universe()), LoanFixtures.converters(),
+                EvalFixtures.protocolParams(),
                 bytes -> { throw new AssertionError("a syncing node must not submit"); });
 
         executor.cycle();
@@ -677,6 +854,7 @@ class CompoundExecutorTest {
                 new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
                         LoanFixtures.utxoSupplier(universe()), EvalFixtures.protocolParams(), null),
                 new FakeResolver(), LoanFixtures.utxoSupplier(universe()), LoanFixtures.converters(),
+                EvalFixtures.protocolParams(),
                 bytes -> { throw new AssertionError("a closed lending gate must not submit"); });
 
         var gate = new com.fluidtokens.aquarium.offchain.service.LendingConfigGate();
@@ -709,6 +887,7 @@ class CompoundExecutorTest {
                 new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
                         LoanFixtures.utxoSupplier(universe()), EvalFixtures.protocolParams(), null),
                 new FakeResolver(), LoanFixtures.utxoSupplier(universe()), LoanFixtures.converters(),
+                EvalFixtures.protocolParams(),
                 bytes -> com.bloxbean.cardano.client.api.model.Result.<String>success("ok").withValue("deadbeef"));
 
         // FAB-115 audit finding 3: the control. An OPEN gate must not stop compound — a condition
@@ -741,6 +920,7 @@ class CompoundExecutorTest {
                 new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
                         LoanFixtures.utxoSupplier(universe()), EvalFixtures.protocolParams(), null),
                 new FakeResolver(), LoanFixtures.utxoSupplier(universe()), LoanFixtures.converters(),
+                EvalFixtures.protocolParams(),
                 bytes -> { throw new AssertionError("a closed lending gate must not submit"); });
 
         var gate = new com.fluidtokens.aquarium.offchain.service.LendingConfigGate();
@@ -791,10 +971,10 @@ class CompoundExecutorTest {
     }
 
     /**
-     * ⚠ And the LARGEST nominable is taken, not the first. A 1 ada utxo cannot cover the collateral
-     * the ledger requires (150% of a ~0.84 ada fee), and nominating it produces a NEGATIVE collateral
-     * return — trap 16, a transaction the node cannot even parse. Picking first-in-list would have
-     * done exactly that here.
+     * ⚠ And the LARGEST ada-only output that is not C is taken, not the first: that is role U (FAB-185). A
+     * 1 ada utxo cannot fund a compound, and since the builder sees the wallet holding its designated input
+     * alone, nominating it would refuse the candidate outright. Picking first-in-list would have done exactly
+     * that here.
      */
     @Test
     void theLargestAdaOnlyUtxoIsNominatedNotTheFirst() {
@@ -803,15 +983,180 @@ class CompoundExecutorTest {
                 .amount(List.of(Amount.lovelace(BigInteger.valueOf(1_000_000L)))).build();
         Utxo ample = Utxo.builder().txHash("02".repeat(32)).outputIndex(0)
                 .address(ACCOUNT.baseAddress())
-                .amount(List.of(Amount.lovelace(BigInteger.valueOf(20_000_000L)))).build();
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(100_000_000L)))).build();
 
-        // tiny FIRST in the list — first-in-list selection would take it and fail on collateral.
-        Wiring w = wiringWithWallet(List.of(ready(0L)), List.of(tiny, ample));
+        // tiny FIRST in the list — first-in-list selection would take it and refuse.
+        Wiring w = wiringWithWallet(List.of(ready(0L)), List.of(tiny, ample, collateral()));
         w.executor().cycle();
 
         assertEquals(1, w.submitted().size(),
-                "the ample utxo must be nominated; taking the 1 ada one first would produce a "
-                        + "negative collateral return and an unparseable transaction");
+                "the ample utxo must be nominated; taking the 1 ada one first could not fund the compound");
+        assertTrue(inputsOf(w.submitted().getFirst()).contains(refOf(ample)), "funded from the ample utxo, U");
+    }
+
+    // ---- FAB-185: funded from U, with collateral C, roles resolved once per walk ----------------
+
+    /** A token output at the bot's address, larger than U: the old compound selector preferred it. */
+    private static Utxo largerTokenOutput() {
+        return Utxo.builder().txHash("7e".repeat(32)).outputIndex(0).address(ACCOUNT.baseAddress())
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(500_000_000L)),
+                        Amount.asset("ab".repeat(28) + "01", BigInteger.valueOf(1_000L)))).build();
+    }
+
+    private static TransactionInput refOf(Utxo utxo) {
+        return new TransactionInput(utxo.getTxHash(), utxo.getOutputIndex());
+    }
+
+    private static List<TransactionInput> inputsOf(byte[] signed) {
+        try {
+            return Transaction.deserialize(signed).getBody().getInputs();
+        } catch (Exception e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    private static List<TransactionInput> collateralOf(byte[] signed) {
+        try {
+            return Transaction.deserialize(signed).getBody().getCollateral();
+        } catch (Exception e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    /**
+     * (c) FAB-185: every candidate is funded from U even when a LARGER token-bearing output sits in the wallet
+     * — and sits first in the list. The pre-FAB-185 selector preferred exactly that output. Off the submitted
+     * body: U is an input, the token output is not, and the collateral is exactly [C].
+     */
+    @Test
+    void aCompoundIsFundedFromUEvenWhenALargerTokenOutputExists() {
+        Utxo token = largerTokenOutput();
+        Wiring w = wiringWithWallet(List.of(ready(0L)), List.of(token, wallet(), collateral()));
+
+        w.executor().cycle();
+
+        assertEquals(1, w.submitted().size(), "the compound is built and submitted");
+        List<TransactionInput> inputs = inputsOf(w.submitted().getFirst());
+        assertTrue(inputs.contains(refOf(wallet())), "funded from U: " + inputs);
+        assertFalse(inputs.contains(refOf(token)), "the larger token output is never an input: " + inputs);
+        assertEquals(List.of(refOf(collateral())), collateralOf(w.submitted().getFirst()),
+                "the collateral is exactly [C]");
+    }
+
+    /** An armed executor over {@code candidates} and {@code walletUtxos}, with the builder and the rebalancer stated. */
+    private static CompoundExecutor executorOverWallet(List<CompoundCandidate> candidates,
+                                                       CompoundTransactionBuilder builder,
+                                                       FakeAppUtxoService wallet,
+                                                       CompoundExecutor.TransactionSubmitter submitter) {
+        var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.valueOf(-2_000_000L));
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("preview");
+        var blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+        List<Utxo> universe = new ArrayList<>(baseUniverse());
+        universe.add(wallet());
+        var executor = new CompoundExecutor(configuration, network, blockEventListener, wallet, ACCOUNT,
+                new FakeScanner(candidates), new CompoundEconomics(configuration, network, pricingService()),
+                builder, new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(),
+                EvalFixtures.protocolParams(), submitter);
+        var rebalancer = org.mockito.Mockito.mock(
+                com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.class);
+        org.mockito.Mockito.when(rebalancer.lastOutcome()).thenReturn(REBALANCER_OUTCOME);
+        executor.setWalletRebalancer(rebalancer);
+        return executor;
+    }
+
+    /** What the mocked rebalancer says its last outcome was; every role refusal must name it. */
+    private static final String REBALANCER_OUTCOME = "in shape (FAB-185 marker)";
+
+    /** The WARN lines of a walk that name {@code role}. */
+    private static List<String> roleWarnings(List<Line> lines, String role) {
+        return at(Level.WARN, lines).stream().filter(line -> line.contains(role)).toList();
+    }
+
+    /**
+     * (c) FAB-185, B1: a wallet with no U — C and a token output only — builds nothing, and says so ONCE for
+     * the walk at WARN, naming {@code role U} and the rebalancer's last outcome, however many candidates are
+     * ready. The FAB-180 summary is still said.
+     */
+    @Test
+    void aMissingUIsOneWarnNamingTheRoleAndTheRebalancerAndNothingIsBuilt() {
+        List<CompoundCandidate> candidates = twoReadyCandidates();
+        CompoundTransactionBuilder builder = org.mockito.Mockito.spy(realBuilder(candidates));
+        CompoundExecutor executor = executorOverWallet(candidates, builder,
+                new FakeAppUtxoService(List.of(collateral(), largerTokenOutput())),
+                bytes -> { throw new AssertionError("nothing is built, so nothing may be submitted"); });
+
+        List<Line> lines = cycleAt(executor, T0);
+
+        List<String> warnings = roleWarnings(lines, "role U");
+        assertEquals(1, warnings.size(), "one WARN for the walk, not one per candidate: " + lines);
+        assertTrue(warnings.getFirst().contains(REBALANCER_OUTCOME), "it names the rebalancer's last outcome: "
+                + warnings.getFirst());
+        assertEquals(List.of(), roleWarnings(lines, "role C"), "C is present, so it is not said missing");
+        org.mockito.Mockito.verify(builder, org.mockito.Mockito.never())
+                .buildWithFacts(org.mockito.ArgumentMatchers.any(CompoundTransactionBuilder.Request.class));
+        assertReconciles(summaryOf(lines).text(), 0);
+    }
+
+    /** (c) FAB-185, B1: the same for a wallet with no C — U alone — naming {@code role C}. */
+    @Test
+    void aMissingCIsOneWarnNamingTheRoleAndTheRebalancerAndNothingIsBuilt() {
+        List<CompoundCandidate> candidates = twoReadyCandidates();
+        CompoundTransactionBuilder builder = org.mockito.Mockito.spy(realBuilder(candidates));
+        CompoundExecutor executor = executorOverWallet(candidates, builder,
+                new FakeAppUtxoService(List.of(wallet())),
+                bytes -> { throw new AssertionError("nothing is built, so nothing may be submitted"); });
+
+        List<Line> lines = cycleAt(executor, T0);
+
+        List<String> warnings = roleWarnings(lines, "role C");
+        assertEquals(1, warnings.size(), "one WARN for the walk, not one per candidate: " + lines);
+        assertTrue(warnings.getFirst().contains(REBALANCER_OUTCOME), "it names the rebalancer's last outcome: "
+                + warnings.getFirst());
+        org.mockito.Mockito.verify(builder, org.mockito.Mockito.never())
+                .buildWithFacts(org.mockito.ArgumentMatchers.any(CompoundTransactionBuilder.Request.class));
+        assertReconciles(summaryOf(lines).text(), 0);
+    }
+
+    /**
+     * (c) FAB-185: the roles are resolved ONCE per walk. Two ready candidates are both built and submitted —
+     * the first submission is refused by the provider, so the walk goes on to the second — from ONE wallet
+     * read. The pre-FAB-185 executor read the wallet once per candidate.
+     */
+    @Test
+    void theRolesAreResolvedOncePerWalkFromOneWalletRead() {
+        List<CompoundCandidate> candidates = twoReadyCandidates();
+        FakeAppUtxoService wallet = new FakeAppUtxoService(List.of(wallet(), collateral()));
+        AtomicInteger submits = new AtomicInteger();
+        CompoundExecutor executor = executorOverWallet(candidates, realBuilder(candidates), wallet, bytes -> {
+            submits.incrementAndGet();
+            return blockfrostRejection(400, "opaque");
+        });
+
+        assertEquals(WorkResult.DEFINITE_FAILURE, executor.cycle());
+
+        assertEquals(2, submits.get(), "both ready candidates were built and submitted");
+        assertEquals(1, wallet.reads.get(), "one wallet read for the walk, not one per candidate");
+    }
+
+    /** FAB-185: a U below the fee ceiling refuses the candidate at WARN, naming role U as too small. */
+    @Test
+    void aUBelowTheFeeCeilingIsSkippedAsTooSmall() {
+        Utxo smallU = Utxo.builder().txHash("9e".repeat(32)).outputIndex(0).address(ACCOUNT.baseAddress())
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(10_000_000L)))).build();
+        CompoundTransactionBuilder builder = org.mockito.Mockito.spy(realBuilder(List.of(ready(0L))));
+        CompoundExecutor executor = executorOverWallet(List.of(ready(0L)), builder,
+                new FakeAppUtxoService(List.of(smallU, collateral())),
+                bytes -> { throw new AssertionError("nothing is built, so nothing may be submitted"); });
+
+        List<Line> lines = cycleAt(executor, T0);
+
+        assertEquals(1, at(Level.WARN, lines).stream()
+                        .filter(line -> line.startsWith("compound SKIPPED " + LOAN_ID + ": role U")
+                                && line.contains("too small")).count(), lines.toString());
+        org.mockito.Mockito.verify(builder, org.mockito.Mockito.never())
+                .buildWithFacts(org.mockito.ArgumentMatchers.any(CompoundTransactionBuilder.Request.class));
     }
 
     /**
@@ -967,7 +1312,7 @@ class CompoundExecutorTest {
                 new FakeAppUtxoService(List.of(wallet(), collateral())), account,
                 new FakeScanner(candidates), economics,
                 builder, new FakeResolver(), LoanFixtures.utxoSupplier(universe),
-                LoanFixtures.converters(), submitter);
+                LoanFixtures.converters(), EvalFixtures.protocolParams(), submitter);
     }
 
     private static Result<String> blockfrostRejection(int statusCode, String message) {
@@ -1306,7 +1651,8 @@ class CompoundExecutorTest {
         return new CompoundExecutor(configuration, network, blockEventListener,
                 new FakeAppUtxoService(List.of(wallet(), collateral())), ACCOUNT,
                 new FakeScanner(List.of(ready(0L))), new CompoundEconomics(configuration, network, pricingService()),
-                builder, new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(), submitter);
+                builder, new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(),
+                EvalFixtures.protocolParams(), submitter);
     }
 
     // ---- FAB-144: the most profitable compound first ------------------------------------------
@@ -1345,6 +1691,28 @@ class CompoundExecutorTest {
         return appender.list.stream()
                 .map(event -> new Line(event.getLevel(), event.getFormattedMessage()))
                 .toList();
+    }
+
+    /** {@link #linesOf}, keeping the events whole — their throwables included. */
+    private static List<ILoggingEvent> eventsOf(Runnable action) {
+        var logger = (Logger) LoggerFactory.getLogger(CompoundExecutor.class);
+        Level previous = logger.getLevel();
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        logger.setLevel(Level.DEBUG);
+        try {
+            action.run();
+        } finally {
+            logger.setLevel(previous);
+            logger.detachAppender(appender);
+        }
+        return appender.list;
+    }
+
+    /** FAB-195: submitted, would-submit, attempted, error, no-op — in the pass line's order. */
+    private static List<Integer> counts(StageTally tally) {
+        return List.of(tally.submitted(), tally.wouldSubmit(), tally.attempted(), tally.error(), tally.noOp());
     }
 
     /** One cycle's lines, at every level, in the order the executor logged them. */
@@ -1417,6 +1785,7 @@ class CompoundExecutorTest {
                 new FakeScanner(List.of(largerRaw, smallerRaw)),
                 new CompoundEconomics(configuration, network, new PricingService(client)), realBuilder(),
                 new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(),
+                EvalFixtures.protocolParams(),
                 bytes -> { throw new AssertionError("disarmed"); });
         var logger = (Logger) LoggerFactory.getLogger(CompoundExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
@@ -1638,6 +2007,7 @@ class CompoundExecutorTest {
                 new FakeAppUtxoService(List.of(wallet(), collateral())), ACCOUNT, scanner,
                 new CompoundEconomics(configuration, network, pricingService()), realBuilder(),
                 new FakeResolver(), LoanFixtures.utxoSupplier(universe()), LoanFixtures.converters(),
+                EvalFixtures.protocolParams(),
                 bytes -> { throw new AssertionError("nothing here is ready, so nothing may be submitted"); });
     }
 
@@ -1821,7 +2191,11 @@ class CompoundExecutorTest {
         assertReconciles(summaryOf(unpriced).text(), 0);
     }
 
-    /** FAB-180: a fault keeps its level and its text — BUILD FAILED is still an ERROR — and the walk is still summarised. */
+    /**
+     * FAB-180: a fault keeps its level — BUILD FAILED is still an ERROR — and the walk is still summarised.
+     * FAB-195 (K2): its text moves to the cause-chain form, with no throwable on the ERROR line; the stack trace is
+     * one DEBUG event; and it counts error 1.
+     */
     @Test
     void aBuildFailureIsStillAnErrorWithItsTextUnchanged() {
         var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.valueOf(-2_000_000L));
@@ -1831,12 +2205,26 @@ class CompoundExecutorTest {
                 .thenThrow(new IllegalStateException("kernel said no"));
         CompoundCandidate only = ready(0L);
         CompoundExecutor executor = executorWithBuilder(configuration, failing, universe());
+        StageTally tally = new StageTally();
 
-        List<Line> lines = cycleAt(executor, T0);
+        executor.setClock(Clock.fixed(T0, ZoneOffset.UTC));
+        List<ILoggingEvent> events = eventsOf(() -> executor.cycle(SubmitFence.OPEN, tally));
+        List<Line> lines = events.stream().map(event -> new Line(event.getLevel(), event.getFormattedMessage()))
+                .toList();
 
-        assertTrue(lines.contains(new Line(Level.ERROR, "compound BUILD FAILED " + LOAN_ID + " escrow "
-                        + only.escrowRef() + ": java.lang.IllegalStateException: kernel said no")),
-                "BUILD FAILED stays at ERROR, text unchanged: " + lines);
+        String failed = "compound BUILD FAILED " + LOAN_ID + " escrow " + only.escrowRef()
+                + ": IllegalStateException: kernel said no";
+        assertTrue(lines.contains(new Line(Level.ERROR, failed)),
+                "BUILD FAILED stays at ERROR, in the cause-chain form: " + lines);
+        List<ILoggingEvent> errors = events.stream().filter(event -> event.getLevel() == Level.ERROR).toList();
+        assertEquals(1, errors.size(), "one ERROR line: " + lines);
+        assertNull(errors.getFirst().getThrowableProxy(), "no throwable on the ERROR line");
+        assertEquals(1, events.stream().filter(event -> event.getLevel() == Level.DEBUG)
+                        .filter(event -> event.getThrowableProxy() != null)
+                        .filter(event -> event.getFormattedMessage().startsWith("compound BUILD FAILED "))
+                        .count(),
+                "one DEBUG event carries the stack trace: " + lines);
+        assertEquals(List.of(0, 0, 0, 1, 0), counts(tally), "error 1");
         Line summary = summaryOf(lines);
         assertEquals(new Line(Level.INFO, "compound scan: 1 escrows, 1 priced, 1 ready, refused {}, "
                 + "not approved {}"), summary, "one candidate: priced once for the summary, no ranking");
@@ -1889,6 +2277,7 @@ class CompoundExecutorTest {
                 new FakeScanner(List.of(candidate)),
                 new CompoundEconomics(configuration, network, new PricingService(client)), realBuilder(),
                 new FakeResolver(), LoanFixtures.utxoSupplier(universe()), LoanFixtures.converters(),
+                EvalFixtures.protocolParams(),
                 bytes -> { throw new AssertionError("an unpriced candidate must not be submitted"); });
 
         List<Line> lines = cycleAt(executor, T0);
@@ -1939,6 +2328,111 @@ class CompoundExecutorTest {
         assertEquals(List.of(), lines.stream().filter(line -> line.text().startsWith("compound scan")).toList());
     }
 
+    // ---- FAB-183: the compound stage's fence, early returns and outcome-to-log mapping ------------
+
+    /** A fence that reads open {@code opens} times, then closed for good. */
+    private static SubmitFence openFor(int opens) {
+        AtomicInteger reads = new AtomicInteger();
+        return () -> reads.getAndIncrement() < opens;
+    }
+
+    /** FAB-183: a fence closed before the walk builds nothing, and the summary counts both as not reached. */
+    @Test
+    void aFenceClosedBeforeTheWalkBuildsNothingAndCountsNotReached() {
+        List<CompoundCandidate> candidates = twoReadyCandidates();
+        CompoundTransactionBuilder builder = org.mockito.Mockito.spy(realBuilder(candidates));
+        AtomicInteger submits = new AtomicInteger();
+        CompoundExecutor executor = executor(candidates, builder, bytes -> {
+            submits.incrementAndGet();
+            return Result.<String>success("ok").withValue("deadbeef");
+        });
+        WorkResult[] result = new WorkResult[1];
+
+        List<Line> lines = linesOf(() -> result[0] = executor.cycle(() -> false));
+
+        org.mockito.Mockito.verify(builder, org.mockito.Mockito.never())
+                .buildWithFacts(org.mockito.ArgumentMatchers.any(CompoundTransactionBuilder.Request.class));
+        assertEquals(0, submits.get());
+        assertEquals(WorkResult.DEFINITE_FAILURE, result[0]);
+        assertTrue(summaryOf(lines).text().endsWith(", not reached 2"), summaryOf(lines).text());
+    }
+
+    /** FAB-183: a fence that closes immediately before the wire transmits nothing and says FENCED. */
+    @Test
+    void aFenceClosedAtSubmitTransmitsNothingAndSaysFenced() {
+        AtomicInteger submits = new AtomicInteger();
+        CompoundExecutor executor = executor(twoReadyCandidates(), realBuilder(twoReadyCandidates()), bytes -> {
+            submits.incrementAndGet();
+            return Result.<String>success("ok").withValue("deadbeef");
+        });
+        WorkResult[] result = new WorkResult[1];
+
+        List<Line> lines = linesOf(() -> result[0] = executor.cycle(openFor(1)));
+
+        assertEquals(0, submits.get(), "a closed fence transmits nothing");
+        assertEquals(List.of(new Line(Level.INFO, "compound FENCED " + LOAN_ID + ": nothing transmitted")),
+                lines.stream().filter(line -> line.text().startsWith("compound FENCED")).toList());
+        assertEquals(WorkResult.DEFINITE_FAILURE, result[0]);
+        assertTrue(summaryOf(lines).text().endsWith(", not reached 1"), summaryOf(lines).text());
+    }
+
+    /** An armed executor over one ready candidate, syncing or not, behind a closed lending gate or none. */
+    private static CompoundExecutor gatedExecutor(boolean syncing, boolean gateClosed) {
+        var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.valueOf(-2_000_000L));
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("preview");
+        var blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(syncing);
+        var executor = new CompoundExecutor(configuration, network, blockEventListener,
+                new FakeAppUtxoService(List.of(wallet())), ACCOUNT, new FakeScanner(List.of(ready(0L))),
+                new CompoundEconomics(configuration, network, pricingService()),
+                new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
+                        LoanFixtures.utxoSupplier(universe()), EvalFixtures.protocolParams(), null),
+                new FakeResolver(), LoanFixtures.utxoSupplier(universe()), LoanFixtures.converters(),
+                EvalFixtures.protocolParams(),
+                bytes -> { throw new AssertionError("an early return must not submit"); });
+        if (gateClosed) {
+            var gate = new com.fluidtokens.aquarium.offchain.service.LendingConfigGate();
+            gate.block("ConfigDatum[11]: derived 63b26ff9…, chain 64d9b13f…");
+            executor.setLendingConfigGate(gate);
+        }
+        return executor;
+    }
+
+    /**
+     * FAB-183-4 audit residue: the returns before the walk are DEFINITE_FAILURE. The pipeline reads this
+     * value, so a terminal one from a syncing node, or from a closed lending gate, would end the pass.
+     */
+    @Test
+    void theSyncingAndLendingGateEarlyReturnsAreDefiniteFailures() {
+        assertEquals(WorkResult.DEFINITE_FAILURE, gatedExecutor(true, false).cycle(), "the syncing return");
+        assertEquals(WorkResult.DEFINITE_FAILURE, gatedExecutor(false, true).cycle(), "the lending-gate return");
+    }
+
+    /** The level of every line {@code response} makes {@code submit} say that starts with {@code prefix}. */
+    private static List<Level> submitLineLevels(Result<String> response, String prefix) {
+        CompoundExecutor executor = executor(List.of(ready(0L)), realBuilder(), bytes -> response);
+        return linesOf(executor::cycle).stream()
+                .filter(line -> line.text().startsWith(prefix))
+                .map(Line::level)
+                .toList();
+    }
+
+    /** FAB-183-4 audit residue: {@code submit}'s outcome-to-log mapping, one assertion per outcome. */
+    @Test
+    void eachSubmitOutcomeHasItsOwnLineAtItsOwnLevel() {
+        assertEquals(List.of(Level.WARN), submitLineLevels(blockfrostRejection(400, "opaque"),
+                "compound SUBMIT REJECTED " + LOAN_ID), "a decoded refusal");
+        assertEquals(List.of(Level.ERROR), submitLineLevels(Result.<String>error(
+                        blockfrostError(500, "Internal Server Error", "opaque")).code(500),
+                "compound SUBMIT AMBIGUOUS " + LOAN_ID), "an ambiguous answer");
+        assertEquals(List.of(Level.INFO), submitLineLevels(Result.<String>success("ok").withValue("deadbeef"),
+                "COMPOUNDED " + LOAN_ID), "a submission");
+        assertEquals(List.of(Level.INFO), submitLineLevels(
+                Result.<String>success("WOULD_SUBMIT").withValue("WOULD_SUBMIT"),
+                "WOULD_SUBMIT " + LOAN_ID), "the WOULD_SUBMIT sentinel");
+    }
+
     // ---- fakes -------------------------------------------------------------------------------
 
     private static class FakeScanner extends CompoundCandidateScanner {
@@ -1978,6 +2472,8 @@ class CompoundExecutorTest {
 
     private static final class FakeAppUtxoService extends AppUtxoService {
         private final List<Utxo> utxos;
+        /** FAB-185: how often the wallet was read. */
+        final AtomicInteger reads = new AtomicInteger();
 
         FakeAppUtxoService(List<Utxo> utxos) {
             super(null, null);
@@ -1986,6 +2482,7 @@ class CompoundExecutorTest {
 
         @Override
         public List<Utxo> listWalletUtxo() {
+            reads.incrementAndGet();
             return utxos;
         }
     }

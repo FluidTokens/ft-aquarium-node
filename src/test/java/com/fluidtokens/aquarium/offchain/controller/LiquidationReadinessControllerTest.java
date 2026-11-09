@@ -112,7 +112,7 @@ class LiquidationReadinessControllerTest {
                 PoolUsability.noPool(),
                 null, null, null, null,
                 AnticipateAndSell.unknown("no pool"), null,
-                ActionNow.of(false, null, null, null, true, false, null), ProcessingBlocker.NONE,
+                ActionNow.of(false, null, null, null, true, PoolUsability.Verdict.NO_POOL, null), ProcessingBlocker.NONE,
                 null, null);
     }
 
@@ -416,6 +416,225 @@ class LiquidationReadinessControllerTest {
     }
 
     /**
+     * ⛔ FAB-182: ONE ADA/USD rate per page. Through the real {@code readiness()} path the book and the prices
+     * strip are priced from the same reference feed — USDCx at 3/2 lovelace per base unit, 6 decimals, so
+     * 1 USDCx = 1.5 ADA and 1 ADA = $0.6666… (the book floors it to 0.666666 USDCx, the strip shows $0.6667) —
+     * and without it they give the same reason, naming USDCx.
+     */
+    @Test
+    void theBookAndThePricesStripShareOneUsdRate() {
+        String usdcxUnit = "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e345553444378";
+        AssetType usdcx = AssetType.fromUnit(usdcxUnit);
+        long now = System.currentTimeMillis();
+        var controller = pageController(pageIndex().resolver(), syncing(false),
+                COLLATERAL_TOKEN, FLDT, PRINCIPAL_TOKEN);
+        // The reference, and COLLATERAL_TOKEN 1:1 so the book has a priced total to convert.
+        org.springframework.test.util.ReflectionTestUtils.setField(controller, "oracleClient",
+                provide(new FakeOracleClient(LoanFixtures.charli3(usdcx, new AssetType("ee".repeat(28), "55534443"),
+                        "11".repeat(28), OraclePriceFeed.priceDataCharlie(usdcx, BigInteger.valueOf(3),
+                                BigInteger.TWO, now - 60_000L, now + 1_800_000L),
+                        input("22"), input("33"), input("44")),
+                        LoanFixtures.charli3(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT, "11".repeat(28),
+                                OraclePriceFeed.priceDataCharlie(COLLATERAL_TOKEN, BigInteger.ONE, BigInteger.ONE,
+                                        now - 60_000L, now + 1_800_000L),
+                                input("22"), input("33"), input("44")))));
+        org.springframework.test.util.ReflectionTestUtils.setField(controller, "tokenMetadata",
+                provide(new com.fluidtokens.aquarium.offchain.service.loans.TokenMetadataService(null, null,
+                        java.time.Clock.systemUTC()) {
+                    @Override
+                    public TokenMetadata lookup(String unit) {
+                        return usdcxUnit.equals(unit)
+                                ? new TokenMetadata(unit, "USDCx", "USDCx", 6, TokenMetadata.Source.REGISTRY)
+                                : "lovelace".equals(unit) ? TokenMetadata.ada() : TokenMetadata.unknown(unit);
+                    }
+                }));
+        org.springframework.test.util.ReflectionTestUtils.setField(controller, "usdReferenceUnit", usdcxUnit);
+
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, null, null);
+        var book = (LiquidationReadinessController.BookSummary) model.getAttribute("book");
+        var prices = (LiquidationReadinessController.PriceStrip) model.getAttribute("prices");
+
+        assertNotNull(prices, "an oracle client is present, so the strip is");
+        assertNull(book.usdUnavailableReason(), "the book has its USD rate");
+        assertNull(prices.usdUnavailableReason(), "and so does the strip");
+        assertEquals("0.666666", book.adaUsdRateDisplay().amountText());
+        assertEquals("USDCx", book.adaUsdRateDisplay().label(), "the book names the reference by its label");
+        assertEquals("ADA", prices.entries().get(0).label(), "ADA first");
+        assertEquals("$0.6667", prices.entries().get(0).usdText(), "the same rate, from the same feed");
+
+        org.springframework.test.util.ReflectionTestUtils.setField(controller, "oracleClient",
+                provide(new FakeOracleClient()));
+        var without = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(without, null, null, null, null, null);
+        var bookWithout = (LiquidationReadinessController.BookSummary) without.getAttribute("book");
+        var pricesWithout = (LiquidationReadinessController.PriceStrip) without.getAttribute("prices");
+        assertEquals("no usable USDCx oracle price right now", bookWithout.usdUnavailableReason());
+        assertEquals(bookWithout.usdUnavailableReason(), pricesWithout.usdUnavailableReason(),
+                "one rate, so one reason when it is missing");
+    }
+
+    // ---- FAB-182 r2: the one-rate wiring, the trimmed unit, and a strip that cannot fail the page ----------
+
+    private static final String USDCX_UNIT = "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e345553444378";
+
+    /** USDCx at 3/2 lovelace per base unit (6 decimals: 1 USDCx = 1.5 ADA, 1 ADA = $0.6666…) over the window. */
+    private static OracleEntry usdcxEntry(long validFrom, long validTo) {
+        AssetType usdcx = AssetType.fromUnit(USDCX_UNIT);
+        return LoanFixtures.charli3(usdcx, new AssetType("ee".repeat(28), "55534443"), "11".repeat(28),
+                OraclePriceFeed.priceDataCharlie(usdcx, BigInteger.valueOf(3), BigInteger.TWO, validFrom, validTo),
+                input("22"), input("33"), input("44"));
+    }
+
+    /** COLLATERAL_TOKEN at 1:1, usable now, so the book has a priced total to convert. */
+    private static OracleEntry collateralEntry(long now) {
+        return LoanFixtures.charli3(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT, "11".repeat(28),
+                OraclePriceFeed.priceDataCharlie(COLLATERAL_TOKEN, BigInteger.ONE, BigInteger.ONE,
+                        now - 60_000L, now + 1_800_000L),
+                input("22"), input("33"), input("44"));
+    }
+
+    /**
+     * The page as {@code readiness()} builds it, priced by {@code client}, with {@code usdUnit} configured EXACTLY
+     * as given (padding included) and metadata that knows USDCx (6 decimals) and ADA.
+     */
+    private static LiquidationReadinessController usdcxPage(FluidOracleClient client, String usdUnit) {
+        var controller = pageController(pageIndex().resolver(), syncing(false),
+                COLLATERAL_TOKEN, FLDT, PRINCIPAL_TOKEN);
+        org.springframework.test.util.ReflectionTestUtils.setField(controller, "oracleClient", provide(client));
+        org.springframework.test.util.ReflectionTestUtils.setField(controller, "tokenMetadata",
+                provide(new com.fluidtokens.aquarium.offchain.service.loans.TokenMetadataService(null, null,
+                        java.time.Clock.systemUTC()) {
+                    @Override
+                    public TokenMetadata lookup(String unit) {
+                        return USDCX_UNIT.equals(unit)
+                                ? new TokenMetadata(unit, "USDCx", "USDCx", 6, TokenMetadata.Source.REGISTRY)
+                                : "lovelace".equals(unit) ? TokenMetadata.ada() : TokenMetadata.unknown(unit);
+                    }
+                }));
+        org.springframework.test.util.ReflectionTestUtils.setField(controller, "usdReferenceUnit", usdUnit);
+        return controller;
+    }
+
+    /**
+     * ⛔ FAB-182 r2 (F1): the strip is priced through the BOOK's reference feed — {@code usdFeed(now)}, usable
+     * now — and through nothing else. USDCx is HELD but expired 70 minutes ago, so the book has no USD rate;
+     * neither may the strip. A strip given any other reference feed (the held one regardless of validity,
+     * say) would show a dollar figure here the book refuses to show — two rates on one page.
+     */
+    @Test
+    void anExpiredReferenceFeedLeavesTheStripWithoutUsdExactlyAsTheBook() {
+        long now = System.currentTimeMillis();
+        var controller = usdcxPage(new FakeOracleClient(
+                usdcxEntry(now - 6_000_000L, now - 4_200_000L), collateralEntry(now)), USDCX_UNIT);
+
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, null, null);
+        var book = (LiquidationReadinessController.BookSummary) model.getAttribute("book");
+        var prices = (LiquidationReadinessController.PriceStrip) model.getAttribute("prices");
+
+        assertNotNull(prices, "an oracle client is present, so the strip is");
+        assertEquals("no usable USDCx oracle price right now", book.usdUnavailableReason(),
+                "premise: the book has no usable reference feed");
+        assertEquals(book.usdUnavailableReason(), prices.usdUnavailableReason(),
+                "the strip gives the book's reason: one rate, so one answer");
+        assertEquals("ADA", prices.entries().get(0).label());
+        assertEquals("—", prices.entries().get(0).usdText(), "no USD per ADA from an expired reference");
+        assertTrue(prices.entries().stream().allMatch(e -> "—".equals(e.usdText())),
+                "and no USD cell anywhere on the strip: " + prices.entries());
+    }
+
+    /**
+     * ⛔ FAB-182 r2 (F3): a padded {@code LOANS_UI_USD_REFERENCE_UNIT} is trimmed once, where it enters the
+     * controller, so the book and the strip price the SAME unit — both priced, at the same rate. Untrimmed,
+     * the book's metadata lookup missed the padded unit and refused a figure the strip showed.
+     */
+    @Test
+    void aPaddedReferenceUnitIsOneUnitForTheBookAndTheStrip() {
+        long now = System.currentTimeMillis();
+        var controller = usdcxPage(new FakeOracleClient(
+                usdcxEntry(now - 60_000L, now + 1_800_000L), collateralEntry(now)), "  " + USDCX_UNIT + "  ");
+
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, null, null);
+        var book = (LiquidationReadinessController.BookSummary) model.getAttribute("book");
+        var prices = (LiquidationReadinessController.PriceStrip) model.getAttribute("prices");
+
+        assertNotNull(prices);
+        assertNull(book.usdUnavailableReason(), "the book is priced: " + book.usdUnavailableReason());
+        assertNull(prices.usdUnavailableReason(), "and so is the strip: " + prices.usdUnavailableReason());
+        assertEquals("0.666666", book.adaUsdRateDisplay().amountText());
+        assertEquals("USDCx", book.adaUsdRateDisplay().label(), "the book names the trimmed unit's token");
+        assertEquals("$0.6667", prices.entries().get(0).usdText(), "the strip, at the same rate");
+        assertEquals("USDCx", prices.usdReference(), "and the strip names the same token");
+    }
+
+    /**
+     * ⛔ FAB-182 r2: the page never fails because of the strip. An oracle client whose {@code entries()} throws
+     * leaves NO strip, and everything else — rows, book, its USD rate — renders as before.
+     */
+    @Test
+    void aRegistryThatThrowsLeavesNoStripAndThePageStillRenders() {
+        long now = System.currentTimeMillis();
+        var client = new FakeOracleClient(usdcxEntry(now - 60_000L, now + 1_800_000L), collateralEntry(now)) {
+            @Override
+            public java.util.Collection<OracleEntry> entries() {
+                throw new IllegalStateException("the registry exploded");
+            }
+        };
+        var controller = usdcxPage(client, USDCX_UNIT);
+
+        var model = new org.springframework.ui.ConcurrentModel();
+        String view = controller.readiness(model, null, null, null, null, null);
+        @SuppressWarnings("unchecked")
+        var rows = (List<LiquidationReadinessController.Row>) model.getAttribute("rows");
+        var book = (LiquidationReadinessController.BookSummary) model.getAttribute("book");
+
+        assertEquals("readiness", view, "the page renders");
+        assertNull(model.getAttribute("prices"), "with no strip");
+        assertEquals(3, rows.size(), "the rows still render");
+        assertNotNull(book, "the book still renders");
+        assertNull(book.usdUnavailableReason(), "with its USD rate: the strip's failure is the strip's alone");
+    }
+
+    /**
+     * ⛔ FAB-182 r2: one token whose price cannot be computed (a POOLED feed — {@code price()} throws, as it does
+     * in finance.ak) is left out, and every other token still renders.
+     */
+    @Test
+    void aTokenWhosePriceThrowsIsLeftOutAndTheOthersRender() {
+        long now = System.currentTimeMillis();
+        AssetType pooled = new AssetType("ab".repeat(28), "504f4f4c");
+        OracleEntry pooledEntry = LoanFixtures.charli3(pooled, new AssetType("ac".repeat(28), "6f7261636c65"),
+                "11".repeat(28), new OraclePriceFeed(OraclePriceFeed.Variant.POOLED, pooled, BigInteger.ONE,
+                        BigInteger.ONE, now - 60_000L, now + 1_800_000L),
+                input("22"), input("33"), input("44"));
+        List<OracleEntry> registry = List.of(usdcxEntry(now - 60_000L, now + 1_800_000L), collateralEntry(now),
+                pooledEntry);
+        var client = new FakeOracleClient(registry.toArray(OracleEntry[]::new)) {
+            @Override
+            public java.util.Collection<OracleEntry> entries() {
+                return registry;
+            }
+        };
+        var controller = usdcxPage(client, USDCX_UNIT);
+
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, null, null);
+        var prices = (LiquidationReadinessController.PriceStrip) model.getAttribute("prices");
+
+        assertNotNull(prices, "one bad token does not take the strip down");
+        List<String> units = prices.entries().stream().map(LiquidationReadinessController.TokenPrice::unit).toList();
+        assertFalse(units.contains(pooled.toUnit()), "the token whose price throws is left out: " + units);
+        assertEquals(java.util.Set.of("lovelace", USDCX_UNIT, COLLATERAL_TOKEN.toUnit()), java.util.Set.copyOf(units),
+                "and every other token renders: " + units);
+        var usdcx = prices.entries().stream().filter(e -> USDCX_UNIT.equals(e.unit())).findFirst().orElseThrow();
+        assertEquals("1.5", usdcx.adaText(), "priced as usual");
+        assertEquals("$1", usdcx.usdText());
+        assertNull(prices.usdUnavailableReason());
+    }
+
+    /**
      * ⛔ FAB-145 T2: paging does not affect the book. Thirty loans, twenty-eight on COLLATERAL_TOKEN; filtered
      * to it and rendered at page 2 (three rows), the book still holds all twenty-eight.
      */
@@ -475,7 +694,7 @@ class LiquidationReadinessControllerTest {
                 PoolUsability.noPool(),
                 null, null, null, null,
                 AnticipateAndSell.unknown("no pool"), null,
-                ActionNow.of(false, null, null, null, true, false, null), ProcessingBlocker.NONE,
+                ActionNow.of(false, null, null, null, true, PoolUsability.Verdict.NO_POOL, null), ProcessingBlocker.NONE,
                 null, null);
 
         assertNull(r.healthFactor());
@@ -500,8 +719,9 @@ class LiquidationReadinessControllerTest {
             new AssetType("dd".repeat(28), "5553444d4f5241434c45");
 
     /** A stand-in whose {@code findEntry} answers from a fixed map — {@code findEntry} is public, so
-     * this is overridable across packages without touching {@code FluidOracleClient} at all. */
-    private static final class FakeOracleClient extends FluidOracleClient {
+     * this is overridable across packages without touching {@code FluidOracleClient} at all. Not final:
+     * the FAB-182 strip tests override {@code entries()} on it. */
+    private static class FakeOracleClient extends FluidOracleClient {
 
         private final java.util.Map<AssetType, OracleEntry> byToken;
 
@@ -1906,10 +2126,12 @@ class LiquidationReadinessControllerTest {
 
     /**
      * FAB-126 slice 2 r2 (V3): a pair with NO pool is a pool verdict, and fronting the principal is the
-     * operator's switch to flip -- so this, and only the pool verdicts, carry the ANTICIPATE remedy.
+     * operator's switch to flip -- so only the pool verdicts carry a remedy: NO_POOL and TOO_THIN the
+     * CONVERT_BEFORE_ANTICIPATE one (that action falls back to pay-in-advance on exactly these), WRONG_PAIR
+     * and CANNOT_QUOTE the ANTICIPATE one (CONVERT_BEFORE_ANTICIPATE never falls back on them).
      */
     @Test
-    void aConvertMarketWithNoPoolForThePairAdvisesAnticipateWithACap() {
+    void aConvertMarketWithNoPoolForThePairAdvisesConvertBeforeAnticipateWithACap() {
         LiquidationReadinessController.Row row = renderTokenConvertRow(liveConfiguration(),
                 new FakeOracleClient(), PoolIndex.of().resolver());
 
@@ -1917,7 +2139,7 @@ class LiquidationReadinessControllerTest {
                 "fixture premise: " + row.poolUsability());
         assertEquals("CONVERT", row.route(), row.routeDetail());
         assertTrue(row.routeDetail().contains("convert route will refuse"), row.routeDetail());
-        assertTrue(row.routeDetail().contains("action: ANTICIPATE with a cap"), row.routeDetail());
+        assertTrue(row.routeDetail().contains("action: CONVERT_BEFORE_ANTICIPATE with a cap"), row.routeDetail());
         assertTrue(row.routeDetail().contains("fronts no capital"), row.routeDetail());
         assertFalse(row.routeDetail().contains("must be fronted"), row.routeDetail());
     }
@@ -1977,6 +2199,301 @@ class LiquidationReadinessControllerTest {
         assertEquals("CAPITAL IN ADVANCE", row.route(), row.routeDetail());
         assertTrue(row.routeDetail().contains("action: ANTICIPATE"), row.routeDetail());
         assertTrue(row.routeDetail().contains("fronts the principal"), row.routeDetail());
+    }
+
+    // ---- FAB-194-4: a CONVERT_BEFORE_ANTICIPATE row takes the route the pool verdict gives it ---------------
+
+    /** Deep, and two ada per collateral unit: USABLE for the render loan (see the CONVERT usable-pool test). */
+    private static MinswapPoolDatum deepRenderPool() {
+        return new MinswapPoolDatum(AssetType.ada(), COLLATERAL_TOKEN, BigInteger.TEN,
+                new BigInteger("20000000000000"), new BigInteger("10000000000000"),
+                BigInteger.valueOf(30L), BigInteger.valueOf(30L), false);
+    }
+
+    /** 1:1: what reaches the pool after the liquidation fee is less than the debt, so TOO_THIN. */
+    private static MinswapPoolDatum thinRenderPool() {
+        return new MinswapPoolDatum(AssetType.ada(), COLLATERAL_TOKEN, BigInteger.TEN,
+                new BigInteger("10000000000000"), new BigInteger("10000000000000"),
+                BigInteger.valueOf(30L), BigInteger.valueOf(30L), false);
+    }
+
+    /** The deep pool with a dynamic fee: CANNOT_QUOTE, a refusal that is never paid in advance. */
+    private static MinswapPoolDatum dynamicFeeRenderPool() {
+        return new MinswapPoolDatum(AssetType.ada(), COLLATERAL_TOKEN, BigInteger.TEN,
+                new BigInteger("20000000000000"), new BigInteger("10000000000000"),
+                BigInteger.valueOf(30L), BigInteger.valueOf(30L), true);
+    }
+
+    /**
+     * A resolver whose snapshot hands back a pool for ANOTHER pair, so the row's verdict is WRONG_PAIR.
+     * The real snapshot keys pools by the LP unit recomputed from their own datum, so an authentic index
+     * cannot produce this; it is mocked to reach the controller's mapping of the verdict, which is what
+     * is under test here.
+     */
+    private static MinswapPoolResolver wrongPairResolver() {
+        var otherPair = new MinswapPoolDatum(AssetType.ada(), FLDT, BigInteger.TEN,
+                new BigInteger("20000000000000"), new BigInteger("10000000000000"),
+                BigInteger.valueOf(30L), BigInteger.valueOf(30L), false);
+        var snapshot = org.mockito.Mockito.mock(MinswapPoolResolver.Snapshot.class);
+        org.mockito.Mockito.when(snapshot.resolveEitherOrder(org.mockito.ArgumentMatchers.any(),
+                        org.mockito.ArgumentMatchers.any()))
+                .thenReturn(Optional.of(new MinswapPoolResolver.ResolvedPool(null, otherPair, "fixture")));
+        var resolver = org.mockito.Mockito.mock(MinswapPoolResolver.class);
+        org.mockito.Mockito.when(resolver.snapshot()).thenReturn(snapshot);
+        return resolver;
+    }
+
+    private static AppConfig.LiquidationConfiguration convertBeforeAnticipateConfiguration() {
+        var market = anticipateMarket("lovelace", 1_000_000_000L);
+        market.setAction(AppConfig.LiquidationConfiguration.Action.CONVERT_BEFORE_ANTICIPATE);
+        var configuration = liveConfiguration();
+        configuration.setMarkets(List.of(market));
+        return configuration;
+    }
+
+    private static LiquidationReadinessController.Row renderTokenConvertRow(
+            AppConfig.LiquidationConfiguration configuration, MinswapPoolResolver resolver, boolean convertEnabled) {
+        return renderLiquidatable(
+                LoanFixtures.convertToPrincipalBondDatum(BigInteger.valueOf(50),
+                        LoanFixtures.noStakeCredential(), AssetType.ada()),
+                LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT), configuration, null,
+                new com.fluidtokens.aquarium.offchain.service.LendingConfigGate(), true,
+                pricedCollateralOracle(), resolver, AssetType.ada(), AssetType.ada(), null, null,
+                convertEnabled).row();
+    }
+
+    /** The ANTICIPATE version of the same loan's advance: what every capital row of this loan must show. */
+    private static BigInteger anticipateAdvanceOfTheRenderLoan() {
+        var configuration = liveConfiguration();
+        configuration.setMarkets(List.of(anticipateMarket("lovelace", 1_000_000_000L)));
+        BigInteger advance = renderTokenConvertRow(configuration, PoolIndex.of().resolver(), true)
+                .advancePrincipalAmount();
+        assertNotNull(advance, "fixture premise: the render loan must be priced");
+        return advance;
+    }
+
+    /** Every detail a CONVERT_BEFORE_ANTICIPATE row shows names it, and none claims the ANTICIPATE setting. */
+    private static void assertNamesConvertBeforeAnticipate(LiquidationReadinessController.Row row) {
+        for (String detail : List.of(row.routeDetail(), row.actionNow().detail())) {
+            assertTrue(detail.contains("CONVERT_BEFORE_ANTICIPATE"), detail);
+            assertFalse(detail.contains("configured action: ANTICIPATE"), detail);
+        }
+        assertTrue(row.actionNow().detail().endsWith(ActionNow.ESTIMATE_NOTE), row.actionNow().detail());
+    }
+
+    @Test
+    void aConvertBeforeAnticipateRowWithNoPoolPaysInAdvance() {
+        LiquidationReadinessController.Row row = renderTokenConvertRow(convertBeforeAnticipateConfiguration(),
+                PoolIndex.of().resolver(), true);
+
+        assertEquals(PoolUsability.Verdict.NO_POOL, row.poolUsability().verdict(), "fixture premise: " + row.poolUsability());
+        assertEquals("CAPITAL IN ADVANCE", row.route(), row.routeDetail());
+        assertTrue(row.routeDetail().contains("NO_POOL"), row.routeDetail());
+        assertEquals(anticipateAdvanceOfTheRenderLoan(), row.advancePrincipalAmount());
+        assertEquals("ADVANCE", row.actionNow().text(), row.actionNow().toString());
+        assertTrue(row.actionNow().wouldAct(), row.actionNow().toString());
+        assertNamesConvertBeforeAnticipate(row);
+    }
+
+    @Test
+    void aConvertBeforeAnticipateRowWithAThinPoolPaysInAdvance() {
+        LiquidationReadinessController.Row row = renderTokenConvertRow(convertBeforeAnticipateConfiguration(),
+                PoolIndex.of(thinRenderPool()).resolver(), true);
+
+        assertEquals(PoolUsability.Verdict.TOO_THIN, row.poolUsability().verdict(), "fixture premise: " + row.poolUsability());
+        assertEquals("CAPITAL IN ADVANCE", row.route(), row.routeDetail());
+        assertTrue(row.routeDetail().contains("TOO_THIN"), row.routeDetail());
+        assertEquals(anticipateAdvanceOfTheRenderLoan(), row.advancePrincipalAmount());
+        assertEquals("ADVANCE", row.actionNow().text(), row.actionNow().toString());
+        assertNamesConvertBeforeAnticipate(row);
+    }
+
+    @Test
+    void aConvertBeforeAnticipateRowWithADeepPoolConvertsAndComputesNoAdvance() {
+        LiquidationReadinessController.Row row = renderTokenConvertRow(convertBeforeAnticipateConfiguration(),
+                PoolIndex.of(deepRenderPool()).resolver(), true);
+
+        assertEquals(PoolUsability.Verdict.USABLE, row.poolUsability().verdict(), "fixture premise: " + row.poolUsability());
+        assertEquals("CONVERT", row.route(), row.routeDetail());
+        assertTrue(row.routeDetail().contains("USABLE"), row.routeDetail());
+        assertNull(row.advancePrincipalAmount(), "a usable pool converts, so no advance is computed");
+        assertEquals("CONVERT", row.actionNow().text(), row.actionNow().toString());
+        assertTrue(row.actionNow().wouldAct(), row.actionNow().toString());
+        assertFalse(row.blocker().blocked(), row.blocker().toString());
+        assertNamesConvertBeforeAnticipate(row);
+    }
+
+    /** ⛔ D15: a lookup that failed is not "no pool", so it is neither ADVANCE nor a capital need. */
+    @Test
+    void aConvertBeforeAnticipateRowWhosePoolCheckFailedIsUnknownNeverAdvance() {
+        LiquidationReadinessController.Row row = renderTokenConvertRow(convertBeforeAnticipateConfiguration(),
+                PoolIndex.failing().resolver(), true);
+
+        assertEquals(PoolUsability.Verdict.CHECK_FAILED, row.poolUsability().verdict(), "fixture premise: " + row.poolUsability());
+        assertEquals("UNKNOWN", row.route(), row.routeDetail());
+        assertTrue(row.routeDetail().contains("CHECK_FAILED"), row.routeDetail());
+        assertEquals(anticipateAdvanceOfTheRenderLoan(), row.advancePrincipalAmount());
+        assertEquals("UNKNOWN", row.actionNow().text(), row.actionNow().toString());
+        assertFalse(row.actionNow().wouldAct(), row.actionNow().toString());
+        assertEquals("unknown", row.blocker().label(), row.blocker().toString());
+        assertNamesConvertBeforeAnticipate(row);
+    }
+
+    /** ⛔ D15: a pool the convert route refuses by name is never a reason to front capital. */
+    @Test
+    void aConvertBeforeAnticipateRowWhosePoolCannotBeQuotedIsRefusedNotPaidInAdvance() {
+        LiquidationReadinessController.Row row = renderTokenConvertRow(convertBeforeAnticipateConfiguration(),
+                PoolIndex.of(dynamicFeeRenderPool()).resolver(), true);
+
+        assertEquals(PoolUsability.Verdict.CANNOT_QUOTE, row.poolUsability().verdict(), "fixture premise: " + row.poolUsability());
+        assertEquals("CONVERT", row.route(), row.routeDetail());
+        assertTrue(row.routeDetail().contains("CANNOT_QUOTE"), row.routeDetail());
+        assertTrue(row.routeDetail().contains("not a reason to pay in advance"), row.routeDetail());
+        assertEquals(anticipateAdvanceOfTheRenderLoan(), row.advancePrincipalAmount());
+        assertEquals("NONE — pool", row.actionNow().text(), row.actionNow().toString());
+        assertFalse(row.actionNow().wouldAct(), row.actionNow().toString());
+        assertEquals("no pool", row.blocker().label(), row.blocker().toString());
+        assertNamesConvertBeforeAnticipate(row);
+    }
+
+    /**
+     * ⛔ D15, FAB-194-4 r2: a pool for the wrong pair shares CANNOT_QUOTE's label and is refused the same
+     * way — the convert route will not take it and CONVERT_BEFORE_ANTICIPATE does not fall back on it.
+     */
+    @Test
+    void aConvertBeforeAnticipateRowWhosePoolIsTheWrongPairIsRefusedNotPaidInAdvance() {
+        LiquidationReadinessController.Row row = renderTokenConvertRow(convertBeforeAnticipateConfiguration(),
+                wrongPairResolver(), true);
+
+        assertEquals(PoolUsability.Verdict.WRONG_PAIR, row.poolUsability().verdict(), "fixture premise: " + row.poolUsability());
+        assertEquals("CONVERT", row.route(), row.routeDetail());
+        assertTrue(row.routeDetail().contains("WRONG_PAIR"), row.routeDetail());
+        assertTrue(row.routeDetail().contains("not a reason to pay in advance"), row.routeDetail());
+        assertFalse(row.routeDetail().contains("pays in advance instead"), row.routeDetail());
+        assertFalse(row.routeDetail().contains("fallback"), row.routeDetail());
+        assertEquals(anticipateAdvanceOfTheRenderLoan(), row.advancePrincipalAmount());
+        assertEquals("NONE — pool", row.actionNow().text(), row.actionNow().toString());
+        assertFalse(row.actionNow().wouldAct(), row.actionNow().toString());
+        assertFalse(row.actionNow().text().contains("ADVANCE"), row.actionNow().toString());
+        assertEquals("no pool", row.blocker().label(), row.blocker().toString());
+        assertNamesConvertBeforeAnticipate(row);
+    }
+
+    @Test
+    void aConvertBeforeAnticipateRowWithConvertOffPaysInAdvanceWhateverThePool() {
+        LiquidationReadinessController.Row row = renderTokenConvertRow(convertBeforeAnticipateConfiguration(),
+                PoolIndex.of(deepRenderPool()).resolver(), false);
+
+        assertEquals(PoolUsability.Verdict.USABLE, row.poolUsability().verdict(), "fixture premise: " + row.poolUsability());
+        assertEquals("CAPITAL IN ADVANCE", row.route(), row.routeDetail());
+        assertTrue(row.routeDetail().contains("convert is disabled"), row.routeDetail());
+        assertEquals(anticipateAdvanceOfTheRenderLoan(), row.advancePrincipalAmount());
+        assertEquals("ADVANCE", row.actionNow().text(), row.actionNow().toString());
+        assertTrue(row.actionNow().detail().contains("convert is disabled"), row.actionNow().detail());
+        assertNamesConvertBeforeAnticipate(row);
+    }
+
+    /**
+     * The same pools on a CONVERT market, plus a wrong-pair pool: the route and its detail are exactly what
+     * they were before FAB-194-4 (only the advice texts changed), pinned in full rather than by fragment.
+     */
+    @Test
+    void theSameRowsOnAConvertMarketRenderTheirConvertRouteDetailsUnchanged() {
+        String noCapital = "; the bot fronts no capital on a CONVERT market";
+
+        LiquidationReadinessController.Row deep = renderTokenConvertRow(liveConfiguration(),
+                PoolIndex.of(deepRenderPool()).resolver(), true);
+        assertEquals("CONVERT", deep.route());
+        assertEquals("a Minswap pool is deep enough to clear this loan's debt, so the bot creates a swap "
+                + "order and fronts no capital", deep.routeDetail());
+        assertNull(deep.advancePrincipalAmount());
+
+        // ⛔ r2: each verdict pinned to its OWN advice. The executor falls back on NO_POOL and TOO_THIN
+        // only, so only they may advise CONVERT_BEFORE_ANTICIPATE; WRONG_PAIR and CANNOT_QUOTE would be
+        // refused by that market too, so their only capital remedy is ANTICIPATE.
+        Map<PoolUsability.Verdict, MinswapPoolResolver> pools = new java.util.EnumMap<>(PoolUsability.Verdict.class);
+        pools.put(PoolUsability.Verdict.NO_POOL, PoolIndex.of().resolver());
+        pools.put(PoolUsability.Verdict.TOO_THIN, PoolIndex.of(thinRenderPool()).resolver());
+        pools.put(PoolUsability.Verdict.CANNOT_QUOTE, PoolIndex.of(dynamicFeeRenderPool()).resolver());
+        pools.put(PoolUsability.Verdict.WRONG_PAIR, wrongPairResolver());
+        Map<PoolUsability.Verdict, String> advice = new java.util.EnumMap<>(PoolUsability.Verdict.class);
+        advice.put(PoolUsability.Verdict.NO_POOL,
+                " — to front the principal instead, set this market to action: CONVERT_BEFORE_ANTICIPATE with a cap");
+        advice.put(PoolUsability.Verdict.TOO_THIN,
+                " — to front the principal instead, set this market to action: CONVERT_BEFORE_ANTICIPATE with a cap");
+        advice.put(PoolUsability.Verdict.CANNOT_QUOTE,
+                " — to front the principal instead, set this market to action: ANTICIPATE with a cap");
+        advice.put(PoolUsability.Verdict.WRONG_PAIR,
+                " — to front the principal instead, set this market to action: ANTICIPATE with a cap");
+
+        for (var entry : pools.entrySet()) {
+            PoolUsability.Verdict verdict = entry.getKey();
+            LiquidationReadinessController.Row row = renderTokenConvertRow(liveConfiguration(), entry.getValue(), true);
+            assertEquals(verdict, row.poolUsability().verdict(), "fixture premise: " + row.poolUsability());
+            assertEquals("CONVERT", row.route(), row.routeDetail());
+            assertEquals("the pool cannot fill this loan's swap, so the convert route will refuse it: "
+                    + row.poolUsability().detail() + noCapital + advice.get(verdict), row.routeDetail());
+            assertNotNull(row.advancePrincipalAmount(), row.routeDetail());
+            if (verdict == PoolUsability.Verdict.WRONG_PAIR || verdict == PoolUsability.Verdict.CANNOT_QUOTE) {
+                assertFalse(row.routeDetail().contains("CONVERT_BEFORE_ANTICIPATE"),
+                        verdict + " is never a fallback, so it must not advise the fallback action: "
+                                + row.routeDetail());
+            }
+        }
+
+        LiquidationReadinessController.Row failed = renderTokenConvertRow(liveConfiguration(),
+                PoolIndex.failing().resolver(), true);
+        assertEquals("CONVERT", failed.route());
+        assertEquals("the pool check could not complete, which is NOT evidence that no pool exists; the bot "
+                + "checks again next cycle: " + failed.poolUsability().detail() + noCapital, failed.routeDetail());
+
+        LiquidationReadinessController.Row off = renderTokenConvertRow(liveConfiguration(),
+                PoolIndex.of(deepRenderPool()).resolver(), false);
+        assertEquals("CONVERT", off.route());
+        assertEquals(deep.routeDetail(), off.routeDetail(), "convert off does not change a CONVERT market's route");
+        assertEquals("NONE — convert off", off.actionNow().text(), off.actionNow().toString());
+    }
+
+    /**
+     * ⛔ P-G4: the row's action and blocker must read the verdict of THIS row's pool. A CONVERT row over a
+     * thin pool is not usable, so it must not say it would convert, nor read clean.
+     */
+    @Test
+    void aConvertMarketRowOverAThinPoolReadsNotUsableInTheActionAndTheBlocker() {
+        LiquidationReadinessController.Row row = renderTokenConvertRow(liveConfiguration(),
+                PoolIndex.of(thinRenderPool()).resolver(), true);
+
+        assertEquals(PoolUsability.Verdict.TOO_THIN, row.poolUsability().verdict(), "fixture premise: " + row.poolUsability());
+        assertEquals("NONE — pool", row.actionNow().text(), row.actionNow().toString());
+        assertFalse(row.actionNow().wouldAct(), row.actionNow().toString());
+        assertEquals("no pool", row.blocker().label(), row.blocker().toString());
+        assertEquals(row.poolUsability().detail(), row.blocker().detail());
+    }
+
+    /** The NOT_CONFIGURED advice names the action that falls back, not the one that always fronts capital. */
+    @Test
+    void aNodeThatCannotConvertAdvisesConvertBeforeAnticipateWithACap() {
+        LiquidationReadinessController.Row row = renderTokenConvertRow(liveConfiguration(),
+                new FakeOracleClient(), null);
+
+        assertEquals(PoolUsability.Verdict.NOT_CONFIGURED, row.poolUsability().verdict(),
+                "fixture premise: " + row.poolUsability());
+        assertTrue(row.routeDetail().endsWith(" — configure loans.minswap.*, or set this market to action: "
+                + "CONVERT_BEFORE_ANTICIPATE with a cap"), row.routeDetail());
+    }
+
+    /** A CONVERT_BEFORE_ANTICIPATE row on a node that cannot convert pays in advance, naming NOT_CONFIGURED. */
+    @Test
+    void aConvertBeforeAnticipateRowOnANodeThatCannotConvertPaysInAdvance() {
+        LiquidationReadinessController.Row row = renderTokenConvertRow(convertBeforeAnticipateConfiguration(),
+                null, true);
+
+        assertEquals(PoolUsability.Verdict.NOT_CONFIGURED, row.poolUsability().verdict(),
+                "fixture premise: " + row.poolUsability());
+        assertEquals("CAPITAL IN ADVANCE", row.route(), row.routeDetail());
+        assertTrue(row.routeDetail().contains("NOT_CONFIGURED"), row.routeDetail());
+        assertEquals("ADVANCE", row.actionNow().text(), row.actionNow().toString());
+        assertNamesConvertBeforeAnticipate(row);
     }
 
     /**
@@ -2212,6 +2729,26 @@ class LiquidationReadinessControllerTest {
             AssetType principalOracleAsset,
             com.fluidtokens.aquarium.offchain.service.AppUtxoService walletUtxos,
             com.bloxbean.cardano.client.api.ProtocolParamsSupplier protocolParamsSupplier) {
+        return renderLiquidatable(bondDatumOrNull, collateral, configuration, assessmentFactory,
+                lendingConfigGate, liquidatable, oracleClient, poolResolverOrNull, principal,
+                principalOracleAsset, walletUtxos, protocolParamsSupplier, true);
+    }
+
+    /** FAB-194-4: as above, with {@code loans.liquidation.convert.enabled} as given. */
+    private static Rendered renderLiquidatable(
+            com.fluidtokens.aquarium.offchain.model.loans.LenderManagerDatum bondDatumOrNull,
+            com.fluidtokens.aquarium.offchain.model.loans.CollateralAsset collateral,
+            AppConfig.LiquidationConfiguration configuration,
+            AssessmentFactory assessmentFactory,
+            com.fluidtokens.aquarium.offchain.service.LendingConfigGate lendingConfigGate,
+            Boolean liquidatable,
+            FluidOracleClient oracleClient,
+            MinswapPoolResolver poolResolverOrNull,
+            AssetType principal,
+            AssetType principalOracleAsset,
+            com.fluidtokens.aquarium.offchain.service.AppUtxoService walletUtxos,
+            com.bloxbean.cardano.client.api.ProtocolParamsSupplier protocolParamsSupplier,
+            boolean convertEnabled) {
         LoanDatum datum = LoanFixtures.loanDatum(principal, principalOracleAsset, BigInteger.valueOf(100_000_000L),
                 BigInteger.ZERO, collateral, 0L, LoanFixtures.liquidation(),
                 new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
@@ -2256,6 +2793,7 @@ class LiquidationReadinessControllerTest {
                 provide(walletUtxos), configuration, network);
         controller.setLendingConfigGate(lendingConfigGate);
         controller.setProtocolParamsSupplier(protocolParamsSupplier);
+        org.springframework.test.util.ReflectionTestUtils.setField(controller, "convertEnabled", convertEnabled);
         var model = new org.springframework.ui.ConcurrentModel();
         controller.readiness(model, null, null, null, null, null);
         @SuppressWarnings("unchecked")
@@ -2874,19 +3412,16 @@ class LiquidationReadinessControllerTest {
                         new LiquidationReadinessController.RebalanceView(true, false, "IDLE",
                                 "the liquidation mode is not set; rebalancing runs only in shadow or live",
                                 true, false)),
-                new Case(activity(true, false, AppConfig.LiquidationConfiguration.Mode.SHADOW,
-                        com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.NO_ANTICIPATE_MARKET),
-                        new LiquidationReadinessController.RebalanceView(true, false, "IDLE",
-                                "no action: ANTICIPATE market has an effective mode of shadow or live, so there "
-                                        + "is no token to keep ready", true, false)),
                 new Case(activity(true, false, AppConfig.LiquidationConfiguration.Mode.LIVE,
                         com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.SYNCING),
                         new LiquidationReadinessController.RebalanceView(true, false, "IDLE",
                                 "the node is syncing; rebalancing starts once it has caught up", true, false)),
                 new Case(activity(true, false, AppConfig.LiquidationConfiguration.Mode.SHADOW, null),
                         new LiquidationReadinessController.RebalanceView(true, false, "ARMED",
-                                "after each block, if the wallet has drifted out of shape, the node signs and "
-                                        + "submits one self-send of its whole wallet, in shadow as well as live",
+                                "on each pass — after a committed block or an oracle price change — in which "
+                                        + "no liquidation or compound went out, if the wallet has drifted out of "
+                                        + "shape, the node signs and submits one self-send of its whole wallet, in "
+                                        + "shadow as well as live",
                                 true, false)));
 
         for (Case c : cases) {
@@ -2900,6 +3435,41 @@ class LiquidationReadinessControllerTest {
             assertEquals(c.activity().armed(), status.notes().contains(ARMED_NOTE),
                     "the banner's ARMED note must follow armed() exactly: " + c.activity() + " " + status.notes());
         }
+    }
+
+    /**
+     * A REAL rebalancer on a synced SHADOW node whose only markets are {@code action: CONVERT} (FAB-188: the markets
+     * no longer arm it, so this is armed). Its engine and wallet are never touched by {@code activity()}.
+     */
+    static com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer convertOnlyRebalancer() {
+        var configuration = new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                60, 120, 30, BigInteger.ZERO, 200);
+        var convert = new AppConfig.LiquidationConfiguration.Market();
+        convert.setUnit("ee".repeat(28) + "4e49474854");
+        convert.setAction(AppConfig.LiquidationConfiguration.Action.CONVERT);
+        configuration.setMarkets(new java.util.ArrayList<>(List.of(convert)));
+        var listener = new com.fluidtokens.aquarium.offchain.service.BlockEventListener(LoanFixtures.converters());
+        listener.getIsSyncing().set(false);
+        var engine = new com.fluidtokens.aquarium.offchain.service.wallet.WalletShapeTransactions(
+                new com.bloxbean.cardano.client.account.Account(Networks.testnet()), LoanFixtures.protocolParams(),
+                bytes -> com.bloxbean.cardano.client.api.model.Result.error("not in this test"));
+        return new com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer(engine,
+                org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.service.AppUtxoService.class), listener,
+                configuration, true);
+    }
+
+    /** FAB-188: a configuration with only CONVERT markets reaches the page as ARMED, banner note included. */
+    @Test
+    void anOnlyConvertConfigurationRendersArmed() {
+        var controller = bareController();
+        controller.setWalletRebalancer(convertOnlyRebalancer());
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, null, null);
+
+        var view = (LiquidationReadinessController.RebalanceView) model.getAttribute("rebalance");
+        assertEquals("ARMED", view.state(), String.valueOf(view));
+        assertTrue(((OperationalStatus) model.getAttribute("status")).notes().contains(ARMED_NOTE),
+                "the banner's ARMED note follows the armed rebalancer");
     }
 
     /** A direct construction holds no rebalancer: no line on the page, and the banner is not armed. */

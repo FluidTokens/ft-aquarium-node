@@ -17,13 +17,16 @@ error.
 | A setting in `.env` | restart | untouched |
 | You added a **market**, margin, or mode | restart | untouched |
 | You enabled the **UI** | restart | untouched |
+| Upgrading to the release that reads **oracle liveness from the index** (FAB-196) | pull, restart — nothing else required; a re-sync with the §1.1 steps is optional ([§7](#oracle-liveness-is-read-from-the-index-first-fab-196)) | untouched, unless you choose to re-sync |
+| Upgrading to the release that adds **`CONVERT_BEFORE_ANTICIPATE`** and keeps **U in the check** (FAB-194) | pull, restart — nothing else required; it changes how every `shadow` or `live` node funds liquidations from U ([§7](#u-stays-in-the-check-convert_before_anticipate-fab-194)) | untouched |
 | **FluidTokens redeployed the contracts** (new config NFTs) | §4 — new coordinates **and a full re-sync** | ⛔ **wiped** |
 | FluidTokens replaced **action scripts in place** (same config NFTs — e.g. 2026-10-01, 2026-10-23/26) | §4.8, §4.9 — new image, restart | untouched |
 | You changed `sync-start-*` | §3 — on an existing database this **does nothing** by itself | ⛔ **wiped, or no effect** |
 | Upgrading to the release that **indexes the Minswap V2 pools** (FAB-137) | §1.1 — wipe **including the cursor**, re-sync from `sync-start` | ⛔ **wiped** |
+| Upgrading to the release on **Yaci Store 2.0.7** (FAB-203) | §1.3 — wipe **including the cursor**, re-sync from `sync-start` | ⛔ **wiped** |
 | You changed `WALLET_ACCOUNT_INDEX` | §9 — restart, then re-sync **or** one self-send | ⛔ **wiped, or a self-send** |
 
-The first four are ordinary. The others are the subject of this guide (§4, §4.8, §4.9, §3, §1.1, §9).
+The first six are ordinary. The others are the subject of this guide (§4, §4.8, §4.9, §3, §1.1, §1.3, §9).
 
 ### 1.1 ⛔ The Minswap pool release requires a database wipe (FAB-137)
 
@@ -50,6 +53,67 @@ The same release turns on Yaci's UTxO pruning (`store.utxo.pruning-enabled: true
 `store.utxo.pruning-interval: 600`): every 10 minutes it deletes rows for outputs spent more than
 2160 blocks ago. Unspent outputs are never pruned. Nothing for you to set.
 
+### 1.2 The readiness page's USD now goes through USDCx, not USDM (FAB-182)
+
+The default of `LOANS_UI_USD_REFERENCE_UNIT` moved from USDM to **USDCx**
+(`1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e345553444378`). It is the page's one ADA/USD
+rate — the summary's USD figure and the new prices strip — so after upgrading, the USD figures you see
+are priced through USDCx and the page says so by name. Display only: nothing the bot decides reads it,
+and the database is untouched. To keep USDM, set
+`LOANS_UI_USD_REFERENCE_UNIT=c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad0014df105553444d`
+and restart.
+
+### 1.3 ⛔ The Yaci Store 2.0.7 release requires a database wipe (FAB-203)
+
+**Upgrading to this release requires wiping the database, INCLUDING the cursor, then re-syncing from
+`sync-start`.** This is not optional and there is no partial route.
+
+This release moves the library the node indexes with, Yaci Store, from 0.1.7 to 2.0.7, and Yaci Store
+2.0.7 edited one of its own schema migrations (version 0.200.1) in place. The schema history a 0.1.7
+node wrote no longer matches the migrations this image carries, so **the node refuses to start over an
+existing database, before applying anything** — nothing in the database is changed. Compose runs the
+node with `restart: on-failure`, so it is restarted straight into the same refusal, again and again.
+The log shows a `FlywayValidateException` from `flywayInitializer`, reading:
+
+```
+Validate failed: Migrations have failed validation
+Migration checksum mismatch for migration version 0.200.1
+-> Applied to database : <number>
+-> Resolved locally    : <number>
+Either revert the changes to the migration, or run repair to update the schema history.
+Need more flexibility with validation rules? Learn more: https://rd.gt/3AbJUZE
+```
+
+On PostgreSQL, as Compose runs it, the two numbers are expected to read `972844675` (applied) and
+`-603161577` (resolved locally), but they can differ on your database. **Match on the line
+`Migration checksum mismatch for migration version 0.200.1`, not on the numbers.**
+
+Do it with the same steps as a redeploy, without changing any coordinates:
+[§4.2 stop the node](#42-stop-the-node-leave-the-database-up) →
+[§4.3 back up if you want to](#43-back-up-if-you-want-to-be-able-to-go-back) →
+[§4.4 wipe](#44-wipe) (deleting the database deletes its schema history and the cursor with it; a
+partial wipe that keeps the schema history is refused just the same, and one that keeps the cursor
+re-indexes nothing — §3) → **pin this release's version in `.env`**
+(`AQUARIUM_DOCKER_IMAGE_VERSION`, as in [§2](#2-the-ordinary-upgrade)) →
+[§4.6 start and let it catch up](#46-start-and-let-it-catch-up).
+**Pin before you start:** none of the §4 steps pins the image, so a node started before the pin
+re-syncs on the image you were already running, still on Yaci 0.1.7, and this release then refuses
+that database too — a second wipe and a second full re-sync.
+**Keep the shipped `sync-start-*` values** (skip §4.5): starting later would hide the pools, the
+contracts and the wallet history the node needs. A §4.3 dump is only of use to go back to an older
+image ([§5](#5-rolling-back)).
+
+**⛔ Do not run `flyway repair`, even though the message suggests it — wipe instead.** Repair makes
+the stored checksum match; it changes no table. The tables stay Yaci 0.1.7's, without the
+`address.slot` column and the `ptr_address` table that 2.0.7 expects. On every boot over a stored
+cursor, Yaci 2.0.7 first publishes a rollback to that cursor, to clean out anything written after it,
+and that rollback deletes rows from `address` by `slot` — a column a repaired database does not have.
+You trade a clear refusal for a second, more confusing failure at every boot, and the same restart
+loop. (This is read from Yaci 2.0.7's code, not run.)
+
+The wipe also drops the node's token-metadata cache (tickers, names and decimals); it refills by itself
+from the token registry.
+
 ---
 
 ## 2. The ordinary upgrade
@@ -59,7 +123,7 @@ cd docker
 # pin the new version in .env, e.g. AQUARIUM_DOCKER_IMAGE_VERSION=2026.09.22-413f16cb32fb
 docker compose pull
 docker compose up -d
-docker compose logs -f aquarium
+docker compose logs -f aquarium-node
 ```
 
 Check afterwards:
@@ -217,7 +281,7 @@ route back is another wipe and another sync.
 
 ```bash
 docker compose up -d
-docker compose logs -f aquarium
+docker compose logs -f aquarium-node
 ```
 
 Wait for the tip (deploying.md §6). **Do not arm anything yet.**
@@ -415,13 +479,21 @@ LMConfigDatum[3]`, the node is not running this release: compare `/actuator/info
 
 ## 5. Rolling back
 
-**The image rolls back cleanly:** pin the previous version and restart.
+**Within one Yaci Store version, the image rolls back cleanly:** pin the previous version and
+restart.
+
+**⛔ Not across the Yaci Store 2.0.7 release (FAB-203).** Rolling back from that release to an older
+image needs another wipe and re-sync: the older image's Flyway refuses this release's schema the same
+way this release refuses the older one ([§1.3](#13--the-yaci-store-207-release-requires-a-database-wipe-fab-203)),
+and Compose restarts it into the same refusal. Use the §1.3 steps, with the older image pinned — or,
+instead of re-syncing, restore the §4.3 dump you took before upgrading.
 
 **The database does not roll back with it.** If you re-synced from a later start point, the old
 coordinates' history is not there any more, and going back to the old image means going back to an
 empty world. That is what the §4.3 dump is for.
 
-**⇒ The practical rule: an image rollback is cheap; a re-sync is not reversible without a backup.**
+**⇒ The practical rule: within one Yaci Store version an image rollback is cheap; across the Yaci Store
+2.0.7 release it costs a wipe and a re-sync; and a re-sync is not reversible without a backup.**
 
 ---
 
@@ -446,7 +518,7 @@ database is an avoidable variable.
 
 ## 7. Keys that no longer exist
 
-If you are carrying a configuration forward from an older node, **remove these.** They are ignored
+If you are carrying a configuration forward from an older node, **remove these.** Most are ignored
 in silence, which reads exactly like them working.
 
 | removed key | why, and what happens if you still pass it |
@@ -456,6 +528,8 @@ in silence, which reads exactly like them working.
 | `LOANS_ENABLED` | lending-v4 indexing is unconditional now |
 | `AQUARIUM_X_SUBMIT` / `loans.submittable-network` | a barrier that silently blocked submission while everything else was armed is a bug, not a safeguard |
 | `SCHEDULING_TRANSACTION_PROCESSOR_OGMIOS_URL` | a diagnostic for the 2026-09-22 tank decode failure (FAB-149). Still set, it is ignored and the tank is evaluated through Blockfrost, as on every node that never set it — see §2 |
+| `AQUARIUM_LIQUIDATION_DELAY_SECONDS` / `loans.liquidation.delay-seconds` | removed by FAB-183: liquidation no longer runs on a timer (see [below](#liquidation-compound-and-rebalancing-run-on-blocks-and-prices-not-timers-fab-183)). Still set, it is ignored, and the node logs one WARN for it at boot |
+| `AQUARIUM_COMPOUND_DELAY_SECONDS` / `loans.compound.delay-seconds` | removed by FAB-183: compound no longer runs on a timer (see [below](#liquidation-compound-and-rebalancing-run-on-blocks-and-prices-not-timers-fab-183)). Still set, it is ignored, and the node logs one WARN for it at boot |
 
 **The general shape is worth keeping in mind beyond this list:** an unknown environment variable is
 not an error anywhere in this stack. It is read by nothing and reported by nothing. When a setting
@@ -486,20 +560,21 @@ many minutes old.
 
 **This is a different mechanism from the startup rebalance above, and it is continuous.** The removed
 one ran once at boot; this one watches the wallet on every block. `AQUARIUM_WALLET_REBALANCE_ENABLED`
-defaults to `true`, and it acts when the node is in `shadow` or `live` **and** at least one market is
-`action: ANTICIPATE` with an effective mode of shadow or live — see
-[deploying.md §9, "Wallet rebalancing"](deploying.md#wallet-rebalancing--the-shape-an-anticipate-market-keeps-your-wallet-in).
-A node in `disabled` mode, or with no such market, is unaffected.
+defaults to `true`, and it acts when the node is in `shadow` or `live`, whatever its markets
+([FAB-188, below](#every-shadow-or-live-node-now-keeps-its-wallet-shaped-fab-188)) — see
+[deploying.md §9, "Wallet rebalancing"](deploying.md#wallet-rebalancing--the-shape-a-shadow-or-live-node-keeps-your-wallet-in).
+A node in `disabled` mode is unaffected.
 
 **If your node meets that condition, expect a transaction right after upgrading.** On the first block
 once the node is synced, if the wallet is not already in the target shape, the node **signs and
 submits one self-send of its whole wallet — in `shadow` too** — and it does so again whenever the
 wallet drifts out of shape. Each one costs a transaction fee.
 
-- **Funds.** Shaping needs 10 ADA beside each `ANTICIPATE` token the wallet holds, 10 ADA beside the
-  bundle of any other tokens, and a 5 ADA collateral UTxO (under current protocol parameters),
-  plus the fee, **plus a change output that still holds its own minimum ada after paying that fee**
-  (about 1 ADA) — so one `ANTICIPATE` token needs about 16.2 ADA and an ada-only wallet about 6.2 ADA
+- **Funds.** Shaping needs 10 ADA beside the token of each `ANTICIPATE` or `CONVERT_BEFORE_ANTICIPATE`
+  market the wallet holds ([FAB-194, below](#u-stays-in-the-check-convert_before_anticipate-fab-194)),
+  10 ADA beside the bundle of any other tokens, and a 5 ADA collateral UTxO (under current protocol
+  parameters), plus the fee, **plus a change output that still holds its own minimum ada after paying
+  that fee** (about 1 ADA) — so one such token needs about 16.2 ADA and an ada-only wallet about 6.2 ADA
   (approximate: the figures move with the protocol parameters and the number of wallet UTxOs). A
   wallet with less is not touched: the node logs `[REBALANCE] REFUSED: …` at WARN on every block
   (an empty wallet: `[REBALANCE] NOTHING_TO_DO: no input UTxOs…`) and submits nothing, so a refusal
@@ -515,6 +590,310 @@ wallet drifts out of shape. Each one costs a transaction fee.
   suspension is held in memory: a restart resumes rebalancing.
 - **To opt out**, set `AQUARIUM_WALLET_REBALANCE_ENABLED=false` and restart. The readiness page
   cannot turn it back on.
+
+### Liquidation, compound and rebalancing run on blocks and prices, not timers (FAB-183)
+
+Older images ran liquidation and compound each on its own timer (`AQUARIUM_LIQUIDATION_DELAY_SECONDS`,
+`AQUARIUM_COMPOUND_DELAY_SECONDS`, both 60 s by default). **Those timers are gone**, and so are the two
+settings (the table above). The bot wallet now has one queue of work, a *pass*, and a pass runs:
+
+1. **Liquidation.** Every candidate is tried, most profitable first, in every market. A loan whose
+   submit is rejected, or whose outcome is unknown, is skipped and the next candidate is tried — see
+   [Fire and forget (FAB-186)](#fire-and-forget-fab-186) below, which replaced this release's original
+   rules (at most one liquidation per market per pass, and an unknown outcome ending the stage).
+2. **Compound.**
+3. **Housekeeping** — the wallet rebalance described above.
+
+**After a liquidation that Blockfrost accepted, compound and housekeeping wait for the next trigger.**
+The same rule holds between compound and housekeeping. A liquidation that was rejected, or whose outcome
+is unknown, does not hold them back (FAB-186). In `shadow` a liquidation the node *would* have submitted
+sent nothing, so it does **not** hold them back either.
+
+**What starts a pass**, with no timer anywhere:
+
+- a **committed block**, once the node is in sync (a node working through its initial sync starts none);
+- a change in the **merged oracle prices**.
+
+A pass already running is never joined by a second one; new triggers wait for it to finish.
+
+**The settings that govern this:**
+
+- `WALLET_COORDINATOR_PASS_TIMEOUT_SECONDS` (default `120`) — the pass deadline. It bounds every
+  Blockfrost call made during a pass.
+- `LOANS_ORACLE_SOURCE` — where the prices come from: `stream` (the default) merges the FluidTokens
+  oracle stream with the registry API; `api` is the emergency lever, API polling only.
+- `WALLET_PIPELINE_LOG_EVERY_PASS` (default `true`, FAB-195) — every pass ends with one INFO line:
+  `wallet pipeline pass #<n> at slot <slot> (<hash>), trigger <block|price|block+price>, <k> block(s) folded in, waited <s> s, took <s> s: liquidation <outcome>, compound <outcome>, housekeeping <outcome>; Blockfrost calls discovery <n>, evaluate <n>, submit <n>`.
+  *Folded in* counts the blocks a newer block replaced while they waited; *waited* runs from the first
+  trigger the pass serves to its start; each `<outcome>` is described in
+  [Stage outcomes on the pass line (FAB-195)](#stage-outcomes-on-the-pass-line-fab-195). `false` returns to
+  INFO only when a pass did something (the rule in that entry), DEBUG otherwise.
+
+**The Tank processor is unchanged:** it keeps its own timer, and none of the above applies to it.
+
+**Nothing is remembered between passes.** A transaction the node submitted and that is still pending
+may be built again on the next trigger; the ledger rejects the duplicate harmlessly, because the pending
+transaction already spends its inputs.
+
+### Every shadow or live node now keeps its wallet shaped (FAB-188)
+
+Older images rebalanced the wallet only when at least one market was `action: ANTICIPATE` with an
+effective mode of shadow or live. **That condition is gone.** Every node in `shadow` or `live` keeps its
+wallet shaped, whatever its markets — a node with only `CONVERT` markets, or none listed, included —
+because liquidation depends on a shaped wallet. See
+[deploying.md §9, "Wallet rebalancing"](deploying.md#wallet-rebalancing--the-shape-a-shadow-or-live-node-keeps-your-wallet-in).
+
+- **Expect one self-send right after upgrading** on a `shadow` or `live` node whose wallet is out of
+  shape — **in `shadow` too** — for example a wallet whose ada sits in several UTxOs, or that holds no
+  ada-only UTxO of exactly the collateral size. It costs a transaction fee. A preview node runs in
+  `shadow` by default, so this applies to it.
+- **Funds.** The shape is unchanged: 10 ADA beside each `ANTICIPATE` token the wallet holds (since
+  [FAB-194](#u-stays-in-the-check-convert_before_anticipate-fab-194), the token of each `ANTICIPATE` or
+  `CONVERT_BEFORE_ANTICIPATE` market), 10 ADA
+  beside the bundle of any other tokens, a 5 ADA collateral UTxO (under current protocol parameters),
+  plus the fee and a change output that still holds its own minimum ada after paying it — so an
+  ada-only wallet needs about 6.2 ADA. A wallet with less is not touched: the node logs
+  `[REBALANCE] REFUSED: …` at WARN on every pass in which the rebalancer runs and submits nothing.
+- **Any deposit triggers a reshape.** Funds you send arrive as a second ada-only UTxO, which puts the
+  wallet out of shape, and the next pass reshapes it with a self-send. **That self-send spends EVERY
+  wallet UTxO** — the collateral UTxO C and every token UTxO included — **so for about one block, until
+  it lands, nothing can be liquidated or compounded**; a candidate built in that window is rejected by
+  the ledger and retried on the next pass. A reshape only runs on a pass in which no liquidation or
+  compound went out.
+- **To opt out**, set `AQUARIUM_WALLET_REBALANCE_ENABLED=false` and restart. On a `shadow` or `live`
+  node the node then logs one WARN on every pass in which the rebalancer runs,
+  `[REBALANCE] ENV_DISABLED: … liquidation depends on a shaped wallet …` — and `SUSPENDED` in its place
+  while rebalancing is suspended from the readiness page.
+
+### Liquidation is funded by wallet role (FAB-185)
+
+Older images picked a wallet UTxO for each liquidation from a list that shrank as the pass went on — the
+smallest one that covered the requirement — so a liquidation could be funded from whichever UTxO was
+left. **Each liquidation check now reads the wallet once and gives its UTxOs fixed roles:**
+
+- **C**, the ada-only UTxO of exactly the collateral size (5 ADA under current protocol parameters), is
+  never handed to a liquidation as its funding UTxO;
+- **U**, the largest other ada-only UTxO, pays for plain, convert and ADA-principal anticipate
+  liquidations;
+- a **token-principal anticipate** is paid for from the UTxO holding the most of that token.
+
+See [deploying.md §9, "Which wallet output pays for what"](deploying.md#which-wallet-output-pays-for-what)
+for what each role must hold.
+
+- **A UTxO that went out is not used again in the same check**, and the next candidate funded from the
+  same role is skipped (`… skipped: wallet output … (role U) already went out in this check`, at INFO)
+  rather than funded from another UTxO. **So two plain liquidations no longer both go out in one pass**
+  — they share U; the second goes on a later pass. Several liquidations go out in one pass only when they
+  are funded from different roles. (Since FAB-186, below, "went out" means accepted by Blockfrost.)
+  **Replaced for U by [FAB-194](#u-stays-in-the-check-convert_before_anticipate-fab-194):** U is no longer
+  taken out of the check, so a later candidate funded from U is built and submitted on it; only a token
+  UTxO an accepted token-principal anticipate spent is still skipped
+  (`… skipped: wallet output … (role TOKEN <unit>) already went out in this check`).
+- **A missing role is refused by name.** No C: nothing is built, and one WARN names role C, its size and
+  the wallet rebalancer's last outcome. No U, or no token UTxO for a token anticipate: that candidate is
+  recorded `WALLET_ROLE_MISSING`, with one WARN per missing role per check. A role UTxO too small for
+  its candidate is recorded `WALLET_INPUT_TOO_SMALL`, naming the UTxO, what it holds and what it needed.
+- **Unreadable protocol parameters now stop the check** — one line naming role C and the cause (an ERROR
+  since [FAB-195](#stage-outcomes-on-the-pass-line-fab-195); it was a WARN) — instead of falling back to the
+  largest UTxO: without them C cannot be sized.
+- **A shaped wallet is what makes this work** — keep wallet rebalancing on
+  ([FAB-188, above](#every-shadow-or-live-node-now-keeps-its-wallet-shaped-fab-188)), and keep reference
+  scripts and datum UTxOs out of the bot wallet: they keep it from being shaped, and so stop liquidation.
+
+### Fire and forget (FAB-186)
+
+Older images served **at most one liquidation per market per pass**, treated a submit whose outcome was
+unknown as if it had gone out — ending the liquidation stage for that pass — and read the text of a
+rejection (`BadInputsUTxO`, an empty `ScriptFailures`) to set a wallet UTxO aside. All three are gone:
+
+- **Every candidate is walked**, most profitable first, in every market.
+- **A rejected or unknown submit frees nothing and stops nothing.** A rejection, a raw or 5xx answer, no
+  answer, or a submit that threw are one outcome: that candidate failed. Nothing is set aside, and the
+  next candidate is tried — on the same UTxO if it is funded from the same role. Each one is said in
+  **one INFO line**, never ERROR:
+  `liquidation of <loan> via <plain|convert|pay-in-advance> on <UTxO> not accepted: HTTP <code|none|threw> <response>`,
+  with the response cut to 300 characters (the decision row keeps all of it). The
+  `aquarium.liquidation.submit.outside.validity` counter still counts `OutsideValidityInterval` answers;
+  it decides nothing.
+- **An accepted submit uses up its UTxO for the pass** — the next candidate funded from it is skipped,
+  as in FAB-185 — **and holds compound and housekeeping back** to the next trigger. Since
+  [FAB-194](#u-stays-in-the-check-convert_before_anticipate-fab-194) that is true of a token UTxO only:
+  **U stays in the check**, and a later candidate funded from it is still built and submitted. An accepted
+  submit still holds compound and housekeeping back.
+- **Until our accepted transaction is in a block (about 20 s), later passes rebuild candidates on U and
+  get harmless rejections** — U is already spent by the pending transaction. They cost Blockfrost calls,
+  and each pass now ends with a summary line that shows them:
+  `wallet pipeline pass #<n> at slot <slot> (<hash>), trigger <label>, <k> block(s) folded in, waited <w> s, took <d> s: liquidation <outcome>, compound <outcome>, housekeeping <outcome>; Blockfrost calls discovery <n>, evaluate <n>, submit <n>`,
+  where each `<outcome>`, and when the line is INFO or DEBUG, are described in
+  [Stage outcomes on the pass line (FAB-195)](#stage-outcomes-on-the-pass-line-fab-195) below; the trigger,
+  fold and wait fields are described under `WALLET_PIPELINE_LOG_EVERY_PASS`
+  ([above](#liquidation-compound-and-rebalancing-run-on-blocks-and-prices-not-timers-fab-183)). By
+  default **every pass says it at INFO**.
+
+### Stage outcomes on the pass line (FAB-195)
+
+Older images printed each stage of the pass line as the raw answer the stage returned — `DEFINITE_FAILURE`,
+which read like an error and only meant "nothing went out", or `not run` / `threw`. **Each stage now prints
+its outcome**, one of six:
+
+- **`NO_OP`** — nothing was sent to the network: there was nothing to do, or every candidate was refused
+  by name before submitting.
+- **`ATTEMPTED`** — built and submitted, but not accepted.
+- **`SUBMITTED`** — accepted into the mempool, not yet on chain (a transaction hash came back). A compound
+  or housekeeping submit with no clear answer — a raw or 5xx response, or a submit that threw — also prints
+  `SUBMITTED`, because nothing says it did not go out; that is a display merge only.
+- **`WOULD_SUBMIT`** — a `shadow` candidate that would have been submitted.
+- **`SKIPPED`** — the stage did not run this pass: an earlier stage sent something, the pass was fenced (a
+  rollback, the pass deadline, shutdown), or an earlier stage failed.
+- **`ERROR`** — our own error: an unexpected build failure (a builder exception, a failed index or
+  Blockfrost read, a failed script evaluation — one caused by a lost race too), or a stage that threw. Each
+  unexpected build failure is **one ERROR line** carrying the whole cause chain; its stack trace is logged
+  at DEBUG.
+
+**Precedence.** A stage prints the strongest that applies:
+`SUBMITTED > WOULD_SUBMIT > ATTEMPTED > ERROR > NO_OP`.
+
+**Counts.** The outcome is followed, in brackets, by the stage's non-zero counts, in this order:
+`submitted <n>`, `would-submit <n>`, `attempted <n>`, `error <n>`, `no-op <n>`. A stage with no count
+prints its outcome alone. For example:
+
+```
+wallet pipeline pass #12 at slot 101234567 (ab12…), trigger block, 0 block(s) folded in, waited 0.4 s, took 0.0 s: liquidation ATTEMPTED (attempted 1, error 1, no-op 3), compound NO_OP, housekeeping SKIPPED; Blockfrost calls discovery 5, evaluate 2, submit 1
+```
+
+A liquidation `ATTEMPTED` is not explained on the pass line: each of its candidates has its own
+`liquidation of <loan> via <route> on <UTxO> not accepted: HTTP …` INFO line
+([Fire and forget, above](#fire-and-forget-fab-186)).
+
+**What ends a pass is unchanged:** only a liquidation or compound that went out (or whose outcome is
+unknown) holds the later stages back. The counts are for reading only.
+
+**When the line is INFO.** With `WALLET_PIPELINE_LOG_EVERY_PASS=true` (the default) every pass says it at
+INFO. With `false` it is INFO when any stage is neither `NO_OP` nor `SKIPPED`, or the pass evaluated or
+submitted anything, and DEBUG otherwise. **A pass with an `ERROR` is now INFO where it was DEBUG.**
+
+### Oracle liveness is read from the index first (FAB-196)
+
+Before every liquidation, pay-in-advance and convert build, the node checks that each oracle output the
+transaction will reference — the price feed, and for a Charli3 feed its provider — is still unspent and
+holds its NFT. Older images asked Blockfrost about every one of them. **The node now asks its own index
+first:**
+
+- an oracle output the index holds unspent, with its NFT, passes with **no Blockfrost call**;
+- one the index recorded as spent is refused **with no Blockfrost call**, naming the transaction that spent
+  it;
+- anything the index does not know is checked on Blockfrost, **exactly as before**.
+
+To have something to answer from, the index also keeps every output holding a token of the oracle NFT
+policies in `loans.oracle.indexed-nft-policies`, whatever its address. That key is shipped per network in
+the image's configuration (on mainnet, the Lending v4 feed policy) and **needs no setting**. Like every
+write-time filter in this node, it applies only to the blocks the node indexes from then on: changing it,
+or upgrading to an image that changes it, **re-indexes nothing by itself**
+([§3](#3--the-rule-that-surprises-people)).
+
+What that means depends on your node:
+
+| your node | what happens | what you do |
+|---|---|---|
+| **An existing node, not re-synced** | Oracle outputs created before the upgrade are not in its index — on mainnet that is all 16 Lending v4 feeds, created 2026-09-30 — so their checks ask Blockfrost exactly as before. Oracle outputs created after the upgrade are indexed and answered from the index. | nothing — it keeps working |
+| **Re-synced with the [§1.1](#11--the-minswap-pool-release-requires-a-database-wipe-fab-137) steps, keeping the shipped `sync-start-*`** | The index answers for every oracle output under the shipped policies: a live one costs no Blockfrost call, so the pass line's `discovery` count drops; a spent one is refused from the index. | optional — re-sync only if you want that now |
+| **A fresh install** | As a re-synced node. | nothing |
+| **A feed spent long ago** | Its rows are pruned about 2160 blocks after the spend ([§1.1](#11--the-minswap-pool-release-requires-a-database-wipe-fab-137)), so the index no longer knows it and the check goes back to Blockfrost, which reports it spent. | nothing |
+| **FluidTokens publish oracle NFTs under a new policy** | A release adds it to the shipped `loans.oracle.indexed-nft-policies`. Until you re-sync after that release, those checks ask Blockfrost, as today. | nothing required; re-sync after that release to have the index answer them |
+
+**The refusal for a spent oracle output is unchanged in effect.** Whether the index or Blockfrost says so,
+the candidate is REFUSED, the node logs one ERROR line with the reason, and the wallet UTxO is kept; the
+candidate is checked again on the next pass. Only the reason differs when the index answered: it ends
+`spent in transaction <hash>, as recorded by this node's index`.
+
+### U stays in the check; CONVERT_BEFORE_ANTICIPATE (FAB-194)
+
+This release changes one thing on **every** `shadow` or `live` node, and adds one market action you opt
+into. Nothing to set, and the database is untouched. What it means depends on your node:
+
+- **Every `shadow` or `live` node: an accepted liquidation no longer takes U out of the check.** Older
+  images skipped every later candidate funded from U once one liquidation funded from U had been accepted
+  ([FAB-185](#liquidation-is-funded-by-wallet-role-fab-185),
+  [FAB-186](#fire-and-forget-fab-186)). Now a plain liquidation, a convert or an ADA-principal
+  pay-in-advance accepted on U leaves U in the check, and every later candidate funded from U is still
+  built and submitted on it, in profit order. **What that costs:** usually the mempool that holds the
+  first refuses it — one evaluate and one submit call, and one INFO line
+  `liquidation of … via … on … not accepted: HTTP …`. A backend that has not yet seen the first
+  transaction can accept it too: the liquidations endpoint then shows **two `SUBMITTED` rows for one U**,
+  and at most one of the two can land — the second only if the first loses its race. The `SUBMITTED` row
+  of a liquidation funded from U says so (`…; U stays in this check: …`). Nothing bounds how many
+  candidates are tried on U in one check. A token UTxO spent by an accepted token-principal anticipate is
+  still taken out (`… skipped: wallet output … (role TOKEN <unit>) already went out in this check`), a
+  `shadow` node's would-be submission marks what an accept would, and a market in `shadow` on a `live`
+  node marks nothing — all as before.
+- **`CONVERT` markets, and markets you have not listed:** otherwise unchanged.
+- **`ANTICIPATE` markets:** unchanged, except the U rule above on an ADA principal (which is funded from
+  U) and the wording of two log lines: a pay-in-advance refused by the market gate (its mode, `cap` or
+  balance), or because the wallet output funding it is too small, now reads
+  `the pay-in-advance liquidation of … was refused by the market gate: …` and
+  `the pay-in-advance liquidation of … was refused: …`, where older images wrote
+  `the convert liquidation of …`. If you alert on that text, update the pattern.
+- **Opting in: `action: CONVERT_BEFORE_ANTICIPATE`.** A market with this action converts first, and pays
+  in advance in the same check only when a convert is impossible — no Minswap pool for the pair in this
+  node's index (or no pool address configured), a pool too thin to repay the debt, or
+  `LOANS_LIQUIDATION_CONVERT_ENABLED=false`; every other convert refusal is refused by name
+  ([deploying.md §9](deploying.md#convert_before_anticipate--convert-first-pay-in-advance-only-when-convert-is-impossible)).
+  Like `ANTICIPATE` it needs a `cap`, and the node refuses to start without one or with a negative one.
+  **The `cap` is per loan, in the token's smallest unit:** for a 6-decimal token, `500000000` is 500 of
+  it, and a `cap` of `50` is 0.00005 of it and refuses every loan. The market's token gets its own shaped
+  UTxO with 10 ADA, as an `ANTICIPATE` market's does, so the rebalancer's funding figure counts it (about
+  16.2 ADA for one such token under current parameters). On a node that cannot convert, each such
+  market gets one WARN at boot
+  (`market … is action: CONVERT_BEFORE_ANTICIPATE on a node that cannot convert: …`); with convert
+  switched off, one INFO
+  (`INIT - market … is action: CONVERT_BEFORE_ANTICIPATE and loans.liquidation.convert.enabled is false: …`).
+- **A node whose convert is unavailable or switched off:** a `CONVERT_BEFORE_ANTICIPATE` market pays in
+  advance where its boot line says — with convert switched off, every loan in it whose lender allows
+  conversion; with convert unavailable, every such loan the convert route finds no pool or too thin a
+  pool for, which with `loans.minswap.pool-address` blank (as preview ships it) is every such loan.
+
+**⚠ A pool this node has never indexed counts as no pool.** A Minswap pool that has not moved since the
+block your node started syncing from is not in its index, so a loan in a `CONVERT_BEFORE_ANTICIPATE`
+market whose pair it serves is paid in advance, although that pool could convert it on chain. A pool
+becomes visible the next time it moves (any swap recreates its output). A restart or a configuration
+change does not help: the stored cursor overrides `sync-start-*` (§3). A re-sync with the
+[§1.1](#11--the-minswap-pool-release-requires-a-database-wipe-fab-137) steps helps only a pool that last
+moved **after** the shipped `sync-start` (mainnet: 2025-05-06) but before your own node's index began —
+for example on a node whose cursor started later than the shipped value. A pool idle since **before**
+2025-05-06 is in none of the blocks a re-sync replays, so it stays invisible until it moves, re-sync or
+not.
+
+### Yaci Store 2.0.7 (FAB-203)
+
+This release moves the library the node indexes with, Yaci Store, from 0.1.7 to 2.0.7.
+
+- **The database must be wiped, cursor included, and re-synced**
+  ([§1.3](#13--the-yaci-store-207-release-requires-a-database-wipe-fab-203)). Rolling back across this
+  release needs another wipe ([§5](#5-rolling-back)). How long a mainnet re-sync takes on this release
+  has not been measured; leave room for a full re-sync from the shipped `sync-start`.
+- **`/actuator/health` means what it meant: the process and its database.** Yaci 2.0.7 brings two
+  health indicators of its own that follow the chain sync, `nodeSync` and `nodeHealth`. The node keeps
+  both out of `/actuator/health`, so a probe on it (a container platform's liveness or startup
+  probe, for example) does not restart a node that is syncing, has a stalled tip or has lost its relay. **`/healthcheck` is unchanged.**
+- **Switched off:** Yaci's plugin system, its plugin-admin API, its sync-status and genesis APIs
+  (`/api/v1/sync/status`, `/api/v1/genesis`), and its automatic index management. Yaci plugins could
+  never have hooked this node's storage anyway: even with the plugin system on, Yaci's plugin aspect
+  does not advise the node's own `saveUnspent` / `saveSpent` overrides, which carry no `@Plugin`
+  annotation. Parallel block processing is pinned off.
+- **The node creates its own two `address_utxo` indexes**, on the payment credential
+  (`idx_address_utxo_owner_paykey_hash`) and on the address (`idx_address_utxo_owner_addr`), which its
+  own reads need and Yaci 2.0.7 no longer creates in its schema. Yaci's stake-address, stake-credential
+  and epoch indexes on that table are left out, so the Yaci routes that filter on those columns run
+  unindexed — on a table that holds only what the node keeps. The Yaci routes the node still serves,
+  two of them new in 2.0.7, are listed in [deploying.md §7](deploying.md#-loans_ui_enabledfalse-does-not-close-port-8080).
+- **Yaci's automatic restart of its chain sync behaves differently — an accepted behaviour change.**
+  On 0.1.7 it stopped for good after 5 attempts ("Max restart attempts reached. Manual intervention
+  required."), unless after a restart the sync had stayed healthy for 5 minutes, which reset the count.
+  On 2.0.7 it counts attempts in a sliding window: after 5 attempts it pauses until a whole window
+  (10 minutes by default) has passed with no attempt, then starts counting again; it never stops for
+  good.
+  A node whose sync keeps failing now keeps retrying, where 0.1.7 gave up and waited for manual
+  intervention.
 
 ---
 

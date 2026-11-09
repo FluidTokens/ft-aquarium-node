@@ -2,7 +2,9 @@ package com.fluidtokens.aquarium.offchain.service.loans;
 
 import com.bloxbean.cardano.client.account.Account;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
+import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.service.StakerService;
+import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.annotation.PreDestroy;
 import org.springframework.beans.factory.ObjectProvider;
@@ -18,6 +20,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -27,16 +30,23 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
+import java.util.stream.Collectors;
 
 /**
- * Starts the SHADOW oracle stream (FAB-174) once the node is ready, or says in one line why it does not.
+ * Starts the oracle stream (FAB-174) once the node is ready, or says in one line why it does not.
  *
- * <p>⛔ <b>A shadow: nothing reads what it produces.</b> Each push is parsed and judged by an
- * {@link OracleStreamComparator} against what the production poller loads, and said as one
- * {@code [oracle-stream] cmp} line (FAB-175; the push receipt itself is DEBUG); no decision, price, readiness
- * figure or {@link FluidOracleClient} state changes. It is on by default ({@code loans.oracle.stream.enabled},
- * Giovanni's ruling A2 of 2026-10-29) so every operator's log shows how the stream behaves before anything
- * depends on it.
+ * <p>Each push is parsed and judged by an {@link OracleStreamComparator} against what the production poller loads,
+ * and said as one {@code [oracle-stream] cmp} line (FAB-175; the push receipt itself is DEBUG). It is on by default
+ * ({@code loans.oracle.stream.enabled}, Giovanni's ruling A2 of 2026-10-29).
+ *
+ * <p>⛔ <b>What it drives depends on {@code loans.oracle.source}</b> (FAB-183). {@code stream}, the default: after the
+ * comparator has seen each callback, every parsed push is merged into {@link FluidOracleClient}'s prices and every
+ * open and close sets its connection state — newest {@code validFrom} per oracle NFT wins (see
+ * {@link FluidOracleClient}); and an API load that changes prices while the stream is connected counts and says
+ * the pushes the stream missed ({@code [oracle-stream] missed}). {@code api}, the emergency lever: nothing is
+ * merged, and the stream is exactly the shadow it was — no decision, price, readiness figure or
+ * {@link FluidOracleClient} state changes because of it. Either way the comparator hears the API's own loads, never
+ * the merged prices.
  *
  * <p>⛔ <b>{@link FluidOracleClient} only through an {@link ObjectProvider}, to ask whether it exists and to
  * listen to its loads.</b> With {@code loans.oracle.enabled=false} that bean is absent, and a hard dependency would
@@ -69,6 +79,11 @@ public class OracleStreamLauncher {
     static final String IO_THREAD_PREFIX = "oracle-stream-io-";
 
     private static final int VALUE_ECHO = 16;
+    /** NFT units echoed in a {@code missed} line. */
+    static final int MISSED_UNITS = 5;
+    /** The longest unit echoed: a 56-hex policy id plus an asset name of at most 64 hex. */
+    private static final int UNIT_LIMIT = 120;
+    static final String METER_MISSED = "aquarium.oracle.stream.missed";
     /** FluidTokens truncate {@code X-FT-Node-Version} to this many characters. */
     static final int NODE_VERSION_MAX = 64;
     /** How often pushes older than {@link OracleStreamComparator#WINDOW} are resolved. */
@@ -81,6 +96,7 @@ public class OracleStreamLauncher {
     private final MeterRegistry meterRegistry;
     private final String enabled;
     private final String url;
+    private final String source;
     private final String buildCommitShort;
     private final String buildDirty;
     private final OracleStreamLog events = new OracleStreamLog();
@@ -97,6 +113,8 @@ public class OracleStreamLauncher {
     private volatile OracleStreamComparator comparator;
     /** {@code day} tasks that woke before their midnight by the injected clock, and so wrote nothing — for tests. */
     private final AtomicLong dayEarlyWakes = new AtomicLong();
+    /** The oracle client the stream merges into, while {@code source=stream} runs; null otherwise. */
+    private FluidOracleClient merging;
     /** Why the stream is off while no client runs; what {@link #status()} reports then. */
     private volatile String offDetail = "not started";
     private volatile Instant offSince;
@@ -113,6 +131,7 @@ public class OracleStreamLauncher {
                                 MeterRegistry meterRegistry,
                                 @Value("${loans.oracle.stream.enabled:true}") String enabled,
                                 @Value("${loans.oracle.stream.url:}") String url,
+                                @Value("${loans.oracle.source:stream}") String source,
                                 @Value("${aquarium.build.commitShort:unknown}") String buildCommitShort,
                                 @Value("${aquarium.build.dirty:unknown}") String buildDirty) {
         this.account = account;
@@ -122,18 +141,19 @@ public class OracleStreamLauncher {
         this.meterRegistry = meterRegistry;
         this.enabled = enabled;
         this.url = url;
+        this.source = source;
         this.buildCommitShort = buildCommitShort;
         this.buildDirty = buildDirty;
     }
 
-    /** Without the build's provenance: the stream sends no {@code X-FT-Node-Version} header. */
+    /** Without the build's provenance (no {@code X-FT-Node-Version} header), with {@code loans.oracle.source=stream}. */
     public OracleStreamLauncher(Account account, AppConfig.Network network,
                                 ObjectProvider<FluidOracleClient> oracleClient,
                                 StakerService stakerService,
                                 MeterRegistry meterRegistry,
                                 String enabled,
                                 String url) {
-        this(account, network, oracleClient, stakerService, meterRegistry, enabled, url, "unknown", "unknown");
+        this(account, network, oracleClient, stakerService, meterRegistry, enabled, url, "stream", "unknown", "unknown");
     }
 
     /** For tests only: the timings and clock the client is built with. */
@@ -182,6 +202,12 @@ public class OracleStreamLauncher {
             off("stopped");
             shutDownComparator();
             shutDown();
+            // The client says no onClose for its own shutdown: the stream's NFTs stop holding entries here.
+            FluidOracleClient merged = merging;
+            merging = null;
+            if (merged != null) {
+                merged.streamConnected(false);
+            }
         } catch (Throwable t) {
             // ⛔ never throws: this runs on Spring's shutdown path
         }
@@ -310,8 +336,25 @@ public class OracleStreamLauncher {
         return value;
     }
 
+    /**
+     * {@code loans.oracle.source}, trimmed and case-insensitive: blank or {@code stream} is
+     * {@link FluidOracleClient.Source#STREAM}, {@code api} is {@link FluidOracleClient.Source#API}, and anything else
+     * is API — the stream then drives nothing — with one WARN.
+     */
+    private FluidOracleClient.Source source() {
+        String value = source == null ? "" : source.trim();
+        if (value.isEmpty() || value.equalsIgnoreCase("stream")) {
+            return FluidOracleClient.Source.STREAM;
+        }
+        if (!value.equalsIgnoreCase("api")) {
+            events.warn("source", "reason=unrecognised value=" + OracleStreamLog.token(value, VALUE_ECHO));
+        }
+        return FluidOracleClient.Source.API;
+    }
+
     /** One line either way; ON builds the threads and the client. */
     private void launch() {
+        FluidOracleClient.Source priceSource = source();
         Decision decision = decide(enabled, () -> oracleClient.getIfAvailable() != null, network, url);
         if (!decision.on()) {
             off(decision.detail());
@@ -325,7 +368,8 @@ public class OracleStreamLauncher {
         URI uri = decision.uri();
         String nodeVersion = nodeVersion(buildCommitShort, buildDirty);
 
-        events.info("on", decision.fields() + " node_ver=" + (nodeVersion == null ? "-" : nodeVersion));
+        events.info("on", decision.fields() + " node_ver=" + (nodeVersion == null ? "-" : nodeVersion)
+                + " source=" + (priceSource == FluidOracleClient.Source.STREAM ? "stream" : "api"));
         scheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, THREAD_NAME);
             thread.setDaemon(true);
@@ -355,19 +399,105 @@ public class OracleStreamLauncher {
             });
             stream.execute(guarded("cmp-seed", () -> {
                 if (!Instant.EPOCH.equals(fc.lastRefresh())) {
-                    comparing.onApiLoad(fc.lastRefresh(), fc.entries());
+                    comparing.onApiLoad(fc.lastRefresh(), fc.lastApiEntries());
                 }
             }));
+        }
+        OracleStreamClient.Listener listener = comparing;
+        if (fc != null && priceSource == FluidOracleClient.Source.STREAM) {
+            listener = mergingInto(fc, comparing);
+            countMissedPushes(fc);
+            merging = fc;
         }
         stream.scheduleWithFixedDelay(guarded("cmp-tick", () -> comparing.tick(streamClock.instant())),
                 COMPARE_TICK_SECONDS, COMPARE_TICK_SECONDS, TimeUnit.SECONDS);
         scheduleDaySummary(stream, comparing, streamClock);
 
         OracleStreamClient created = new OracleStreamClient(uri, new OracleStreamAuth(account), timings, clock,
-                comparing, events, scheduler, io, () -> !staker.findStakerRefInput().isEmpty(),
+                listener, events, scheduler, io, () -> !staker.findStakerRefInput().isEmpty(),
                 meterRegistry, nodeVersion);
         client = created;
         created.start();
+    }
+
+    /**
+     * {@code source=stream}: every callback goes to the comparator FIRST and unchanged, then the push or the
+     * connection state is written into {@code fc}. Each side is guarded on its own, and a throw is said as the
+     * client would say it ({@code listener-error callback=… error=<class>}), so neither side can break the other.
+     */
+    private OracleStreamClient.Listener mergingInto(FluidOracleClient fc, OracleStreamComparator comparing) {
+        return new OracleStreamClient.Listener() {
+            @Override
+            public void onOpen(Instant at) {
+                forward("onOpen", () -> comparing.onOpen(at));
+                forward("merge-open", () -> fc.streamConnected(true));
+            }
+
+            @Override
+            public void onClose(Instant at, String reason) {
+                forward("onClose", () -> comparing.onClose(at, reason));
+                forward("merge-close", () -> fc.streamConnected(false));
+            }
+
+            @Override
+            public void onPush(Instant at, long serverTimestamp, OracleRegistryParser.Parsed parsed, int chars) {
+                forward("onPush", () -> comparing.onPush(at, serverTimestamp, parsed, chars));
+                forward("merge-push", () -> fc.mergeStreamPush(parsed.entries(), at));
+            }
+
+            @Override
+            public void onPush(Instant at, long serverTimestamp, long xferMs, OracleRegistryParser.Parsed parsed,
+                               int chars) {
+                forward("onPush", () -> comparing.onPush(at, serverTimestamp, xferMs, parsed, chars));
+                forward("merge-push", () -> fc.mergeStreamPush(parsed.entries(), at));
+            }
+        };
+    }
+
+    private void forward(String callback, Runnable call) {
+        try {
+            call.run();
+        } catch (Throwable t) {
+            events.warn("listener-error", "callback=" + callback + " error=" + OracleStreamLog.simpleName(t));
+        }
+    }
+
+    /**
+     * Missed-push accounting, {@code source=stream} only. An API load that changes prices while the stream is
+     * connected means the stream missed those pushes: counted ({@code stream=connected}) and said as one
+     * {@code missed} INFO line. While it is not connected the change is counted ({@code stream=disconnected}) and
+     * not said. Changes the stream made itself are not counted.
+     */
+    private void countMissedPushes(FluidOracleClient fc) {
+        MeterRegistry registry = meterRegistry;
+        Counter connected = registry == null ? null : Counter.builder(METER_MISSED).tag("stream", "connected")
+                .description("Oracle NFTs an API load changed that the stream had not pushed, by connection state")
+                .register(registry);
+        Counter disconnected = registry == null ? null : Counter.builder(METER_MISSED).tag("stream", "disconnected")
+                .description("Oracle NFTs an API load changed that the stream had not pushed, by connection state")
+                .register(registry);
+        fc.addChangeListener((changedBy, nfts, streamConnected) -> {
+            if (changedBy != FluidOracleClient.Source.API) {
+                return;
+            }
+            if (streamConnected) {
+                if (connected != null) {
+                    connected.increment(nfts.size());
+                }
+                events.info("missed", "n=" + nfts.size() + " units=" + units(nfts));
+            } else if (disconnected != null) {
+                disconnected.increment(nfts.size());
+            }
+        });
+    }
+
+    /** At most {@value #MISSED_UNITS} NFT units, sorted, comma-joined, each one a sanitised token. */
+    static String units(Set<AssetType> nfts) {
+        return nfts.stream()
+                .map(nft -> OracleStreamLog.token(nft.toUnit(), UNIT_LIMIT))
+                .sorted()
+                .limit(MISSED_UNITS)
+                .collect(Collectors.joining(","));
     }
 
     /**

@@ -93,6 +93,32 @@ class WalletShapeTest {
         assertEquals(EnumSet.of(Reason.NO_EXACT_COLLATERAL, Reason.NON_RELEVANT_NOT_ONE_EXACT_UTXO), reasons(utxos));
     }
 
+    /**
+     * (d1) FAB-188: R1/R2 use the one ada-only predicate, {@code WalletInputSelection.nominable}. A datum-bearing
+     * UTxO of exactly C lovelace is not a collateral the bot could nominate, so R1 still fires.
+     */
+    @Test
+    void r1_aDatumBearingAdaOnlyUtxoOfExactlyCIsNotCollateral() {
+        Utxo datumC = utxo(C);
+        datumC.setInlineDatum("d87980");
+        List<Utxo> utxos = List.of(utxo(TEN_ADA, UNIT_A, 500L), utxo(TEN_ADA, JUNK_1, 7L, JUNK_2, 9L), datumC,
+                utxo(ada(100)));
+        assertEquals(EnumSet.of(Reason.NO_EXACT_COLLATERAL), reasons(utxos));
+    }
+
+    /**
+     * (d2) ... and a reference-script UTxO carrying only ada is not a fragment of the change: beside C and one
+     * change it does not fire ADA_FRAGMENTED.
+     */
+    @Test
+    void r2_aReferenceScriptAdaOnlyUtxoIsNotAFragment() {
+        Utxo refScript = utxo(ada(30));
+        refScript.setReferenceScriptHash("ab".repeat(28));
+        List<Utxo> utxos = new ArrayList<>(shaped());
+        utxos.add(refScript);
+        assertEquals(EnumSet.noneOf(Reason.class), reasons(utxos));
+    }
+
     @Test
     void r2_twoAdaOnlyUtxosBesidesCollateral() {
         List<Utxo> utxos = new ArrayList<>(shaped());
@@ -154,6 +180,22 @@ class WalletShapeTest {
         assertEquals(Set.of(UNIT_A),
                 WalletShape.relevantUnits(List.of(anticipateA, convertB, anticipateAda, anticipateAdaUpper, defaulted)));
         assertEquals(Set.of(), WalletShape.relevantUnits(null));
+    }
+
+    /**
+     * FAB-194 D7: a CONVERT_BEFORE_ANTICIPATE market's fallback fronts the principal exactly as ANTICIPATE does, so
+     * its token is relevant — lower-cased, and never lovelace — beside an ANTICIPATE market's, while CONVERT's is not.
+     */
+    @Test
+    void relevantUnitsIncludeTheConvertBeforeAnticipateMarketsLowerCasedWithoutLovelace() {
+        Market cbaA = market(UNIT_A.toUpperCase(), Action.CONVERT_BEFORE_ANTICIPATE);
+        Market cbaAda = market("lovelace", Action.CONVERT_BEFORE_ANTICIPATE);
+        Market cbaAdaUpper = market("LOVELACE", Action.CONVERT_BEFORE_ANTICIPATE);
+        Market convertJunk = market(JUNK_1, Action.CONVERT);
+
+        assertEquals(Set.of(UNIT_A), WalletShape.relevantUnits(List.of(cbaA, cbaAda, cbaAdaUpper, convertJunk)));
+        assertEquals(Set.of(UNIT_A, UNIT_B),
+                WalletShape.relevantUnits(List.of(cbaA, market(UNIT_B, Action.ANTICIPATE), convertJunk)));
     }
 
     private static Market market(String unit, Action action) {

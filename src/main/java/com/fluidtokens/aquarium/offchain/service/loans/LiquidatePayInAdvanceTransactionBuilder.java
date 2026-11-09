@@ -39,6 +39,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import com.fluidtokens.aquarium.offchain.model.loans.Rational;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import com.fluidtokens.aquarium.offchain.service.TransactionInputComparator;
+import com.fluidtokens.aquarium.offchain.util.WalletInputSelection;
 
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
@@ -124,6 +125,32 @@ import java.util.stream.Stream;
  * only unknown is {@link OutputLayout#CCL_PREPENDED_OUTPUTS}. As {@code LiquidateTransactionBuilder}
  * does, the transaction is built ONCE (T-051); {@link #assertStructure} then re-derives both indexes
  * from the finished body and refuses on any mismatch.
+ *
+ * <h2>Collateral and the wallet: C is pinned, the designated input is the only wallet input (FAB-185)</h2>
+ * The wallet has roles ({@code WalletRoles}); this builder takes two of them by name and chooses nothing:
+ * <ul>
+ *   <li><b>Collateral is exactly {@link Request#collateralUtxo()}</b> — role C — pinned with
+ *       {@code withCollateralInputs} as the transaction's only collateral input. It is never chosen from the
+ *       wallet and never spent. {@link #build} refuses {@code COLLATERAL_UTXO_INVALID} when it is missing, not
+ *       ada-only with no datum and no script, or the designated input itself; after the build
+ *       {@code LiquidateTransactionBuilder.assertCollateralIsCoverable} checks the body's
+ *       {@code total_collateral} and {@code collateral_return} against the real fee (CCL trap 16), naming C,
+ *       and refuses {@code INSUFFICIENT_COLLATERAL}.</li>
+ *   <li><b>The only wallet input is {@link Request#walletUtxo()}</b> — U for an ada principal, the token
+ *       output for a token principal. Every supplier the build hands cardano-client-lib —
+ *       {@code QuickTxBuilder}'s, the selection strategy's and the {@code preBalanceTx} selector's — is a
+ *       {@link DesignatedInputUtxoSupplier} view in which the wallet's payment credential holds that output and
+ *       nothing else (CCL trap 9b: guard every seam, not one). Balancing therefore cannot pull C, U, another
+ *       token output or a published reference script. <b>A designated input too small for the build refuses;
+ *       it never pulls a second wallet output.</b></li>
+ * </ul>
+ * ⚠ <b>On a token principal the token output ALONE must fund the fee, the min-ada rider on the lender's
+ * converted output, the min-ada rider on the bot's S-15 collateral output and the change's min-ada</b> —
+ * none of those outputs states its ada, so cardano-client-lib tops each up out of the inputs (CCL trap 6),
+ * and the only wallet input there is the token output. Before FAB-185 the balancer quietly pulled ada-only
+ * wallet outputs to cover them; now a token output carrying too little ada beside the token is refused.
+ * So a built pay-in-advance spends exactly {token output} (token principal) or {U} (ada principal) from the
+ * wallet, and its collateral is exactly [C].
  */
 public final class LiquidatePayInAdvanceTransactionBuilder {
 
@@ -160,7 +187,8 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
     /**
      * Where cardano-client-lib fetches the BYTES of a script that travels as a reference script, or
      * {@code null} for the offline rigs (which hand every script in explicitly). Production builds with
-     * {@code new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, scriptSupplier, null)}: priced,
+     * {@code new QuickTxBuilder(walletView, protocolParamsSupplier, scriptSupplier, null)} — {@code walletView}
+     * being the per-build {@link DesignatedInputUtxoSupplier} over the injected supplier (FAB-185): priced,
      * because this supplier serves the bytes (CCL trap 9), and submit-incapable, because the processor
      * slot is null and the evaluator arrives through {@code withTxEvaluator} (CCL trap 8). Mirrors
      * {@link LiquidateTransactionBuilder}'s field of the same name (FAB-134 B3b-1).
@@ -261,7 +289,10 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
      * @param loanUtxo         the loan UTxO
      * @param bond             the decoded lender bond
      * @param bondUtxo         the lender-bond UTxO; its output is echoed byte-for-byte
-     * @param walletUtxo       funds the ADA paid in advance to the lender, plus fees and min-ada
+     * @param walletUtxo       the ONE wallet output this build may spend (FAB-185): U for an ada principal, the
+     *                         token output for a token principal. It alone funds the principal paid in
+     *                         advance, the fee, the lender's and the bot's min-ada riders and the change's
+     *                         min-ada — no other wallet output is visible to the build
      * @param configUtxo       the main config reference input
      * @param lmConfigUtxo     the LenderManager config reference input
      * @param oracle           the Charli3-backed collateral oracle entry
@@ -311,7 +342,16 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
                            * transaction's {@code validTo}. Same meaning and same source as the plain
                            * path's field of this name — {@code loans.liquidation.oracle-window-margin-seconds}.
                            */
-                          long oracleWindowMarginMillis) {
+                          long oracleWindowMarginMillis,
+                          /**
+                           * ⛔ FAB-185 — wallet role C, pinned as the transaction's ONLY collateral input and
+                           * never spent. Ada-only with no datum and no script
+                           * ({@code WalletInputSelection.nominable}), and a different output from
+                           * {@link #walletUtxo}; {@link #build} refuses anything else as
+                           * {@code COLLATERAL_UTXO_INVALID}. Chosen by the executor's wallet roles, never by
+                           * the router or this builder.
+                           */
+                          Utxo collateralUtxo) {
     }
 
     /** The five numbers the redeemer and the outputs rest on, all computed through {@link LoanFinance}. */
@@ -505,6 +545,10 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
         if (request.principalOracle() != null) {
             refuseUnmodelledVariant(request.principalOracle(), "principal");
         }
+        // ⛔ FAB-185 — C is pinned as the only collateral input and never spent, so it must exist, be pure ada
+        // with no datum and no script (the one ada-only predicate), and be a different output from the
+        // designated wallet input, which IS spent. Refused by name, before anything is priced or probed.
+        refuseInvalidCollateral(request);
         Numbers numbers = numbers(request);
         // F0 (round 2) — EQUITY 0 IS THE VALIDATOR'S NORMAL CASE, NOT A SHAPE THIS BUILDER REFUSES.
         //
@@ -584,8 +628,11 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
         // adds no reference input, see referenceInputs). Asked once per build, here, before any
         // QuickTxBuilder build or evaluation. Spent, wrong NFT or a provider error throws
         // OracleReferenceInputNotLiveException, which the executor records REFUSED and logs at ERROR every
-        // cycle. After evaluation it would be too late: a spent feed comes back from Blockfrost as an empty
-        // ScriptFailures, which the executor reads as a spent WALLET input (CCL trap 13).
+        // cycle. An out-ref whose content is unknown (not yet visible to this node) throws it marked
+        // notYetVisible instead: a wait, recorded REFUSED ORACLE_INPUT_NOT_YET_VISIBLE and logged at INFO,
+        // with the nominated wallet utxo kept (FAB-183). After evaluation it would be too late: a spent feed
+        // comes back from Blockfrost as an empty ScriptFailures, which the executor reads as a spent WALLET
+        // input (CCL trap 13).
         if (oracleReferenceInputProbe != null) {
             oracleReferenceInputProbe.requireLive(request.principalOracle() != null
                     ? List.of(request.oracle(), request.principalOracle())
@@ -659,7 +706,35 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
                 principalProviderRefIndex, refInputs, lenderBondOutputIndex, assetOutputIndex),
                 (ctx, txn) -> assertStructure(txn, request, numbers, lenderBondOutputIndex,
                         assetOutputIndex));
+
+        // ⛔ FAB-185 (m3) — C is the ONLY collateral now, so its capacity is the whole of it: the built body's
+        // collateral_return must not be negative (an unparseable artefact, CCL trap 16) and its
+        // total_collateral must reach ceil(fee × collateral_percent). The plain path's check, on every build,
+        // naming C; it throws LiquidateTransactionBuilder.RefusedException(INSUFFICIENT_COLLATERAL).
+        LiquidateTransactionBuilder.assertCollateralIsCoverable(protocolParamsSupplier.getProtocolParams(),
+                transaction, request.collateralUtxo());
         return transaction;
+    }
+
+    /**
+     * FAB-185 — refuses, as {@code IllegalStateException("COLLATERAL_UTXO_INVALID: …")}, a
+     * {@link Request#collateralUtxo()} that is missing, is not {@link WalletInputSelection#nominable} (ada only,
+     * no datum, no script), or is the designated wallet input itself. Mirrors the plain path's
+     * {@code checkRequestShape} refusal of the same name.
+     */
+    private static void refuseInvalidCollateral(Request request) {
+        Utxo collateral = request.collateralUtxo();
+        if (collateral == null) {
+            throw new IllegalStateException("COLLATERAL_UTXO_INVALID: no collateral utxo (wallet role C) supplied");
+        }
+        if (!WalletInputSelection.nominable(collateral)) {
+            throw new IllegalStateException("COLLATERAL_UTXO_INVALID: collateral utxo " + utxoRef(collateral)
+                    + " must hold ada only, with no datum or script");
+        }
+        if (request.walletUtxo() != null && utxoRef(collateral).equals(utxoRef(request.walletUtxo()))) {
+            throw new IllegalStateException("COLLATERAL_UTXO_INVALID: collateral utxo " + utxoRef(collateral)
+                    + " is the wallet utxo itself; C and the designated input must be different outputs");
+        }
     }
 
     // ---- assembly ---------------------------------------------------------------------------------
@@ -878,17 +953,27 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
         TransactionEvaluator evaluator =
                 scriptCostEvaluator != null ? reporting(scriptCostEvaluator) : null;
         try {
-            // Production: the injected utxo supplier (the local index first), the per-epoch protocol
-            // params, and a SCRIPT SUPPLIER that serves the bytes of every validator travelling as a
-            // reference script — without which cardano-client-lib prices that script's fee as zero (CCL
-            // trap 9). The processor slot is null and stays null: the evaluator arrives through
+            // ⛔ FAB-185: EVERY supplier this build hands cardano-client-lib — QuickTxBuilder's, the strategy's
+            // and the selector's — is this view, in which the wallet's payment credential holds the
+            // designated input and nothing else. Balancing can therefore spend exactly {walletUtxo} from the
+            // wallet: C, U (on a token principal), the other token outputs and a published reference script
+            // are not there to be chosen, so a designated input too small for the build refuses rather than
+            // pulling a second one. Built once per build, from the injected supplier; out-refs (C, the loan,
+            // the bond, every reference input) still resolve through it unchanged. Mirrors
+            // LiquidateTransactionBuilder.complete (FAB-185-2).
+            UtxoSupplier walletView = DesignatedInputUtxoSupplier.of(utxoSupplier, request.changeAddress(),
+                    request.walletUtxo());
+            // Production: the injected utxo supplier (the local index first) seen through that view, the
+            // per-epoch protocol params, and a SCRIPT SUPPLIER that serves the bytes of every validator
+            // travelling as a reference script — without which cardano-client-lib prices that script's fee as
+            // zero (CCL trap 9). The processor slot is null and stays null: the evaluator arrives through
             // withTxEvaluator below, never through the processor (CCL trap 8), so this builder can price
             // a transaction and has nothing that could submit one. Offline: the three-argument form with
             // no processor and no supplier, because the rigs hand every script in explicitly and
             // evaluate for themselves. Mirrors LiquidateTransactionBuilder.complete (FAB-134 B3b-1).
             QuickTxBuilder quickTxBuilder = scriptSupplier != null
-                    ? new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, scriptSupplier, null)
-                    : new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, null);
+                    ? new QuickTxBuilder(walletView, protocolParamsSupplier, scriptSupplier, null)
+                    : new QuickTxBuilder(walletView, protocolParamsSupplier, null);
             QuickTxBuilder.TxContext context = quickTxBuilder
                     .compose(tx)
                     .feePayer(request.changeAddress())
@@ -907,7 +992,7 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
                     // operational address, and cardano-client-lib's default selection has no
                     // reference-script exclusion at all (verified against the pinned v0.7.2 source).
                     // Spending it would refuse every later convert liquidation as TX_TOO_LARGE.
-                    .withUtxoSelectionStrategy(ReferenceScriptSafeUtxoSelection.strategy(utxoSupplier))
+                    .withUtxoSelectionStrategy(ReferenceScriptSafeUtxoSelection.strategy(walletView))
                     // The strategy above guards only the path ChangeOutputAdjustments tries SECOND. The
                     // UtxoSelector it tries FIRST has no withUtxoSelector on TxContext, so it is installed
                     // here — preBalanceTx hands over the TxBuilderContext itself and runs before balancing.
@@ -917,7 +1002,7 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
                     // path deliberately: T-043 found that BOTH of 80857b5's fixes landed in one sibling
                     // only, and this is the same class of edit.
                     .preBalanceTx(((TxBuilder) (ctx, txn) ->
-                            ctx.setUtxoSelector(ReferenceScriptSafeUtxoSelection.selector(utxoSupplier)))
+                            ctx.setUtxoSelector(ReferenceScriptSafeUtxoSelection.selector(walletView)))
                             .andThen(LiquidateTransactionBuilder.stripReferencedScriptsFromWitnessSet(
                                     publishedScripts(request.referenceScripts()))))
                     // COLLATERAL is chosen by neither of the above: QuickTxBuilder.buildCollateralOutput
@@ -927,19 +1012,12 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
                     // still pledged the published loan_claim_action script as collateral — and collateral
                     // is what a PHASE-2 failure consumes, which makes it the worse of the two paths.
                     //
-                    // Pinning it to the wallet utxo is safe and costs no extra funding: that utxo is
-                    // already an explicit input (collectFrom above), the executor's adaOnlyWalletUtxo()
-                    // guarantees it is ada-only with no datum and no reference script, and one utxo may
-                    // serve as both spend input and collateral (CCL trap 12 — a collateral return is
-                    // emitted). Pinning also excludes it from ordinary coin selection, which changes
-                    // nothing here precisely because it was never selected: it is handed in.
-                    // T-050, mirrored from the plain path: collateral is chosen by OUR selection,
-                    // not nominated as the spend input and not left to CCL — whose own collateral
-                    // selector (QuickTxBuilder:507) is invisible to both of our guards and has no
-                    // reference-script exclusion. Amount DERIVED from protocol params, never assumed.
-                    .withCollateralInputs(LiquidateTransactionBuilder.collateralInputsFor(
-                            utxoSupplier, protocolParamsSupplier,
-                            request.changeAddress(), request.walletUtxo()));
+                    // ⛔ FAB-185: it is pinned to exactly C, the Request's collateral utxo — nothing chosen
+                    // here, neither by this builder nor by cardano-client-lib. refuseInvalidCollateral has
+                    // proven C ada-only, datum-free, script-free and not the designated input;
+                    // buildCollateralOutput resolves it by out-ref (walletView.getTxOutput, which the view
+                    // delegates), and build() then runs assertCollateralIsCoverable on the built body.
+                    .withCollateralInputs(inputOf(request.collateralUtxo()));
 
             if (scriptSupplier == null) {
                 // Offline: cardano-client-lib would otherwise walk every reference input looking for a
@@ -1505,6 +1583,10 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
 
     private static PlutusData list(PlutusData... items) {
         return ListPlutusData.of(items);
+    }
+
+    private static String utxoRef(Utxo utxo) {
+        return utxo.getTxHash() + "#" + utxo.getOutputIndex();
     }
 
     private static TransactionInput inputOf(Utxo utxo) {

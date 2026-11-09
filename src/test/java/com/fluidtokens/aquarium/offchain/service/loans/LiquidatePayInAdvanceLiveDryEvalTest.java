@@ -197,8 +197,6 @@ class LiquidatePayInAdvanceLiveDryEvalTest {
     private static final long ORACLE_WINDOW_MARGIN_MILLIS = 30_000L;
     /** {@code loans.liquidation.validity-window-seconds}, mainnet default 120. */
     private static final long VALIDITY_WINDOW_MILLIS = 120_000L;
-    /** {@code LiquidationExecutor.TOKEN_PRINCIPAL_MIN_ADA_CEILING} — mirrored, not imported (private there). */
-    private static final BigInteger TOKEN_PRINCIPAL_MIN_ADA_CEILING = BigInteger.valueOf(2_000_000L);
 
     /** What the evaluator actually said, kept because CCL's wrapper throws it away. */
     private static String lastEvaluatorMessage;
@@ -493,21 +491,34 @@ class LiquidatePayInAdvanceLiveDryEvalTest {
                         + "floor, so this would mean that floor itself broke — " + candidateState);
         BigInteger lenderPayout = numbers.convertedLoanCollateralToPrincipalAmount();
 
-        // T-052 / MarketGate's Part 2: the smallest wallet utxo carrying enough USDM plus enough ada
-        // for the fee ceiling and the min-ada rider — mirrors LiquidationExecutor.nominate()'s
-        // token-principal branch exactly, against the REAL live protocol params.
+        // T-052 / MarketGate's Part 2: the smallest wallet utxo carrying enough USDM plus enough ada for
+        // everything the token output alone must now fund — sized by the executor's own rule,
+        // WalletRoles.tokenOutputRequiredAda (fee ceiling + lender min-ada rider + S-15 collateral rider +
+        // change min-ada), against the REAL live protocol params. FAB-185: the builder no longer pulls a
+        // second wallet output for the riders, so a token output sized by fee + min-ada alone would refuse.
         ProtocolParams liveParams = new DefaultProtocolParamsSupplier(backend.getEpochService()).getProtocolParams();
-        BigInteger requiredAda = LedgerCeilings.maxPossibleFee(liveParams).add(TOKEN_PRINCIPAL_MIN_ADA_CEILING);
+        BigInteger requiredAda = com.fluidtokens.aquarium.offchain.service.wallet.WalletRoles
+                .tokenOutputRequiredAda(LedgerCeilings.maxPossibleFee(liveParams));
         Utxo walletUtxo = WalletInputSelection.smallestSufficientToken(walletUtxos, USDM, lenderPayout, requiredAda)
                 .orElseThrow(() -> new AssertionError(
                         "no utxo at " + realWallet + " carries >= " + lenderPayout + " " + USDM.toUnit()
-                                + " alongside >= " + requiredAda + " lovelace (fee ceiling + min-ada rider) — "
-                                + "this is a wallet-funding gap, not a rig or validator defect"));
+                                + " alongside >= " + requiredAda + " lovelace (fee ceiling + min-ada rider + "
+                                + "S-15 collateral rider + change min-ada) — this is a wallet-funding gap, not a "
+                                + "rig or validator defect"));
+
+        // FAB-185 — role C, resolved from the REAL wallet exactly as the executor resolves it, and already in
+        // the universe above (the full wallet set): the builder pins it as the only collateral.
+        Utxo collateralUtxo = com.fluidtokens.aquarium.offchain.service.wallet.WalletRoles.resolve(walletUtxos,
+                        com.fluidtokens.aquarium.offchain.service.wallet.WalletShape.collateralLovelace(liveParams))
+                .c()
+                .orElseThrow(() -> new AssertionError("no role-C output at " + realWallet + " — no ada-only "
+                        + "output of exactly the collateral amount; this is a wallet-shape gap, not a rig or "
+                        + "validator defect"));
 
         var request = new LiquidatePayInAdvanceTransactionBuilder.Request(loan, loanUtxo, bond, bondUtxo,
                 walletUtxo, configUtxo, lmConfigUtxo, fldtEntry, usdmEntry,
                 validFromMillis, validToMillis, slots[0], slots[1],
-                walletUtxo.getAddress(), scripts, ORACLE_WINDOW_MARGIN_MILLIS);
+                walletUtxo.getAddress(), scripts, ORACLE_WINDOW_MARGIN_MILLIS, collateralUtxo);
 
         Transaction transaction = builder.build(request);
         return new Built(transaction, universe, List.of(fldtOracleScript, usdmOracleScript), request, numbers,

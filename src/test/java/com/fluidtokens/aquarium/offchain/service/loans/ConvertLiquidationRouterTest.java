@@ -20,6 +20,7 @@ import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -98,6 +99,12 @@ class ConvertLiquidationRouterTest {
         };
     }
 
+    /**
+     * FAB-185 — wallet role C, which the router hands to the builder untouched. These tests refuse before any
+     * build, so it is never read; it is a well-formed C so that no refusal here can be about it.
+     */
+    private static final Utxo ROLE_C = LoanFixtures.adaUtxo("c5".repeat(32), 0, "addr_change", 5_000_000L);
+
     private static ConvertLiquidationRouter router() {
         AppConfig.LoansConfiguration loans = configuredForMinswap();
         return new ConvertLiquidationRouter(LoanFixtures.registry(), loans, null,
@@ -136,7 +143,7 @@ class ConvertLiquidationRouterTest {
         // POOL_TOO_THIN pre-check fires first, masking the seam this class exists to test.
         OraclePriceFeed feed = new OraclePriceFeed(OraclePriceFeed.Variant.AGGREGATED, FLDT,
                 BigInteger.valueOf(15_000_000L), BigInteger.valueOf(100_000_000L),
-                1_759_000_000_000L, 1_799_000_000_000L);
+                1_759_998_000_000L, 1_760_001_000_000L);
         return Map.of(LoanFixtures.NO_ORACLE.toUnit(),
                 LoanFixtures.multisig(FLDT, LoanFixtures.NO_ORACLE, "dd".repeat(28), feed,
                         null, null, java.util.List.of()));
@@ -164,7 +171,7 @@ class ConvertLiquidationRouterTest {
         var e = assertThrows(ConvertLiquidationRouter.WalletInputTooSmallException.class,
                 () -> router().buildConvertLiquidation(candidate(), loanUtxo(), null, null, null,
                         requirement -> Optional.empty(),
-                        collateralOracle(), "addr_change",
+                        ROLE_C, collateralOracle(), "addr_change",
                         1_760_000_000_000L, 1_760_000_120_000L));
 
         assertTrue(e.getMessage().contains("4000000"),
@@ -192,7 +199,7 @@ class ConvertLiquidationRouterTest {
                             asked[0] = requirement;
                             return Optional.empty();
                         },
-                        collateralOracle(), "addr_change",
+                        ROLE_C, collateralOracle(), "addr_change",
                         1_760_000_000_000L, 1_760_000_120_000L));
 
         assertEquals(ConvertEconomics.MINSWAP_ORDER_OVERHEAD, asked[0],
@@ -217,7 +224,7 @@ class ConvertLiquidationRouterTest {
         var e = assertThrows(IllegalStateException.class,
                 () -> router().buildConvertLiquidation(candidate(), loanUtxo(), null, null, null,
                         requirement -> Optional.empty(),
-                        Map.of(LoanFixtures.NO_ORACLE.toUnit(), wrongToken), "addr_change",
+                        ROLE_C, Map.of(LoanFixtures.NO_ORACLE.toUnit(), wrongToken), "addr_change",
                         1_760_000_000_000L, 1_760_000_120_000L));
 
         assertTrue(e.getMessage().contains("pricing " + FLDT.toUnit()), e.getMessage());
@@ -252,7 +259,7 @@ class ConvertLiquidationRouterTest {
 
         var e = assertThrows(IllegalStateException.class,
                 () -> router().buildConvertLiquidation(tokenPrincipal, loanUtxo(), null, null, null,
-                        requirement -> Optional.empty(), oracles, "addr_change",
+                        requirement -> Optional.empty(), ROLE_C, oracles, "addr_change",
                         1_760_000_000_000L, 1_760_000_120_000L));
 
         assertTrue(e.getMessage().contains("pricing " + principal.toUnit()), e.getMessage());
@@ -280,7 +287,7 @@ class ConvertLiquidationRouterTest {
 
         var e = assertThrows(IllegalStateException.class,
                 () -> router().buildConvertLiquidation(adaCollateral, loanUtxo(), null, null, null,
-                        requirement -> Optional.empty(), collateralOracle(), "addr_change",
+                        requirement -> Optional.empty(), ROLE_C, collateralOracle(), "addr_change",
                         1_760_000_000_000L, 1_760_000_120_000L));
         assertTrue(e.getMessage().startsWith("ada collateral:"), e.getMessage());
 
@@ -296,9 +303,109 @@ class ConvertLiquidationRouterTest {
                 new FixedPoolResolver(), null, null, LoanFixtures.converters(), LoanFixtures.NETWORK);
         var first = assertThrows(IllegalStateException.class,
                 () -> unconfigured.buildConvertLiquidation(adaCollateral, loanUtxo(), null, null, null,
-                        requirement -> Optional.empty(), collateralOracle(), "addr_change",
+                        requirement -> Optional.empty(), ROLE_C, collateralOracle(), "addr_change",
                         1_760_000_000_000L, 1_760_000_120_000L));
         assertTrue(first.getMessage().startsWith("ada collateral:"), first.getMessage());
+    }
+
+    // ===== FAB-183: the feed window guard the plain and pay-in-advance routes already had =====
+
+    /** The collateral feed of {@link #collateralOracle()}, re-windowed. */
+    private static Map<String, OracleEntry> collateralOracleWindowed(long validFrom, long validTo) {
+        OracleEntry named = collateralOracle().get(LoanFixtures.NO_ORACLE.toUnit());
+        OraclePriceFeed feed = new OraclePriceFeed(OraclePriceFeed.Variant.AGGREGATED, FLDT,
+                named.feed().priceInLovelaces(), named.feed().priceDenominator(), validFrom, validTo);
+        return Map.of(LoanFixtures.NO_ORACLE.toUnit(),
+                LoanFixtures.multisig(FLDT, LoanFixtures.NO_ORACLE, "dd".repeat(28), feed,
+                        null, null, java.util.List.of()));
+    }
+
+    /**
+     * ⛔ <b>A collateral feed that opens after the body's start is refused BEFORE the wallet is asked.</b>
+     * {@code retrieve_oracle_data} requires {@code valid_from <= transactionValidFrom}; this route used to
+     * check only {@code usableForLiquidation()}, so such a feed reached the chain. The body here starts at
+     * {@code 1_760_000_000_000} and the feed opens ten seconds later.
+     *
+     * <p>The selector would answer {@code Optional.empty()} — a {@code WalletInputTooSmallException} — so
+     * a guard that ran after it, or not at all, fails this test by throwing the wrong type. The counter
+     * pins that the selector was never invoked.
+     */
+    @Test
+    void aCollateralFeedOpeningAfterTheBodysStartIsRefusedBeforeTheWalletIsAsked() {
+        int[] selectorCalls = new int[1];
+
+        var e = assertThrows(ConvertLiquidationRouter.FeedWindowException.class,
+                () -> router().buildConvertLiquidation(candidate(), loanUtxo(), null, null, null,
+                        requirement -> {
+                            selectorCalls[0]++;
+                            return Optional.empty();
+                        },
+                        ROLE_C, collateralOracleWindowed(1_760_000_010_000L, 1_760_001_000_000L), "addr_change",
+                        1_760_000_000_000L, 1_760_000_120_000L));
+
+        assertEquals(0, selectorCalls[0], "the wallet selector must not run for a body the validator refuses");
+        assertTrue(e.getMessage().contains("collateral"), "names the leg: " + e.getMessage());
+        assertTrue(e.getMessage().contains("[1760000010000,1760001000000]"),
+                "names the feed window: " + e.getMessage());
+        assertTrue(e.getMessage().contains("[1760000000000,1760000120000]"),
+                "names the transaction window, in the body's own slot times: " + e.getMessage());
+    }
+
+    /** The other end: a feed that closes before the body's end is refused the same way. */
+    @Test
+    void aCollateralFeedClosingBeforeTheBodysEndIsRefused() {
+        int[] selectorCalls = new int[1];
+
+        assertThrows(ConvertLiquidationRouter.FeedWindowException.class,
+                () -> router().buildConvertLiquidation(candidate(), loanUtxo(), null, null, null,
+                        requirement -> {
+                            selectorCalls[0]++;
+                            return Optional.empty();
+                        },
+                        ROLE_C, collateralOracleWindowed(1_759_998_000_000L, 1_760_000_060_000L), "addr_change",
+                        1_760_000_000_000L, 1_760_000_120_000L));
+
+        assertEquals(0, selectorCalls[0]);
+    }
+
+    /**
+     * The PRINCIPAL leg is guarded too when the principal is a token: a correctly named principal feed whose
+     * window does not cover the body is refused by name, while the collateral feed covers it.
+     */
+    @Test
+    void aTokenPrincipalFeedThatDoesNotCoverTheBodyIsRefusedNamingThePrincipalLeg() {
+        AssetType principal = new AssetType("c".repeat(56), "4e49474854");
+        AssetType principalNft = new AssetType("d".repeat(56), "6f7261636c65");
+        LiquidationAssessment ada = candidate();
+        LoanDatum datum = LoanFixtures.loanDatum(principal, principalNft, BigInteger.valueOf(20_000_000L),
+                BigInteger.valueOf(100L), ada.loan().datum().collateral(), 1_700_000_000_000L,
+                ada.loan().datum().liquidationMode(), ada.loan().datum().repaymentMode(), false);
+        Loan loan = new Loan("aa".repeat(32), 0, "addr_loan", "cafe",
+                BigInteger.valueOf(100_000_000L), BigInteger.valueOf(3_000_000L), datum);
+        LenderBond bond = new LenderBond("bb".repeat(32), 0, "addr_bond", "cafe", "d87980",
+                LoanFixtures.convertToPrincipalBondDatum(BigInteger.valueOf(50L),
+                        LoanFixtures.noStakeCredential(), principal));
+        LiquidationAssessment tokenPrincipal = LiquidationAssessment.buildable(bond, loan, "token principal",
+                BigInteger.valueOf(20_000_000L), BigInteger.ZERO, false, BigInteger.valueOf(5_000_000L));
+        OracleEntry principalOracle = LoanFixtures.multisig(principal, principalNft, "ee".repeat(28),
+                new OraclePriceFeed(OraclePriceFeed.Variant.AGGREGATED, principal, BigInteger.ONE,
+                        BigInteger.ONE, 1_760_000_030_000L, 1_760_001_000_000L),
+                null, null, java.util.List.of());
+        Map<String, OracleEntry> oracles = new java.util.HashMap<>(collateralOracle());
+        oracles.put(principalNft.toUnit(), principalOracle);
+        int[] selectorCalls = new int[1];
+
+        var e = assertThrows(ConvertLiquidationRouter.FeedWindowException.class,
+                () -> router().buildConvertLiquidation(tokenPrincipal, loanUtxo(), null, null, null,
+                        requirement -> {
+                            selectorCalls[0]++;
+                            return Optional.empty();
+                        },
+                        ROLE_C, oracles, "addr_change", 1_760_000_000_000L, 1_760_000_120_000L));
+
+        assertEquals(0, selectorCalls[0]);
+        assertTrue(e.getMessage().contains("principal"), "names the leg: " + e.getMessage());
+        assertTrue(e.getMessage().contains("[1760000030000,1760001000000]"), e.getMessage());
     }
 
     // ===== the pool snapshot: ONE index query per liquidation cycle (FAB-137 T2b) =====
@@ -350,7 +457,7 @@ class ConvertLiquidationRouterTest {
     private static void buildOnce(ConvertLiquidationRouter router) {
         try {
             router.buildConvertLiquidation(candidate(), loanUtxo(), null, null, null,
-                    requirement -> Optional.empty(), collateralOracle(), "addr_change",
+                    requirement -> Optional.empty(), ROLE_C, collateralOracle(), "addr_change",
                     1_760_000_000_000L, 1_760_000_120_000L);
         } catch (RuntimeException expected) {
             // Whatever the outcome past the pool step: this test counts index queries, not verdicts.
@@ -385,12 +492,13 @@ class ConvertLiquidationRouterTest {
 
         var e = assertThrows(ConvertLiquidationRouter.NoPoolException.class,
                 () -> router.buildConvertLiquidation(candidate(), loanUtxo(), null, null, null,
-                        requirement -> Optional.empty(), collateralOracle(), "addr_change",
+                        requirement -> Optional.empty(), ROLE_C, collateralOracle(), "addr_change",
                         1_760_000_000_000L, 1_760_000_120_000L));
 
         assertEquals("no Minswap pool for " + FLDT.toUnit() + "/lovelace is indexed — not indexed (pools "
                 + "idle since 2025-05-06 are invisible); convert is impossible for this loan, not merely "
-                + "unprofitable — set this market to action: ANTICIPATE if it should be liquidated", e.getMessage());
+                + "unprofitable — set this market to action: CONVERT_BEFORE_ANTICIPATE with a cap if it should be "
+                + "liquidated", e.getMessage());
     }
 
     /** CCL §19: the lookup is now a database read, and its failure must still arrive as LOOKUP_FAILED. */
@@ -406,8 +514,115 @@ class ConvertLiquidationRouterTest {
 
         var e = assertThrows(MinswapPoolResolver.RefusedException.class,
                 () -> router.buildConvertLiquidation(candidate(), loanUtxo(), null, null, null,
-                        requirement -> Optional.empty(), collateralOracle(), "addr_change",
+                        requirement -> Optional.empty(), ROLE_C, collateralOracle(), "addr_change",
                         1_760_000_000_000L, 1_760_000_120_000L));
         assertEquals(MinswapPoolResolver.Refusal.LOOKUP_FAILED, e.refusal());
+    }
+
+    // ===== FAB-194-3: the two IMPOSSIBLE verdicts come before the wallet is asked =====
+
+    /**
+     * A selector that records that it was asked. FAB-194-3 designates U only when the router asks, so a
+     * {@code CONVERT_BEFORE_ANTICIPATE} fallback relies on the router reaching both impossible verdicts — no
+     * pool, a pool too thin — WITHOUT asking: a verdict reached after the selector would have designated U
+     * (and recorded a missing one) for a convert that was never possible.
+     */
+    private static java.util.function.Function<BigInteger, Optional<Utxo>> recording(boolean[] asked) {
+        return requirement -> {
+            asked[0] = true;
+            return Optional.empty();
+        };
+    }
+
+    /** A resolver answering one fixed pool datum for any pair, like {@link FixedPoolResolver}. */
+    private static MinswapPoolResolver resolverOf(MinswapPoolDatum datum) {
+        return new MinswapPoolResolver(null, "addr_pool", MINSWAP_POOL_POLICY) {
+            @Override
+            public Snapshot snapshot() {
+                Utxo poolUtxo = Utxo.builder().txHash("dd".repeat(32)).outputIndex(0)
+                        .address("addr_pool").build();
+                return new Snapshot(Map.of(), MINSWAP_POOL_POLICY) {
+                    @Override
+                    public Optional<ResolvedPool> resolveEitherOrder(AssetType one, AssetType other) {
+                        return Optional.of(new ResolvedPool(poolUtxo, datum, "lp"));
+                    }
+                };
+            }
+        };
+    }
+
+    /** FAB-194-3 — a pool far too shallow to return the debt: {@code POOL_TOO_THIN}, the selector never asked. */
+    @Test
+    void aThinPoolIsRefusedPoolTooThinBeforeTheWalletIsAsked() {
+        // One ada against the live pool's FLDT: swapping the collateral returns far less than the 20 ADA debt.
+        MinswapPoolDatum thin = new MinswapPoolDatum(AssetType.ada(), FLDT, BigInteger.TEN,
+                BigInteger.valueOf(1_000_000L), new BigInteger("7596442927398"),
+                BigInteger.valueOf(80L), BigInteger.valueOf(80L), false);
+        ConvertLiquidationRouter router = new ConvertLiquidationRouter(LoanFixtures.registry(),
+                configuredForMinswap(), null, resolverOf(thin), null, null, LoanFixtures.converters(),
+                LoanFixtures.NETWORK);
+        boolean[] asked = new boolean[1];
+
+        var e = assertThrows(ConvertOrderPlan.RefusedException.class,
+                () -> router.buildConvertLiquidation(candidate(), loanUtxo(), null, null, null,
+                        recording(asked), ROLE_C, collateralOracle(), "addr_change",
+                        1_760_000_000_000L, 1_760_000_120_000L));
+
+        assertEquals(ConvertOrderPlan.Refusal.POOL_TOO_THIN, e.refusal(), e.getMessage());
+        assertFalse(asked[0], "the wallet selector must not be asked before the pool verdict");
+    }
+
+    /** FAB-194-3 — no authentic pool for the pair in the index: {@code NoPoolException}, the selector never asked. */
+    @Test
+    void aPairWithNoIndexedPoolIsRefusedBeforeTheWalletIsAsked() {
+        ConvertLiquidationRouter router = indexedRouter(indexHolding(java.util.List.of()));
+        router.beginCycle();
+        boolean[] asked = new boolean[1];
+
+        assertThrows(ConvertLiquidationRouter.NoPoolException.class,
+                () -> router.buildConvertLiquidation(candidate(), loanUtxo(), null, null, null,
+                        recording(asked), ROLE_C, collateralOracle(), "addr_change",
+                        1_760_000_000_000L, 1_760_000_120_000L));
+
+        assertFalse(asked[0], "the wallet selector must not be asked when no pool exists");
+    }
+
+    /** FAB-194-3 — no pool address configured: {@code NoPoolException} with the new advice, the selector never asked. */
+    @Test
+    void aBlankPoolAddressIsRefusedBeforeTheWalletIsAsked() {
+        AppConfig.LoansConfiguration blank = new AppConfig.LoansConfiguration() {
+            @Override
+            public String getMinswapPoolAddress() {
+                return "  ";
+            }
+        };
+        ConvertLiquidationRouter router = new ConvertLiquidationRouter(LoanFixtures.registry(), blank, null,
+                new FixedPoolResolver(), null, null, LoanFixtures.converters(), LoanFixtures.NETWORK);
+        boolean[] asked = new boolean[1];
+
+        var e = assertThrows(ConvertLiquidationRouter.NoPoolException.class,
+                () -> router.buildConvertLiquidation(candidate(), loanUtxo(), null, null, null,
+                        recording(asked), ROLE_C, collateralOracle(), "addr_change",
+                        1_760_000_000_000L, 1_760_000_120_000L));
+
+        assertEquals("convert unavailable: no Minswap pool address configured for this network, so there is no "
+                + "pool to swap " + FLDT.toUnit() + " against; set loans.minswap.pool-address, or set this market "
+                + "to action: CONVERT_BEFORE_ANTICIPATE with a cap if the loan should still be liquidated",
+                e.getMessage());
+        assertFalse(asked[0], "the wallet selector must not be asked when no pool address is configured");
+    }
+
+    /** FAB-194-3 — {@code convertEnabled()} answers {@code loans.liquidation.convert.enabled}, read off a real gate. */
+    @Test
+    void convertEnabledAnswersTheEconomicsGatesOwnSwitch() {
+        for (boolean enabled : new boolean[]{true, false}) {
+            ConvertEconomics economics = new ConvertEconomics(new AppConfig.ConvertConfiguration(enabled), null, null);
+            ConvertLiquidationRouter router = new ConvertLiquidationRouter(LoanFixtures.registry(),
+                    configuredForMinswap(), null, new FixedPoolResolver(), economics, null,
+                    LoanFixtures.converters(), LoanFixtures.NETWORK);
+
+            assertEquals(enabled, economics.enabled());
+            assertEquals(enabled, router.convertEnabled());
+        }
     }
 }

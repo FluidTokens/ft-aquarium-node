@@ -5,6 +5,7 @@ import com.bloxbean.cardano.client.address.AddressProvider;
 import com.bloxbean.cardano.client.address.Credential;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
 import com.bloxbean.cardano.client.api.ScriptSupplier;
+import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.api.common.OrderEnum;
 import com.bloxbean.cardano.client.api.exception.ApiException;
@@ -58,6 +59,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -97,6 +99,12 @@ import static org.mockito.Mockito.when;
  *       index returns the operator's UTxOs in (wallet first, scripts first, interleaved), whether or not
  *       selection has to pull extra inputs, and a wallet with nothing safe to select is REFUSED rather
  *       than drained of a reference script (CCL trap 9b).</li>
+ *   <li><b>(e) the slot evaluates through the bean.</b> FAB-38: with NO {@code withTxEvaluator}, the
+ *       {@code QuickTxBuilder} bean's processor slot evaluates through the evaluator it was handed — the
+ *       one {@code YaciConfig.transactionEvaluator} bean in production — and the deserialised
+ *       transaction carries what that evaluator measured.</li>
+ *   <li><b>(d) dump mode.</b> The dump wrapper logs exactly the bytes the injected evaluator receives,
+ *       and neither evaluates nor submits through Blockfrost on its own.</li>
  * </ul>
  * And, driving the processor's own cycle: the tank build is STRICT outside dump mode (a failed
  * evaluation never reaches submit), and a {@code PPViewHashesDontMatch} rejection from
@@ -245,6 +253,110 @@ class TankProductionWiringTest {
         }
     }
 
+    // ---- (e) the bean's processor slot evaluates through the evaluator it was handed ---------------
+
+    /**
+     * ⛔ FAB-38: outside dump mode the tank never calls {@code withTxEvaluator}, so CCL evaluates through
+     * the {@code QuickTxBuilder} bean's PROCESSOR SLOT (CCL trap 8). That slot must reach the evaluator
+     * the bean was handed — the {@code YaciConfig.transactionEvaluator} bean in production — and the
+     * deserialised transaction must carry what it measured. Here the evaluator is a counting wrapper over
+     * the rig's Scalus evaluator, the build sets none, and the ex-units are read off the shipped bytes,
+     * never off an {@code EvaluationResult}.
+     */
+    @Test
+    void theBeanProcessorSlotEvaluatesThroughTheInjectedEvaluatorAndShipsMeasuredExUnits() throws Exception {
+        for (Ordering ordering : Ordering.values()) {
+            for (Mode mode : List.of(Mode.NORMAL, Mode.FORCED_SELECTION)) {
+                AtomicInteger calls = new AtomicInteger();
+                Rig rig = rig(ordering, mode, new BFBackendService(UNREACHABLE_BLOCKFROST, "dummy"),
+                        scalus -> (cbor, inputUtxos) -> {
+                            calls.incrementAndGet();
+                            return scalus.evaluateTx(cbor, inputUtxos);
+                        });
+                Transaction built = rig.balanced().build();
+                assertTrue(calls.get() >= 1, ordering + "/" + mode
+                        + ": the bean's processor slot never reached the evaluator it was handed");
+                Transaction shipped = Transaction.deserialize(built.serialize());
+
+                List<Redeemer> redeemers = shipped.getWitnessSet().getRedeemers();
+                assertFalse(redeemers == null || redeemers.isEmpty(), ordering + "/" + mode + ": no redeemer");
+                var finalEval = rig.scalus().evaluateTx(shipped.serialize());
+                assertTrue(finalEval.isSuccessful(), ordering + "/" + mode
+                        + ": the shipped bytes do not satisfy the tank validator: " + finalEval.getResponse());
+                for (Redeemer redeemer : redeemers) {
+                    ExUnits declared = redeemer.getExUnits();
+                    assertTrue(declared.getMem().compareTo(PLACEHOLDER_CEILING) > 0
+                                    && declared.getSteps().compareTo(PLACEHOLDER_CEILING) > 0,
+                            ordering + "/" + mode + ": the shipped transaction declares placeholder ex-units "
+                                    + declared + " — the processor slot did not evaluate through the bean");
+                    ExUnits measured = finalEval.getValue().stream()
+                            .filter(r -> r.getRedeemerTag() == redeemer.getTag()
+                                    && r.getIndex() == redeemer.getIndex().intValue())
+                            .findFirst().orElseThrow().getExUnits();
+                    assertTrue(declared.getMem().compareTo(measured.getMem()) >= 0
+                                    && declared.getSteps().compareTo(measured.getSteps()) >= 0,
+                            ordering + "/" + mode + ": declares " + declared + " but the shipped bytes cost "
+                                    + measured + " — a phase-2 failure and forfeited collateral");
+                }
+            }
+        }
+    }
+
+    // ---- (d) dump mode logs exactly what the injected evaluator receives ----------------------------
+
+    /**
+     * ⛔ FAB-38: the dump wrapper ({@code scheduling.transaction-processor.dump-cbor}) wraps the INJECTED
+     * evaluator bean. Every call it forwards must be logged as one {@code EVALUATE CBOR} WARN whose message
+     * ends with the hex of exactly the bytes that call received, in order — and the wrapper must not reach
+     * Blockfrost's evaluate or submit on its own: the recording evaluator here is not backed by the mocked
+     * {@code TransactionService}, so any call to it is a path that bypasses the bean.
+     */
+    @Test
+    void dumpModeLogsExactlyTheBytesTheInjectedEvaluatorReceivesAndTouchesNoBackend() throws Exception {
+        TransactionService transactionService = mock(TransactionService.class);
+        List<byte[]> received = new ArrayList<>();
+        TransactionEvaluator recording = (cbor, inputUtxos) -> {
+            received.add(cbor.clone());
+            return Result.<List<EvaluationResult>>success("ok").withValue(List.of(
+                    EvaluationResult.builder().redeemerTag(RedeemerTag.Spend).index(0)
+                            .exUnits(ExUnits.builder().mem(BigInteger.valueOf(500_000L))
+                                    .steps(BigInteger.valueOf(200_000_000L)).build())
+                            .build()));
+        };
+
+        Cycle cycle = new Cycle(transactionService, recording);
+        java.lang.reflect.Field dumpCbor = ScheduledTransactionService.class.getDeclaredField("dumpCbor");
+        dumpCbor.setAccessible(true);
+        dumpCbor.setBoolean(cycle.processor, true);
+
+        ch.qos.logback.classic.Logger logger =
+                (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(ScheduledTransactionService.class);
+        var appender = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            cycle.run();
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        assertFalse(received.isEmpty(), "dump mode never reached the injected evaluator");
+        List<String> dumps = appender.list.stream()
+                .filter(e -> e.getLevel() == ch.qos.logback.classic.Level.WARN)
+                .map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage)
+                .filter(m -> m.startsWith("EVALUATE CBOR"))
+                .toList();
+        assertEquals(received.size(), dumps.size(),
+                "one EVALUATE CBOR WARN per evaluator call: " + received.size() + " calls, " + dumps.size()
+                        + " dumps");
+        for (int i = 0; i < received.size(); i++) {
+            assertTrue(dumps.get(i).endsWith(HexUtil.encodeHexString(received.get(i))),
+                    "dump " + i + " does not end with the exact bytes evaluator call " + i + " received");
+        }
+        verify(transactionService, never()).evaluateTx(any(byte[].class));
+        verify(transactionService, never()).submitTransaction(any(byte[].class));
+    }
+
     // ---- the processor's own cycle: strict evaluation, and the params-rejection refresh -------------
 
     /**
@@ -308,6 +420,15 @@ class TankProductionWiringTest {
         private final ScheduledTransactionService processor;
 
         Cycle(TransactionService transactionService) throws Exception {
+            this(transactionService, null);
+        }
+
+        /**
+         * @param evaluator what the bean's processor slot and the processor are both handed; {@code null}
+         *                  means the production evaluator bean over the mocked backend (FAB-38), one
+         *                  instance shared by the two, exactly as the container shares it.
+         */
+        Cycle(TransactionService transactionService, TransactionEvaluator evaluator) throws Exception {
             JsonNode fx = fixture();
             ProtocolParams params = protocolParams(fx.get("protocol_params"));
             CardanoConverters converters = ClasspathConversionsFactory.createConverters(NetworkType.MAINNET);
@@ -337,8 +458,10 @@ class TankProductionWiringTest {
 
             BFBackendService backend = mock(BFBackendService.class);
             when(backend.getTransactionService()).thenReturn(transactionService);
+            TransactionEvaluator shared = evaluator != null ? evaluator
+                    : new YaciConfig().transactionEvaluator(backend);
             QuickTxBuilder bean = new YaciConfig().quickTxBuilder(supplier, epochParams,
-                    scriptSupplier(validator), backend);
+                    scriptSupplier(validator), backend, shared);
 
             AddressUtxoEntity tankEntity = new AddressUtxoEntity();
             tankEntity.setTxHash(tank.getTxHash());
@@ -371,7 +494,7 @@ class TankProductionWiringTest {
             AppConfig.Network network = new AppConfig.Network();
             network.setNetworkForTest("mainnet");
 
-            processor = new ScheduledTransactionService(network, aquarium, account, bean, backend, epochParams,
+            processor = new ScheduledTransactionService(network, aquarium, account, bean, shared, epochParams,
                     supplier, utxoRepository, staker, converters, parametersService,
                     tankContract, appUtxoService, blockEventListener);
         }
@@ -407,6 +530,18 @@ class TankProductionWiringTest {
     // ---- the rig ------------------------------------------------------------------------------------
 
     private static Rig rig(Ordering ordering, Mode mode, BFBackendService backend) throws Exception {
+        // FAB-38: by default the bean gets the PRODUCTION evaluator bean over this backend.
+        TransactionEvaluator production = new YaciConfig().transactionEvaluator(backend);
+        return rig(ordering, mode, backend, scalus -> production);
+    }
+
+    /**
+     * The rig, with the evaluator the {@code QuickTxBuilder} bean is handed chosen from the rig's own
+     * Scalus evaluator (built over the same params, supplier and validator).
+     */
+    private static Rig rig(Ordering ordering, Mode mode, BFBackendService backend,
+                           Function<scalus.bloxbean.ScalusTransactionEvaluator, TransactionEvaluator> evaluatorFor)
+            throws Exception {
         JsonNode fx = fixture();
         Utxo tank = utxo(fx.get("tank"));
         List<Utxo> refs = new ArrayList<>();
@@ -473,9 +608,14 @@ class TankProductionWiringTest {
         universe.addAll(wallet);
         UtxoSupplier supplier = supplier(universe);
 
+        var scalusEvaluator = new scalus.bloxbean.ScalusTransactionEvaluator(
+                scalus.cardano.ledger.SlotConfig$.MODULE$.mainnet(), params, supplier,
+                (scalus.bloxbean.ScriptSupplier) scriptHash -> validator,
+                scalus.bloxbean.EvaluatorMode.EVALUATE_AND_COMPUTE_COST, false);
+
         // ⛔ THE BEAN, not a QuickTxBuilder built here: whatever YaciConfig wires is what this exercises.
         QuickTxBuilder bean = new YaciConfig().quickTxBuilder(supplier, () -> params, scriptSupplier(validator),
-                backend);
+                backend, evaluatorFor.apply(scalusEvaluator));
 
         var tankDatum = new DatumTankConverter().deserialize(fx.get("tank").get("inline_datum").asText());
         TransactionInput paramsRef = TransactionInput.builder().transactionId(PARAMS_REF_TX).index(0).build();
@@ -503,11 +643,6 @@ class TankProductionWiringTest {
         java.util.function.ToLongFunction<java.time.LocalDateTime> toSlot = t -> SlotConfigs.mainnet().getZeroSlot()
                 + (t.toInstant(ZoneOffset.UTC).toEpochMilli() - SlotConfigs.mainnet().getZeroTime()) / 1000;
         long firstValidSlot = ScheduledTransactionService.firstValidSlot(tankDatum.getExecutiontime(), toSlot);
-
-        var scalusEvaluator = new scalus.bloxbean.ScalusTransactionEvaluator(
-                scalus.cardano.ledger.SlotConfig$.MODULE$.mainnet(), params, supplier,
-                (scalus.bloxbean.ScriptSupplier) scriptHash -> validator,
-                scalus.bloxbean.EvaluatorMode.EVALUATE_AND_COMPUTE_COST, false);
 
         return new Rig(bean, supplier, tx, tank, collateral, operator, firstValidSlot + 1, firstValidSlot,
                 scripts, scalusEvaluator);

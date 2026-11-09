@@ -370,7 +370,12 @@ public class AppConfig {
             this.modeName = modeName;
         }
 
-        @Value("${loans.liquidation.delay-seconds:60}")
+        /**
+         * Obsolete since FAB-183 and read by nothing: the liquidation stage runs on committed blocks and oracle
+         * price changes, never on a timer, so its delay setting is no longer bound or shipped
+         * ({@link ObsoleteSettingsWarning} WARNs at boot if it is set). The field is retained only for
+         * the existing constructors that take it.
+         */
         private long delaySeconds;
 
         /** How far past "now" the built transaction's validity interval extends. */
@@ -485,8 +490,9 @@ public class AppConfig {
          *     markets:
          *       - unit: lovelace          # "lovelace", or policyIdHex + assetNameHex
          *         mode: SHADOW            # DISABLED | SHADOW | LIVE; omitted = inherit the global mode
-         *         action: CONVERT         # CONVERT | ANTICIPATE; default CONVERT
-         *         cap: 1000000000         # MANDATORY iff action: ANTICIPATE, meaningless otherwise
+         *         action: CONVERT         # CONVERT | ANTICIPATE | CONVERT_BEFORE_ANTICIPATE; default CONVERT
+         *         cap: 1000000000         # MANDATORY iff action: ANTICIPATE or CONVERT_BEFORE_ANTICIPATE,
+         *                                 # per loan, in the token's smallest unit; meaningless otherwise
          * </pre>
          *
          * <p><b>An UNLISTED market is {@code action: CONVERT} at the global mode.</b> An absent or
@@ -541,7 +547,8 @@ public class AppConfig {
 
             /**
              * The most principal the bot may front in this market, in the principal asset's own unit.
-             * Mandatory when {@link #action} is {@link Action#ANTICIPATE}, meaningless otherwise.
+             * Mandatory when {@link #action} is {@link Action#ANTICIPATE} or
+             * {@link Action#CONVERT_BEFORE_ANTICIPATE}, meaningless otherwise.
              */
             private BigInteger cap;
         }
@@ -563,7 +570,18 @@ public class AppConfig {
              * least the minimum the lender expects. Pool reliability is the operator's judgement — the
              * bot does not detect it.
              */
-            ANTICIPATE
+            ANTICIPATE,
+            /**
+             * Convert first; pay in advance only when convert is impossible. For a loan whose lender allows
+             * conversion the bot converts exactly as {@link #CONVERT} does, funded from U. Only when convert
+             * is impossible — no authentic Minswap pool for the pair in this node's index or no pool
+             * address configured ({@code NO_MINSWAP_POOL}), the pool too thin to return the debt
+             * ({@code POOL_TOO_THIN}), or {@code loans.liquidation.convert.enabled=false} — does it pay in
+             * advance, in the same check, under the {@link #ANTICIPATE} rules: the per-loan cap in the
+             * token's smallest unit, the wallet balance, and profitability. Every other convert refusal is
+             * refused by name and is never paid in advance. Like {@link #ANTICIPATE}, it needs a cap.
+             */
+            CONVERT_BEFORE_ANTICIPATE
         }
 
         /**
@@ -600,17 +618,21 @@ public class AppConfig {
                     throw new IllegalStateException(where + " has an empty action; legal values are "
                             + Arrays.toString(Action.values()));
                 }
-                if (m.getAction() == Action.ANTICIPATE) {
+                // Exhaustive, no default: a new action does not compile until it says whether it fronts capital.
+                boolean capMandatory = switch (m.getAction()) {
+                    case CONVERT -> false;
+                    case ANTICIPATE, CONVERT_BEFORE_ANTICIPATE -> true;
+                };
+                if (capMandatory) {
                     if (m.getCap() == null) {
-                        throw new IllegalStateException(where + " is action: ANTICIPATE and has no cap. "
+                        throw new IllegalStateException(where + " is action: " + m.getAction() + " and has no cap. "
                                 + "The cap bounds the principal the bot fronts from its own wallet; "
                                 + "anticipating without one is unbounded exposure");
                     }
                     if (m.getCap().signum() < 0) {
                         throw new IllegalStateException(where + " has a negative cap (" + m.getCap() + ")");
                     }
-                }
-                if (m.getAction() == Action.CONVERT && m.getCap() != null) {
+                } else if (m.getCap() != null) {
                     log.warn("{} is action: CONVERT and also sets cap {} — convert fronts no principal, "
                             + "so the cap governs nothing here and is IGNORED", where, m.getCap());
                 }
@@ -1046,7 +1068,12 @@ public class AppConfig {
         @Value("${loans.compound.enabled:false}")
         private boolean enabled;
 
-        @Value("${loans.compound.delay-seconds:60}")
+        /**
+         * Obsolete since FAB-183 and read by nothing: the compound stage runs on committed blocks and oracle
+         * price changes, never on a timer, so its delay setting is no longer bound or shipped
+         * ({@link ObsoleteSettingsWarning} WARNs at boot if it is set). The field is retained only for
+         * the existing constructors that take it.
+         */
         private long delaySeconds;
 
         /**

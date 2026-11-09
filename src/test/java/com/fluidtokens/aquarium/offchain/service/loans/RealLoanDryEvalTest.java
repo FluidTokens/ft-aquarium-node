@@ -286,6 +286,10 @@ class RealLoanDryEvalTest {
     private static final Utxo LM_CONFIG_UTXO = LoanFixtures.syntheticLatestLmConfigUtxo(TX_LM_CONFIG, 0);
     private static final Utxo WALLET_UTXO = LoanFixtures.adaUtxo(TX_WALLET, 0,
             LoanFixtures.botAddress(), 50_000_000L);
+    /** FAB-185 — wallet role C: ada-only, exactly {@code WalletShape.collateralLovelace} of the rig's params. */
+    private static final Utxo COLLATERAL_UTXO = LoanFixtures.adaUtxo("c5".repeat(32), 0, LoanFixtures.botAddress(),
+            com.fluidtokens.aquarium.offchain.service.wallet.WalletShape.collateralLovelace(
+                    EvalFixtures.protocolParams().getProtocolParams()).longValueExact());
 
     /** The real ledger limit. Not {@link EvalFixtures#protocolParams()}'s raised ceiling. */
     private static final int MAX_TX_SIZE = 16_384;
@@ -1161,7 +1165,7 @@ class RealLoanDryEvalTest {
      * six-published-but-only-some-declared.
      */
     private static List<Utxo> universe(Fixture fixture, Set<Validator> published) {
-        List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO,
+        List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO, COLLATERAL_UTXO,
                 fixture.loanUtxo(), fixture.bondUtxo()));
 
         universe.add(LoanFixtures.utxo(ORACLE_REF_INPUT.getTransactionId(), ORACLE_REF_INPUT.getIndex(),
@@ -1262,7 +1266,7 @@ class RealLoanDryEvalTest {
         return new LiquidateTransactionBuilder.Request(
                 List.of(fixture.toLiquidation()), CONFIG_UTXO, LM_CONFIG_UTXO,
                 Map.of(ORACLE_NFT.toUnit(), fixture.oracle()), WALLET_UTXO, LoanFixtures.botAddress(),
-                validFrom, validTo, MARGIN, referenceScripts);
+                validFrom, validTo, MARGIN, referenceScripts, COLLATERAL_UTXO);
     }
 
     /**
@@ -1369,6 +1373,14 @@ class RealLoanDryEvalTest {
         Utxo walletUtxo = utxoSupplier.getTxOutput(
                 "48c102c0034b04558c640df211045fdd7511dc7046b55942ca5909372eab24cd", 1).orElseThrow();
         String changeAddress = walletUtxo.getAddress();
+        // FAB-185: role C, resolved from the live wallet with the live parameters, as the executor resolves it.
+        java.math.BigInteger collateralLovelace = com.fluidtokens.aquarium.offchain.service.wallet.WalletShape
+                .collateralLovelace(new com.bloxbean.cardano.client.backend.api.DefaultProtocolParamsSupplier(
+                        bf.getEpochService()).getProtocolParams());
+        Utxo collateralUtxo = com.fluidtokens.aquarium.offchain.service.wallet.WalletRoles
+                .resolve(utxoSupplier.getAll(changeAddress), collateralLovelace).c()
+                .orElseThrow(() -> new AssertionError("the wallet holds no role C — no ada-only output of exactly "
+                        + collateralLovelace + " lovelace"));
 
         var registry = new FluidOracleClient("https://testapi.fluidtokens.com/get-oracle-tokens");
         registry.refresh(); // outside Spring the scheduled refresh never runs; populate it once
@@ -1394,7 +1406,7 @@ class RealLoanDryEvalTest {
         var request = new LiquidateTransactionBuilder.Request(
                 List.of(new LiquidateTransactionBuilder.LoanLiquidation(assessment, loanUtxo, bondUtxo)),
                 configUtxo, lmConfigUtxo, Map.of(ORACLE_NFT.toUnit(), oracle), walletUtxo, changeAddress,
-                validFrom, validTo, 30_000L, published);
+                validFrom, validTo, 30_000L, published, collateralUtxo);
 
         Transaction tx = production.build(request);
 

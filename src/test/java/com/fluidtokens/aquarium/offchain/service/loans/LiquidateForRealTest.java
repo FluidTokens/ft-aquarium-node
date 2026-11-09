@@ -117,9 +117,21 @@ public class LiquidateForRealTest {
             System.out.println("LQ maths: remainingDebt=" + debt
                     + " price=" + entry.feed().priceInLovelaces() + "/" + entry.feed().priceDenominator());
 
-            Utxo wallet = b.getUtxoService().getUtxos(signer.baseAddress(), 100, 1).getValue().stream()
+            List<Utxo> walletUtxos = b.getUtxoService().getUtxos(signer.baseAddress(), 100, 1).getValue();
+            // FAB-185 — role C, resolved as the executor resolves it; pinned by the builder as the only
+            // collateral and never spent, so the wallet input below is never C.
+            Utxo collateral = com.fluidtokens.aquarium.offchain.service.wallet.WalletRoles.resolve(walletUtxos,
+                            com.fluidtokens.aquarium.offchain.service.wallet.WalletShape.collateralLovelace(
+                                    new com.bloxbean.cardano.client.backend.api.DefaultProtocolParamsSupplier(
+                                            b.getEpochService()).getProtocolParams()))
+                    .c().orElseThrow(() -> new IllegalStateException("no role-C output at "
+                            + signer.baseAddress() + " — the wallet holds no ada-only output of exactly the "
+                            + "collateral amount"));
+            Utxo wallet = walletUtxos.stream()
                     .filter(u -> u.getAmount().size() == 1 && u.getReferenceScriptHash() == null
                             && u.getInlineDatum() == null && u.getDataHash() == null)
+                    .filter(u -> !(u.getTxHash().equals(collateral.getTxHash())
+                            && u.getOutputIndex() == collateral.getOutputIndex()))
                     .max(Comparator.comparing(u -> u.getAmount().getFirst().getQuantity())).orElseThrow();
             System.out.println("LQ wallet utxo " + wallet.getTxHash().substring(0, 12) + "#"
                     + wallet.getOutputIndex() + " " + wallet.getAmount().getFirst().getQuantity());
@@ -131,7 +143,7 @@ public class LiquidateForRealTest {
                     cfg(b, CFG), cfg(b, LMCFG), entry, null, fromMs, toMs, sl[0], sl[1],
                     signer.baseAddress(),
                     new LiquidateTransactionBuilder.ReferenceScripts(null, null, null, null,
-                            new TransactionInput(REF_LOAN_CLAIM, 0), null, null), MARGIN);
+                            new TransactionInput(REF_LOAN_CLAIM, 0), null, null), MARGIN, collateral);
 
             // 3+4+5. Build through the PRODUCTION constructor: backend script supplier, real
             // Blockfrost evaluator, guarded coin selection and pinned collateral.

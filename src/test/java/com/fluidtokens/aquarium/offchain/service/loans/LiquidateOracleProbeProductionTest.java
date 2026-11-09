@@ -16,6 +16,8 @@ import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
 import com.bloxbean.cardano.client.plutus.spec.ExUnits;
 import com.bloxbean.cardano.client.plutus.spec.Redeemer;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
+import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
+import com.bloxbean.cardano.client.util.HexUtil;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.config.YaciConfig;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
@@ -128,6 +130,7 @@ class LiquidateOracleProbeProductionTest {
         final AtomicInteger evaluations = new AtomicInteger();
         final AtomicInteger submissions = new AtomicInteger();
         final List<ILoggingEvent> events = new ArrayList<>();
+        List<Utxo> universe;
         LiquidationExecutor executor;
         LiquidationDecisionLog log;
         LiquidateTransactionBuilder builder;
@@ -161,18 +164,23 @@ class LiquidateOracleProbeProductionTest {
             return this;
         }
 
-        Rig wire(AppConfig.LiquidationConfiguration.Mode mode, List<Utxo> walletUtxos) {
+        Rig wire(AppConfig.LiquidationConfiguration.Mode mode, List<Utxo> walletFunds) {
+            // FAB-185: role C, sized from the parameters the executor below reads, beside the funds given.
+            List<Utxo> walletUtxos = LoanFixtures.shapedWallet(LoanFixtures.protocolParams(), ACCOUNT.baseAddress(),
+                    walletFunds.toArray(new Utxo[0]));
             Scenario scenario = tokenScenario();
             List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO, ORACLE_NFT_UTXO,
                     C3_PROVIDER_UTXO, scenario.loanUtxo(), scenario.bondUtxo()));
             universe.addAll(walletUtxos);
+            this.universe = universe;
             var contentHold = LoanFixtures.utxoSupplier(universe);
             ScriptSupplier noScripts = hash -> Optional.empty();
 
             YaciConfig yaciConfig = new YaciConfig();
             builder = yaciConfig.liquidateTransactionBuilder(LoanFixtures.registry(), previewNetwork(),
-                    LoanFixtures.converters(), contentHold, LoanFixtures.protocolParams(), noScripts, backend,
-                    yaciConfig.oracleReferenceInputProbe(contentHold, backend));
+                    LoanFixtures.converters(), contentHold, LoanFixtures.protocolParams(), noScripts,
+                    yaciConfig.transactionEvaluator(backend),
+                    yaciConfig.oracleReferenceInputProbe(contentHold, backend, OracleOutRefIndex.NOTHING_INDEXED));
 
             AppConfig.LiquidationConfiguration configuration = config(mode);
             BlockEventListener blockEventListener = new BlockEventListener(null);
@@ -322,6 +330,50 @@ class LiquidateOracleProbeProductionTest {
         verify(rig.utxoService, never()).getUtxos(C3_PROVIDER_ADDRESS, ORACLE_NFT.toUnit(), 100, 1);
         assertEquals(0, rig.evaluations.get());
         assertTrue(!rig.droppedAWalletUtxo(), rig.events.toString());
+    }
+
+    /**
+     * (d) ⛔ FAB-185, production wiring: the executor's cycle over {@code YaciConfig}'s own builder bean, with
+     * the shaped wallet — C, U (the 200-ADA output, the largest ada-only one that is not C) and a 150-ADA
+     * ada-only output beside it. The bytes the executor would submit deserialise to wallet inputs exactly {U},
+     * collateral exactly [C], and redeemers carrying the mocked Blockfrost evaluator's ex-units.
+     *
+     * <p>SHADOW, not LIVE: this rig publishes no reference scripts, so a LIVE cycle vetoes the all-inline body
+     * as {@code TX_TOO_LARGE} before the wire. A SHADOW cycle records the very bytes it would have submitted
+     * ({@code WOULD_SUBMIT}'s {@code txCborHex}), which is what is read back here.
+     */
+    @Test
+    void theSubmittedPlainLiquidationSpendsExactlyUAndPledgesExactlyC() throws Exception {
+        Rig rig = new Rig().feedAnswers(live(ORACLE_NFT_UTXO)).providerAnswers(live(C3_PROVIDER_UTXO))
+                .wire(AppConfig.LiquidationConfiguration.Mode.SHADOW, List.of(WALLET_A, WALLET_B));
+        Utxo c = rig.universe.stream().filter(u -> u.getTxHash().equals("c5".repeat(32))).findFirst()
+                .orElseThrow(() -> new AssertionError("the shaped wallet carries no C"));
+
+        rig.cycles(1);
+
+        LiquidationDecision decision = rig.log.newestFirst(10).getFirst();
+        assertEquals(LiquidationDecision.Outcome.WOULD_SUBMIT, decision.outcome(), decision.detail());
+        assertNotNull(decision.txCborHex(), "the would-submit bytes are recorded");
+        assertEquals(1, rig.evaluations.get(), "priced exactly once, by the mocked Blockfrost evaluator");
+        Transaction tx = Transaction.deserialize(HexUtil.decodeHexString(decision.txCborHex()));
+        List<TransactionInput> walletInputs = tx.getBody().getInputs().stream()
+                .filter(input -> rig.universe.stream()
+                        .filter(u -> u.getTxHash().equals(input.getTransactionId())
+                                && u.getOutputIndex() == input.getIndex())
+                        .anyMatch(u -> ACCOUNT.baseAddress().equals(u.getAddress())))
+                .toList();
+        assertEquals(List.of(new TransactionInput(WALLET_A.getTxHash(), WALLET_A.getOutputIndex())), walletInputs,
+                "the wallet inputs must be exactly {U}, U once");
+        assertEquals(List.of(new TransactionInput(c.getTxHash(), c.getOutputIndex())), tx.getBody().getCollateral(),
+                "the collateral must be exactly [C]");
+        List<Redeemer> redeemers = tx.getWitnessSet().getRedeemers();
+        assertTrue(!redeemers.isEmpty(), "a script transaction carries redeemers");
+        for (Redeemer redeemer : redeemers) {
+            assertEquals(BigInteger.valueOf(400_000), redeemer.getExUnits().getMem(),
+                    redeemer.getTag() + "#" + redeemer.getIndex() + " mem is not the evaluator's");
+            assertEquals(BigInteger.valueOf(150_000_000), redeemer.getExUnits().getSteps(),
+                    redeemer.getTag() + "#" + redeemer.getIndex() + " steps are not the evaluator's");
+        }
     }
 
     /** The rig really is the bean: the builder it drives holds a probe (6d pins the same on the bean alone). */
