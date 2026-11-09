@@ -31,8 +31,9 @@ monthly from the fees generated.
 |---|---|
 | **[docs/deploying.md](docs/deploying.md)** | Standing up a node for the first time — keys, configuration, first start, reaching the UI safely, arming the bot, the market specification |
 | **[docs/upgrading.md](docs/upgrading.md)** | Already running one — version bumps, and the re-index/wipe sequence a contract redeploy requires |
+| **[docs/oracle-stream.md](docs/oracle-stream.md)** | The oracle WebSocket — what it is, where it connects, how it signs in, its log lines, and how to turn it off |
 
-Both cover **Docker Compose**. Systemd, Kubernetes and Nomad all work; the ordering, secrets and
+The first two cover **Docker Compose**. Systemd, Kubernetes and Nomad all work; the ordering, secrets and
 exposure guidance applies unchanged.
 
 **You never configure a contract address, a script hash or a sync start point.** They ship in the
@@ -189,7 +190,8 @@ whether the tree was dirty, and `unknown` when it could not tell. It is also the
 startup banner.
 
 ```bash
-curl -s http://localhost:8080/actuator/info | jq .build
+# from docker/, on the shipped Compose file, which publishes no port for the node
+docker compose exec -T aquarium-node curl -s http://localhost:8080/actuator/info | jq .build
 ```
 
 See [docs/deploying.md](docs/deploying.md) §11.

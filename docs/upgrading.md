@@ -20,7 +20,7 @@ error.
 | You enabled the **UI** | restart | untouched |
 | Upgrading to the release that reads **oracle liveness from the index** (FAB-196) | on a node **already on Yaci Store 2.0.7**: pull, restart — nothing else required; a re-sync with the §1.1 steps is optional ([§7](#oracle-liveness-is-read-from-the-index-first-fab-196)). It ships in the 2026-11 release, so from Yaci 0.1.7 **§1.3 comes first** | untouched on Yaci 2.0.7, unless you choose to re-sync; from 0.1.7, ⛔ **wiped** (§1.3) |
 | Upgrading to the release that adds **`CONVERT_BEFORE_ANTICIPATE`** and keeps **U in the check** (FAB-194) | on a node **already on Yaci Store 2.0.7**: pull, restart — nothing else required; it changes how every `shadow` or `live` node funds liquidations from U ([§7](#u-stays-in-the-check-convert_before_anticipate-fab-194)). It ships in the 2026-11 release, so from Yaci 0.1.7 **§1.3 comes first** | untouched on Yaci 2.0.7; from 0.1.7, ⛔ **wiped** (§1.3) |
-| **FluidTokens redeployed the contracts** (new config NFTs) | §4 — new coordinates **and a full re-sync** | ⛔ **wiped** |
+| **FluidTokens redeployed the contracts** (new config NFTs), or moved a script the node **indexes** under the same NFTs | §4 — new coordinates **and a full re-sync** | ⛔ **wiped** |
 | FluidTokens replaced **action scripts in place** (same config NFTs — e.g. 2026-10-01, 2026-10-23/26) | §4.8, §4.9 — new image, restart | untouched |
 | You changed `sync-start-*` | §3 — on an existing database this **does nothing** by itself | ⛔ **wiped, or no effect** |
 | Upgrading to the release that **indexes the Minswap V2 pools** (FAB-137) | §1.1 — wipe **including the cursor**, re-sync from `sync-start` | ⛔ **wiped** |
@@ -140,8 +140,9 @@ and that rollback deletes rows from `address` by `slot` — a column a repaired 
 You trade a clear refusal for a second, more confusing failure at every boot, and the same restart
 loop. (This is read from Yaci 2.0.7's code, not run.)
 
-The wipe also drops the node's token-metadata cache (tickers, names and decimals); it refills by itself
-from the token registry.
+The wipe also drops the node's token-metadata cache (tickers, names and decimals). Only a node with the
+readiness UI on (`LOANS_UI_ENABLED=true`) uses it, and there it refills from the token registry as the
+page looks each token up. A node with the UI off never reads or writes it.
 
 ---
 
@@ -158,14 +159,19 @@ docker compose logs -f aquarium-node
 Check afterwards:
 
 ```bash
-curl -s http://localhost:8080/healthcheck | jq .
+docker compose exec -T aquarium-node curl -s http://localhost:8080/healthcheck | jq .
 ```
+
+The shipped Compose file publishes no port for the node, so every `curl` in this guide runs **inside**
+the node's container (`docker compose exec`, from `docker/`); only `jq` runs on your host. While the node
+is still syncing, `/healthcheck` answers the plain text `...syncing...` instead of JSON, and `jq` fails
+on it — wait for the sync to finish.
 
 **Confirm you are running what you think you are.** `/healthcheck` answers "is it working", not
 "what is it" — the commit is on `/actuator/info`:
 
 ```bash
-curl -s http://localhost:8080/actuator/info | jq .build
+docker compose exec -T aquarium-node curl -s http://localhost:8080/actuator/info | jq .build
 ```
 
 If the version you pinned and the commit reported disagree — or `dirty` is `true` on an image you
@@ -240,10 +246,13 @@ fix is a future image. A moved field the node **does** use is different, and it 
 failure either (since FAB-115): the node keeps running, scheduled payments included, but **closes the
 lending gate** and logs `LENDING_CONFIG_MISMATCH` at ERROR, naming each field
 ([§4.7](#47-verify-before-re-arming)). That line means part of the deployment the node uses moved under
-you. If FluidTokens minted new config NFTs, the sequence below applies; if they rewrote the config
-datums in place under the same NFTs, it is [§4.8](#48-when-fluidtokens-replace-action-scripts-in-place--the-2026-10-01-update)
-or [§4.9](#49-when-fluidtokens-replace-action-scripts-in-place--the-2026-10-2326-update) instead — a new
-image, no wipe.
+you. If FluidTokens minted new config NFTs, the sequence below applies. Keeping the same NFTs is **not**
+enough to skip it: [§4.8](#48-when-fluidtokens-replace-action-scripts-in-place--the-2026-10-01-update)
+and [§4.9](#49-when-fluidtokens-replace-action-scripts-in-place--the-2026-10-2326-update) (a new image,
+no re-sync) apply only when **only action-script hashes moved and every payment credential the node
+indexes is unchanged** — the condition §4.8 checks, against the list of indexed credentials it gives. If
+a moved field names one of those credentials, the index kept only the old one (§3), and the full
+sequence below applies, re-sync included, even under the same NFTs.
 
 Order matters here. Do not improvise it.
 
@@ -286,7 +295,7 @@ dump reaches `gzip` byte for byte.
 
 **What is actually in that database:** the indexed UTxO set (with the other tables Yaci Store keeps
 beside it), the chain cursor, the node's token-metadata cache (`token_metadata`: tickers, names and
-decimals, which the readiness page refills by itself from the token registry), and Flyway's schema history
+decimals, used only with the readiness UI on, which refills it from the token registry), and Flyway's schema history
 (`flyway_schema_history`, the record [§1.3](#13--the-yaci-store-207-release-requires-a-database-wipe-fab-203)'s
 refusal is about).
 
@@ -347,8 +356,8 @@ Wait for the tip (deploying.md §6). **Do not arm anything yet.**
 ### 4.7 Verify before re-arming
 
 ```bash
-curl -s http://localhost:8080/healthcheck | jq .
-curl -s http://localhost:8080/api/v1/loans | jq 'length'
+docker compose exec -T aquarium-node curl -s http://localhost:8080/healthcheck | jq .
+docker compose exec -T aquarium-node curl -s http://localhost:8080/api/v1/loans | jq 'length'
 ```
 
 Startup verification is the real check, and it runs **at boot only**. It has two halves, and they
@@ -373,7 +382,7 @@ react differently:
 verdict, because the scheduled payments it guards keep running. Read the gate before re-arming:
 
 ```bash
-curl -s http://localhost:8080/healthcheck | jq '{lending_gate, lending_gate_reason}'
+docker compose exec -T aquarium-node curl -s http://localhost:8080/healthcheck | jq '{lending_gate, lending_gate_reason}'
 # Prometheus: aquarium_lending_gate_closed  (1 = closed, 0 = open) — worth an alert
 # ⚠ While the node is still syncing, /healthcheck answers the plain text "...syncing..." and the jq
 #   line fails — read the gauge, or wait for the sync to finish.
@@ -545,6 +554,26 @@ image needs another wipe and re-sync: the older image's Flyway refuses this rele
 way this release refuses the older one ([§1.3](#13--the-yaci-store-207-release-requires-a-database-wipe-fab-203)),
 and Compose restarts it into the same refusal. Use the §1.3 steps, with the older image pinned — or,
 instead of re-syncing, restore the §4.3 dump you took before upgrading.
+
+**Restoring the §4.3 dump.** Only with the node **stopped**, and only into an **empty** database: one
+freshly wiped and recreated by the Postgres container under the same `DB_USERNAME` and `POSTGRES_DB` the
+dump was taken with. A plain `pg_dump` file recreates every table itself, so loaded over a database that
+still holds tables it fails on objects that already exist. From `docker/`:
+
+```bash
+docker compose down
+sudo rm -rf ./postgres        # as in §4.4 — check the path first
+docker compose up -d --wait postgres
+gunzip -c ~/aquarium-pre-upgrade.sql.gz | docker compose exec -T postgres sh -c 'psql -X --set ON_ERROR_STOP=on --single-transaction -U "$POSTGRES_USER" "$POSTGRES_DB"'
+```
+
+`up -d --wait postgres` starts the database alone and returns once it is healthy; the node depends on it,
+not the other way round, so it stays down. The single quotes and `-T` work as in §4.3, in the other
+direction: the dump reaches `psql` byte for byte, and the container expands `$POSTGRES_USER` and
+`$POSTGRES_DB`. `ON_ERROR_STOP` with `--single-transaction` makes the restore all or nothing: on the
+first error `psql` stops, exits non-zero and leaves the database empty. Then pin the image you were
+running when you took the dump (`AQUARIUM_DOCKER_IMAGE_VERSION`) and `docker compose up -d`. The node
+resumes from the dump's cursor, so it catches up from the moment of the dump.
 
 **The database does not roll back with it.** If you re-synced from a later start point, the old
 coordinates' history is not there any more, and going back to the old image means going back to an
