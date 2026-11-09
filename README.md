@@ -31,8 +31,9 @@ monthly from the fees generated.
 |---|---|
 | **[docs/deploying.md](docs/deploying.md)** | Standing up a node for the first time — keys, configuration, first start, reaching the UI safely, arming the bot, the market specification |
 | **[docs/upgrading.md](docs/upgrading.md)** | Already running one — version bumps, and the re-index/wipe sequence a contract redeploy requires |
+| **[docs/oracle-stream.md](docs/oracle-stream.md)** | The oracle WebSocket — what it is, where it connects, how it signs in, its log lines, and how to turn it off |
 
-Both cover **Docker Compose**. Systemd, Kubernetes and Nomad all work; the ordering, secrets and
+The first two cover **Docker Compose**. Systemd, Kubernetes and Nomad all work; the ordering, secrets and
 exposure guidance applies unchanged.
 
 **You never configure a contract address, a script hash or a sync start point.** They ship in the
@@ -49,7 +50,7 @@ cp .env.example .env
 chmod 600 .env                  # it will hold a seed phrase
 # fill in the six required values (WALLET_ACCOUNT_INDEX is optional), then:
 docker compose up -d
-docker compose logs -f aquarium
+docker compose logs -f aquarium-node
 ```
 
 Then get 30k FLDT (for example on [Minswap](https://minswap.org/tokens/fldt)) into a **separate**
@@ -64,33 +65,43 @@ split across the nodes that performed transactions.
 and compound all have to be turned on deliberately. Read
 [docs/deploying.md](docs/deploying.md) §8 before arming anything, and rehearse in `shadow` first.
 
-For native-principal compounding, the pool fee is calculated in raw token units and priced from the
-identified oracle observation. Admission then uses the exact final transaction body:
-`floor(F*n/d) + recovered escrow ADA - transaction fee - pool minimum-ADA top-up`. The
-wallet may reuse a safe token-bearing change UTxO as its ordinary input, but must also retain a
-distinct, datum-free and reference-script-free pure-ADA collateral UTxO. ADA-principal compounding
-remains `fee - transaction fee`; its escrow principal is not counted again as recovered ADA.
-
 **⛔ Do not publish port 8080.** Nothing served there is authenticated, and
 `LOANS_UI_ENABLED=false` does **not** close it: that flag removes the HTML readiness page only.
-`/api/v1/loans`, `/api/v1/loans/liquidations`, `/api/v1/loans/oracle`, `/healthcheck` and
-`/actuator/*` stay up and still disclose your positions. Reach the port through an SSH tunnel or a
-private network — [docs/deploying.md](docs/deploying.md) §7.
+`/api/v1/loans`, `/api/v1/loans/liquidations`, `/api/v1/loans/oracle`, `/healthcheck`,
+`/actuator/*` and Yaci Store's UTxO routes (`/api/v1/addresses/…`, `/api/v1/assets/…`,
+`/api/v1/utxos/…` — the indexed UTxOs, and the transactions behind them, at any address a caller
+names, the node's own wallet included) stay up and still disclose your positions. Reach the port
+through an SSH tunnel or a private network — [docs/deploying.md](docs/deploying.md) §7, which also
+[lists every route that stays up](docs/deploying.md#-loans_ui_enabledfalse-does-not-close-port-8080).
 
 ## How it works
 
 The node needs two things beside itself: a **Cardano relay** for the chain feed, and a **Postgres**
-database it owns. Transactions are submitted through **Blockfrost**. Once a day, and at startup, it
-also asks **GitHub** whether the build it runs is behind `main` and says so in its log;
-`AQUARIUM_VERSION_CHECK_ENABLED=false` turns that off.
+database it owns. It also talks to:
+
+- **Blockfrost**, for reads (the discovery reads [below](#blockfrost-call-deadlines), and an oracle
+  output's liveness when the index does not know it), for script evaluation, and for transaction
+  submission.
+- **FluidTokens' oracle API** (`api.fluidtokens.com/get-oracle-tokens` on mainnet), polled for the
+  collateral prices. `LOANS_ORACLE_ENABLED=false` turns it off.
+- **FluidTokens' oracle stream**, a WebSocket that pushes the same prices; by default its pushes are
+  merged with the API's. It is on by default and signs in with the node wallet's stake key, checked
+  against your Aquarium staking bond. `LOANS_ORACLE_STREAM_ENABLED=false` turns it off; it also stays
+  off while the oracle API is off. See [docs/oracle-stream.md](docs/oracle-stream.md).
+- **GitHub**, once a day and at startup, to ask whether the build it runs is behind `main` and say so
+  in its log; `AQUARIUM_VERSION_CHECK_ENABLED=false` turns that off.
+- With the readiness page on (`LOANS_UI_ENABLED=true`) only, the **Cardano token registry**
+  (`tokens.cardano.org`), for token names and decimals.
 
 ```mermaid
 flowchart TB
     relay["Cardano relay<br/><i>yours or any reachable</i>"]
     oracle["FluidTokens<br/>oracle API"]
-    bf["Blockfrost<br/><i>submission</i>"]
+    stream["FluidTokens<br/>oracle stream<br/><i>WebSocket</i>"]
+    bf["Blockfrost<br/><i>reads · evaluation · submission</i>"]
     minswap["Minswap V2"]
     gh["GitHub API<br/><i>daily version check</i>"]
+    registry["Cardano token registry<br/><i>UI only</i>"]
 
     subgraph aq["your deployment — docker compose"]
         yaci["Yaci Store<br/>indexer"]
@@ -102,22 +113,50 @@ flowchart TB
     end
 
     relay -- "blocks" --> yaci
-    yaci -- "only UTxOs at known<br/>credentials — see below" --> db
+    yaci -- "only UTxOs at known credentials,<br/>or holding an oracle NFT — see below" --> db
     db --> sched & liq & ui
     oracle -- "collateral prices" --> liq
+    stream -- "price pushes" --> liq
+    sched & liq -- "reads · evaluation" --> bf
     sched & liq -- "sign" --> wallet
     wallet -- "submit" --> bf
     liq -. "CONVERT order" .-> minswap
     aq -. "is this build behind main?" .-> gh
+    ui -. "token names" .-> registry
 ```
 
-**What gets indexed:** Aquarium Scheduled Transaction UTxOs, the Aquarium Parameters UTxO, Aquarium
-Staker UTxOs, and the lending-v4 contract UTxOs.
+**What gets indexed:** UTxOs at a fixed set of payment credentials — Aquarium Scheduled Transaction
+UTxOs, the Aquarium Parameters UTxO, Aquarium Staker UTxOs, the lending-v4 contract UTxOs, **the node's
+own wallet**, and the **Minswap V2 pools** (mainnet; preview has no Minswap deployment) — plus **every
+output holding a token of the configured oracle NFT policies**. That last clause matches by NFT policy
+(`loans.oracle.indexed-nft-policies`, shipped per network), **at any address**, not by credential: it
+is what lets the index answer for the oracle outputs a liquidation references.
 
-**⛔ Only UTxOs at credentials the node knew about when the block went past are kept.** The filter is
+**⛔ Only UTxOs the node was watching for when the block went past are kept.** The filter is
 applied at write time, so adding a contract address later does not backfill — and after a contract
 redeploy a restart is not enough. [docs/upgrading.md](docs/upgrading.md) §3 is the one section to
 read before you meet that.
+
+### What a compound has to earn
+
+For native-principal compounding, the pool fee is calculated in raw token units and priced from the
+identified oracle observation. Admission then uses the exact final transaction body:
+`floor(F*n/d) + recovered escrow ADA - transaction fee - pool minimum-ADA top-up`. The
+wallet may reuse a safe token-bearing change UTxO as its ordinary input, but must also retain a
+distinct, datum-free and reference-script-free pure-ADA collateral UTxO. ADA-principal compounding
+remains `fee - transaction fee`; its escrow principal is not counted again as recovered ADA.
+
+### Blockfrost call deadlines
+
+Every production Blockfrost call has a whole-call deadline: 12 seconds for discovery reads and
+30 seconds for transaction evaluation or submission, within a 120-second wallet-coordinator pass.
+Connection, read and write idle limits are 5, 30 and 30 seconds. These positive integer seconds can
+be overridden with the `BLOCKFROST_TIMEOUT_*_SECONDS` and
+`WALLET_COORDINATOR_PASS_TIMEOUT_SECONDS` settings documented in `docker/.env.advanced.example`.
+Submission redirects and automatic connection retries are disabled: if the peer reads a POST and
+the response is lost, the outcome is ambiguous and the transport does not replay it.
+The separately cached Fluid oracle registry refresh remains on its existing reactive timeout; a
+coordinator pass reads its held snapshot.
 
 ### Alternative solutions
 
@@ -136,16 +175,6 @@ Using Yaci Store also gives the following benefits:
 the Aquarium Node
 3. Blockfrost api: Yaci can serve blockfrost compatible APIs out of the box
 
-Every production Blockfrost call has a whole-call deadline: 12 seconds for discovery reads and
-30 seconds for transaction evaluation or submission, within a 120-second wallet-coordinator pass.
-Connection, read and write idle limits are 5, 30 and 30 seconds. These positive integer seconds can
-be overridden with the `BLOCKFROST_TIMEOUT_*_SECONDS` and
-`WALLET_COORDINATOR_PASS_TIMEOUT_SECONDS` settings documented in `docker/.env.advanced.example`.
-Submission redirects and automatic connection retries are disabled: if the peer reads a POST and
-the response is lost, the outcome is ambiguous and the transport does not replay it.
-The separately cached Fluid oracle registry refresh remains on its existing reactive timeout; a
-coordinator pass reads its held snapshot. These bounds do not arm a worker or activate mainnet.
-
 ## Building it yourself
 
 You do not need to: CI publishes an image built from `main` **after** running the full test suite.
@@ -161,7 +190,8 @@ whether the tree was dirty, and `unknown` when it could not tell. It is also the
 startup banner.
 
 ```bash
-curl -s http://localhost:8080/actuator/info | jq .build
+# from docker/, on the shipped Compose file, which publishes no port for the node
+docker compose exec -T aquarium-node curl -s http://localhost:8080/actuator/info | jq .build
 ```
 
 See [docs/deploying.md](docs/deploying.md) §11.
