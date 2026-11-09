@@ -78,8 +78,9 @@ services:
 
     # ⛔ NO `ports:` BLOCK, DELIBERATELY. Publishing 8080 puts the operator UI -- which shows loan
     # positions and the bot's decisions -- on a public interface with NO AUTHENTICATION IN FRONT OF
-    # IT. Reach it with `ssh -L 8080:localhost:8080 <host>` instead, or run on a private network.
-    # docs/deploying.md § Reaching the UI explains both and why a port mapping is not the answer.
+    # IT. With no port published, a tunnel to the host's own localhost:8080 reaches nothing:
+    # docs/deploying.md § Reaching the UI gives a tunnel that works without a port mapping, the
+    # private-network alternative, and why a port mapping is not the answer.
 
     healthcheck:
       # localhost, not the service name: this runs INSIDE the container, so it needs no DNS and

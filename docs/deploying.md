@@ -60,7 +60,9 @@ anything. The node signs with it automatically and unattended — that is its jo
 arms nothing and spends nothing; a preview node ships in `shadow` (below):
 
 - **Scheduled transactions only** — the processor armed, liquidation `disabled` (the mainnet
-  default): **about 10 ADA, in at least two ada-only UTxOs of 5 ADA or more each.** Each cycle the
+  default): **a little over 10 ADA, in at least two ada-only UTxOs of a little over 5 ADA each** —
+  the fee comes out of the UTxO that funds a tank, so one of exactly 5 ADA can fall under the 5 ADA
+  floor after a single tank. Each cycle the
   processor keeps one such UTxO as the collateral of every transaction in the cycle and never spends
   it, and funds each tank transaction from another one, so every further such UTxO is one more tank
   per cycle. A UTxO under 5 ADA, or one carrying any token, is not used — so 10 ADA in **one** UTxO
@@ -183,9 +185,12 @@ the shape of a tag does not tell you it is a release — **only an image whose c
 is.** Before you pin a tag, take its commit (the twelve characters after the date) and check that
 it is in `main`'s history on GitHub. On a running node, the same commit is `commitShort` on
 `/actuator/info` and on the first line of the startup banner, and the daily version check (§11) says
-it for you: `up to date`, or `this node is N commits behind main` with nothing after it, is a build
-of `main`; `ahead of main — not a build of main`, or `… and carries N commits that are not on main`,
-is not.
+it for you. `up to date — this build (…) is the head of main`, or `this node is N commits behind
+main (built from …). Changes since this build: <link>`, is a build of `main`. `this node is N
+commits behind main and carries M commits that are not on main (built from …). Changes: <link>`, or
+`this build (…) is N commits ahead of main — not a build of main`, is not. On a build from a dirty
+tree, any of these lines ends with ` — this build also carries uncommitted changes on top of that
+commit`.
 
 ---
 
@@ -292,11 +297,15 @@ c.b.c.y.s.c.service.CursorServiceImpl : Block No: 11525533
 Compare that block number against any chain explorer. Until it matches, the node is still catching
 up and **an empty loan list means nothing yet**.
 
-The health endpoint, from **on the box**:
+The health endpoint, from **on the box** — inside the container, because the Compose file publishes
+no port for the node (§7):
 
 ```bash
-curl -s http://localhost:8080/healthcheck | jq .
+docker compose exec -T aquarium-node curl -s http://localhost:8080/healthcheck | jq .
 ```
+
+While the node is still syncing, `/healthcheck` answers plain text rather than JSON (below), so `jq`
+reports a parse error until the node is synced; drop the `| jq .` to see the text.
 
 ```json
 { "db_ok": true, "parameters_ok": true, "parameters_ref_input_ok": true,
@@ -309,7 +318,9 @@ Seven fields: the first five are booleans, and the last two are the **lending ga
 for a mismatch, the fields at fault (§4, "What happens when only part of the deployment moves"). The HTTP
 status follows `db_ok`, `parameters_ok` and `parameters_ref_input_ok` only — any of them false answers
 `500` — so **a `200` does not mean the gate is open**: `wallet_ok`, `staking_ok` and the gate are
-reported, never part of the verdict.
+reported, never part of the verdict. `wallet_ok` checks only that some ada-only UTxO of at least 2 ADA
+exists, which is not the processor's rule of ada-only UTxOs of at least 5 ADA (§2), so it can read
+`true` on a wallet that processes no tanks.
 
 While the node's last applied block is more than `AQUARIUM_SYNCING_THRESHOLD_MINUTES` (default 10)
 minutes old, `/healthcheck` answers the plain text `...syncing...` and nothing is processed.
@@ -330,15 +341,24 @@ live loan positions, health factors, what capital would be required, and what th
 **no authentication in front of the UI.** Publishing `8080` puts your position data — and a read of
 your operating posture — on the public internet for anyone who scans the host.
 
-**On a public or cloud host — use an SSH tunnel:**
+**On a public or cloud host — use an SSH tunnel to the container's own address.** Since the Compose
+file publishes no port for the node, nothing listens on the server's `localhost:8080`, and a tunnel
+to it is refused. Point the tunnel at the container instead:
 
 ```bash
-ssh -L 8080:localhost:8080 you@your-host
+# on the server: the node container's address on the Compose network
+docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' aquarium
+
+# on your own machine, with the address that printed
+ssh -L 8080:<that address>:8080 you@your-host
 # then open http://localhost:8080/api/v1/loans/readiness in your own browser
 ```
 
-The port stays bound to loopback on the server. Nothing is exposed, access follows your existing SSH
-credentials, and there is no extra surface to secure.
+**The address can change whenever the container is recreated** (an image upgrade, `docker compose
+up` after a config change), so look it up again before each tunnel. Nothing is published, access
+follows your existing SSH credentials, and there is no extra surface to secure. This assumes a Linux
+server running Docker directly, where the host can reach container addresses on Docker's bridge
+networks; Docker Desktop on macOS or Windows does not route to container addresses from the host.
 
 **On a private, isolated network** — a home LAN, a VPN, a segment with no ingress — publishing the
 port is reasonable, because the network boundary is doing the work an authentication layer would
@@ -471,7 +491,7 @@ nothing:** whatever its markets, wallet rebalancing signs and submits self-sends
 wallet in shadow too, each costing a transaction fee — see §9, "Wallet rebalancing". Read the result:
 
 ```bash
-curl -s http://localhost:8080/api/v1/loans/liquidations | jq .
+docker compose exec -T aquarium-node curl -s http://localhost:8080/api/v1/loans/liquidations | jq .
 ```
 
 Every decision and its reason is there. **It is held in memory — read it before you restart.**
@@ -901,7 +921,7 @@ Then point `AQUARIUM_DOCKER_IMAGE_NAME`/`_VERSION` at it and set `pull_policy: n
 `/healthcheck`, whose seven fields (§6) carry no build information:
 
 ```bash
-curl -s http://localhost:8080/actuator/info | jq .build
+docker compose exec -T aquarium-node curl -s http://localhost:8080/actuator/info | jq .build
 # { "commit": "2776163…", "commitShort": "2776163…", "dirty": "false", "time": "…" }
 ```
 
@@ -944,6 +964,7 @@ Each check writes exactly one line to the log:
 |---|---|
 | `INFO version check: up to date — …` | the build is the head of `main` |
 | `WARN version check: this node is N commits behind main … Changes since this build: <link>` | `main` has moved on; the link lists exactly the commits your build lacks. It does not mean an image for `main`'s head exists yet — CI builds it after the commit lands |
+| `WARN version check: this node is N commits behind main and carries M commits that are not on main (built from …). Changes: <link>` | a build from a branch that left `main` before `main` moved on: not a build of `main`, and behind it as well. The link is GitHub's comparison of your build's commit with `main` |
 | `INFO version check: this build (…) is N commits ahead of main — not a build of main` | a build from a branch, not from `main` |
 | `INFO version check unavailable: …` | no answer could be decided: a fork or a local build GitHub does not know, a build that does not record its commit, GitHub's limit of 60 unauthenticated requests per hour per IP, a timeout (10 s), or GitHub unreachable |
 
@@ -1004,7 +1025,7 @@ mode, convert, compound) is refused for the life of the process. **An HTTP `200`
 not rule it out** — the gate is not part of its verdict (§6). Read the gate itself:
 
 ```bash
-docker compose exec aquarium-node curl -s http://localhost:8080/healthcheck | jq .lending_gate
+docker compose exec -T aquarium-node curl -s http://localhost:8080/healthcheck | jq .lending_gate
 ```
 
 `"closed"` means it is shut, and `.lending_gate_reason` says why; the Prometheus gauge
