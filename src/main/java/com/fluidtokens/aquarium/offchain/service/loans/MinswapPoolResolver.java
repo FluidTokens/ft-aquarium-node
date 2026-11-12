@@ -1,7 +1,9 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
+import com.bloxbean.cardano.client.address.Address;
 import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.Utxo;
+import com.bloxbean.cardano.client.util.HexUtil;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.model.AddressUtxoEntity;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
@@ -17,6 +19,7 @@ import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 
@@ -93,7 +96,7 @@ public class MinswapPoolResolver {
     private final UtxoRepository utxoRepository;
     private final String poolSpendScriptHash;
     private final String poolPolicyId;
-    private final MinswapPoolDatumConverter converter = new MinswapPoolDatumConverter();
+    private static final MinswapPoolDatumConverter CONVERTER = new MinswapPoolDatumConverter();
 
     public MinswapPoolResolver(UtxoRepository utxoRepository, String poolSpendScriptHash, String poolPolicyId) {
         this.utxoRepository = utxoRepository;
@@ -120,33 +123,78 @@ public class MinswapPoolResolver {
             throw new RefusedException(Refusal.LOOKUP_FAILED, "the pool index query failed: " + e, e);
         }
 
-        String msp = poolPolicyId + ConvertTxEncoder.POOL_NFT_ASSET_NAME;
-        Map<String, List<ResolvedPool>> byLpUnit = new HashMap<>();
+        List<ResolvedPool> accepted = new ArrayList<>();
         int rejected = 0;
         for (AddressUtxoEntity row : rows) {
-            Optional<ResolvedPool> pool = authenticate(row, msp);
+            Optional<ResolvedPool> pool = authenticateRow(row);
             if (pool.isEmpty()) {
                 rejected++;
                 continue;
             }
-            byLpUnit.computeIfAbsent(poolPolicyId + pool.get().lpAssetName(), k -> new ArrayList<>())
-                    .add(pool.get());
+            accepted.add(pool.get());
         }
         if (rejected > 0) {
             log.debug("Minswap pool snapshot: {} row(s) at {} are not authentic pools and were ignored; "
                     + "{} authentic", rejected, poolSpendScriptHash, rows.size() - rejected);
         }
-        return new Snapshot(byLpUnit, poolPolicyId);
+        return Snapshot.of(poolPolicyId, accepted);
     }
 
-    /** The authentic pool this row is, if it is one; empty for anything else at the address. */
-    private Optional<ResolvedPool> authenticate(AddressUtxoEntity row, String msp) {
+    /**
+     * The authentic pool this UTxO is, if it is one; empty for anything else. The four rules of the
+     * class javadoc, checked on a plain {@link Utxo} — no repository is needed, so the rules can be
+     * tested directly and every caller shares this one implementation of them:
+     * <ol>
+     *   <li>the payment credential of {@code utxo.getAddress()} is {@code poolSpendScriptHash}. The stake
+     *       part is NOT checked: anyone may delegate a pool, so a pool under any stake credential is
+     *       authentic;</li>
+     *   <li>it holds exactly one MSP ({@code <poolPolicyId>4d5350}) and its quantity is 1;</li>
+     *   <li>its inline datum is present and decodes as a Minswap pool datum;</li>
+     *   <li>it holds, with a positive quantity, the LP unit recomputed from that datum's pair.</li>
+     * </ol>
+     * Both hex arguments are compared as given and are expected lowercase, as Yaci stores them. An
+     * address that is null, does not parse, or has no payment credential (a reward address) is no pool.
+     *
+     * @return empty for any UTxO that is not an authentic pool; never throws for one
+     */
+    public static Optional<ResolvedPool> authenticate(Utxo utxo, String poolSpendScriptHash, String poolPolicyId) {
+        if (utxo == null || utxo.getAddress() == null || poolSpendScriptHash == null || poolPolicyId == null) {
+            return Optional.empty();
+        }
+        Optional<String> paymentCredential;
+        try {
+            paymentCredential = new Address(utxo.getAddress()).getPaymentCredentialHash()
+                    .map(HexUtil::encodeHexString);
+        } catch (RuntimeException e) {
+            return Optional.empty();
+        }
+        if (paymentCredential.isEmpty() || !poolSpendScriptHash.equals(paymentCredential.get())) {
+            return Optional.empty();
+        }
+        return authenticateContent(utxo, poolPolicyId);
+    }
+
+    /**
+     * Rule 1 from the row's {@code owner_payment_credential} column — the value the index query matched —
+     * then the shared rules 2–4. The column, not a parse of {@code owner_addr}, is what the query scoped
+     * on, so it is what this path checks.
+     */
+    private Optional<ResolvedPool> authenticateRow(AddressUtxoEntity row) {
+        if (!poolSpendScriptHash.equals(row.getOwnerPaymentCredential())) {
+            return Optional.empty();
+        }
         Utxo utxo;
         try {
             utxo = UtxoUtil.toUtxo(row);
         } catch (RuntimeException e) {
             return Optional.empty();
         }
+        return authenticateContent(utxo, poolPolicyId);
+    }
+
+    /** Rules 2–4, the content rules, for a UTxO already known to sit at the pool payment credential. */
+    private static Optional<ResolvedPool> authenticateContent(Utxo utxo, String poolPolicyId) {
+        String msp = poolPolicyId + ConvertTxEncoder.POOL_NFT_ASSET_NAME;
         List<Amount> amounts = utxo.getAmount() == null ? List.of() : utxo.getAmount();
 
         List<Amount> msps = amounts.stream().filter(a -> msp.equals(a.getUnit())).toList();
@@ -160,7 +208,7 @@ public class MinswapPoolResolver {
         }
         MinswapPoolDatum datum;
         try {
-            datum = converter.deserialize(datumHex);
+            datum = CONVERTER.deserialize(datumHex);
         } catch (RuntimeException e) {
             return Optional.empty();
         }
@@ -183,6 +231,23 @@ public class MinswapPoolResolver {
         Snapshot(Map<String, List<ResolvedPool>> byLpUnit, String poolPolicyId) {
             this.byLpUnit = byLpUnit;
             this.poolPolicyId = poolPolicyId;
+        }
+
+        /**
+         * A snapshot of these pools, each filed under {@code poolPolicyId + lpAssetName} — the one keying
+         * rule {@link MinswapPoolResolver#snapshot()} also builds through. No repository is involved, so
+         * per-pair lookup and {@link Refusal#AMBIGUOUS_POOL} can be tested directly.
+         *
+         * @throws NullPointerException for a null pool; an empty collection resolves every pair to empty
+         */
+        public static Snapshot of(String poolPolicyId, Collection<ResolvedPool> pools) {
+            Map<String, List<ResolvedPool>> byLpUnit = new HashMap<>();
+            for (ResolvedPool pool : pools) {
+                Objects.requireNonNull(pool, "pool");
+                byLpUnit.computeIfAbsent(poolPolicyId + pool.lpAssetName(), k -> new ArrayList<>())
+                        .add(pool);
+            }
+            return new Snapshot(byLpUnit, poolPolicyId);
         }
 
         /**
