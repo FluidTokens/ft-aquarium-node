@@ -20,6 +20,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -27,6 +28,7 @@ import java.util.stream.Collectors;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -259,9 +261,9 @@ class MinswapPoolAuthenticateTest {
 
     // ---- a hand-built amount list may carry a null element -------------------------------------------
 
-    /** A caller-built {@link Utxo} can hold a null amount; it is skipped, and every rule is judged on the rest. */
+    /** A caller-built {@link Utxo} can hold a null amount; such a UTxO is malformed and no pool, and nothing throws. */
     @Test
-    void aNullAmountElementIsSkippedNotThrown() {
+    void aNullAmountElementMakesItNoPoolWithoutThrowing() {
         Utxo authentic = authenticAscend("50".repeat(32), POOL_ADDR);
         List<Amount> withNulls = new ArrayList<>(authentic.getAmount());
         assertEquals(MSP, withNulls.get(1).getUnit(), "fixture: MSP follows lovelace");
@@ -270,8 +272,7 @@ class MinswapPoolAuthenticateTest {
         withNulls.add(0, null);
         authentic.setAmount(withNulls);
 
-        var pool = assertDoesNotThrow(() -> authenticate(authentic));
-        assertEquals("50".repeat(32) + "#1", outRef(pool.orElseThrow()), "the pool still satisfies every rule");
+        assertRefused(authentic);
 
         Utxo noMsp = utxo("51".repeat(32), 0, POOL_ADDR, DEEP_POOL_DATUM, amount(LP_ASCEND, 1_000L));
         List<Amount> noMspWithNull = new ArrayList<>(noMsp.getAmount());
@@ -279,6 +280,26 @@ class MinswapPoolAuthenticateTest {
         noMsp.setAmount(noMspWithNull);
 
         assertRefused(noMsp);
+    }
+
+    /** An accepted pool may become a transaction input, so its UTxO is the very one checked, with no null amount. */
+    @Test
+    void everyAcceptedPoolCarriesNoNullAmount() {
+        Utxo authentic = authenticAscend("52".repeat(32), POOL_ADDR);
+
+        var pool = authenticate(authentic).orElseThrow();
+
+        assertSame(authentic, pool.utxo(), "the accepted record carries the UTxO authenticated, not a copy");
+        assertTrue(pool.utxo().getAmount().stream().noneMatch(Objects::isNull), "no null amount element");
+    }
+
+    /** Rule 2 is exactly one MSP entry: a second MSP entry with a null quantity is not overlooked. */
+    @Test
+    void anMspWithNullQuantityBesideAnMspOfOneIsRefused() {
+        Amount nullQuantityMsp = Amount.builder().unit(MSP).quantity(null).build();
+
+        assertRefused(utxo("53".repeat(32), 1, POOL_ADDR, DEEP_POOL_DATUM, nullQuantityMsp, amount(MSP, 1),
+                amount(LP_ASCEND, 9_000_000_000L), amount(ASCEND.toUnit(), 5)));
     }
 
     // ---- Snapshot.of ---------------------------------------------------------------------------------

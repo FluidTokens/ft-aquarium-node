@@ -153,7 +153,8 @@ public class MinswapPoolResolver {
      *   <li>it holds, with a positive quantity, the LP unit recomputed from that datum's pair.</li>
      * </ol>
      * Both hex arguments are compared as given and are expected lowercase, as Yaci stores them. An
-     * address that is null, does not parse, or has no payment credential (a reward address) is no pool.
+     * address that is null, does not parse, or has no payment credential (a reward address) is no pool,
+     * and neither is a UTxO whose amount list holds a null element.
      *
      * @return empty for any UTxO that is not an authentic pool; never throws for one
      */
@@ -195,9 +196,12 @@ public class MinswapPoolResolver {
     /** Rules 2–4, the content rules, for a UTxO already known to sit at the pool payment credential. */
     private static Optional<ResolvedPool> authenticateContent(Utxo utxo, String poolPolicyId) {
         String msp = poolPolicyId + ConvertTxEncoder.POOL_NFT_ASSET_NAME;
-        // A null element is no amount: dropped once here, so neither rule below dereferences it.
-        List<Amount> amounts = utxo.getAmount() == null ? List.of()
-                : utxo.getAmount().stream().filter(Objects::nonNull).toList();
+        // A null amount element makes the UTxO malformed, so it is no pool: refused, never cleaned, so an
+        // accepted pool's utxo() is exactly the UTxO authenticated.
+        if (utxo.getAmount() != null && utxo.getAmount().stream().anyMatch(Objects::isNull)) {
+            return Optional.empty();
+        }
+        List<Amount> amounts = utxo.getAmount() == null ? List.of() : utxo.getAmount();
 
         List<Amount> msps = amounts.stream().filter(a -> msp.equals(a.getUnit())).toList();
         if (msps.size() != 1 || !BigInteger.ONE.equals(msps.getFirst().getQuantity())) {
