@@ -371,12 +371,21 @@ jobs:
       # applies nothing, and a pre-upgrade image refuses a 2.0.7 one) re-measured cold keyless on
       # feat/fab-203-yaci-2.0.7, 2026-11-04: 243 files / 2788 tests / 0 failures / 0 errors / 51 skipped,
       # 0 orphans. Floor 243.
+      # FAB-211-1 (MinswapPoolAuthenticateTest: the four Minswap pool-authentication rules on a plain Utxo through
+      # MinswapPoolResolver.authenticate, Snapshot.of without a repository, and the snapshot path accepting exactly
+      # what authenticate accepts) re-measured cold keyless on feat/fab-211-213-214-seams, 2026-11-12: 244 files / 2810 tests / 0 failures / 0 errors / 51 skipped,
+      # 0 orphans. Floor 244.
+      # FAB-213-1 (BuildInfoHandshakeTest: the oracle stream handshake's build identity is one BuildInfo bean -- a
+      # user's own replaces the auto-configured default, a @Primary one wins, the launcher sanitises whatever it
+      # returns, and the auto-configuration is listed and kept out of component scanning) re-measured cold keyless
+      # on feat/fab-211-213-214-seams, 2026-11-12: 245 files / 2820 tests / 0 failures / 0 errors / 51 skipped,
+      # 0 orphans. Floor 245.
       #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '243'
+          RESULT_FILE_FLOOR: '245'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET

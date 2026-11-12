@@ -2,6 +2,7 @@ package com.fluidtokens.aquarium.offchain.service.loans;
 
 import com.bloxbean.cardano.client.account.Account;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
+import com.fluidtokens.aquarium.offchain.config.BuildInfo;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.service.StakerService;
 import io.micrometer.core.instrument.Counter;
@@ -20,6 +21,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -97,8 +99,7 @@ public class OracleStreamLauncher {
     private final String enabled;
     private final String url;
     private final String source;
-    private final String buildCommitShort;
-    private final String buildDirty;
+    private final BuildInfo buildInfo;
     private final OracleStreamLog events = new OracleStreamLog();
 
     private OracleStreamClient.Timings timings = OracleStreamClient.Timings.PRODUCTION;
@@ -120,9 +121,11 @@ public class OracleStreamLauncher {
     private volatile Instant offSince;
 
     /**
-     * @param buildCommitShort the jar's own short commit — the banner's {@code aquarium.build.commitShort} — sent as
-     *                         the handshake's {@code X-FT-Node-Version} (FAB-179); see {@link #nodeVersion}
-     * @param buildDirty       {@code aquarium.build.dirty}: {@code true} appends {@code -dirty}
+     * @param buildInfo the build's short commit and dirty flag — by default the banner's
+     *                  {@code aquarium.build.commitShort} and {@code aquarium.build.dirty} — sent as the handshake's
+     *                  {@code X-FT-Node-Version} (FAB-179), {@code -dirty} appended iff dirty is {@code true};
+     *                  sanitised by {@link #nodeVersion} where it is handed to the client, so a replacement bean
+     *                  cannot bypass it
      */
     @Autowired
     public OracleStreamLauncher(Account account, AppConfig.Network network,
@@ -132,8 +135,7 @@ public class OracleStreamLauncher {
                                 @Value("${loans.oracle.stream.enabled:true}") String enabled,
                                 @Value("${loans.oracle.stream.url:}") String url,
                                 @Value("${loans.oracle.source:stream}") String source,
-                                @Value("${aquarium.build.commitShort:unknown}") String buildCommitShort,
-                                @Value("${aquarium.build.dirty:unknown}") String buildDirty) {
+                                BuildInfo buildInfo) {
         this.account = account;
         this.network = network;
         this.oracleClient = oracleClient;
@@ -142,8 +144,21 @@ public class OracleStreamLauncher {
         this.enabled = enabled;
         this.url = url;
         this.source = source;
-        this.buildCommitShort = buildCommitShort;
-        this.buildDirty = buildDirty;
+        this.buildInfo = Objects.requireNonNull(buildInfo, "buildInfo");
+    }
+
+    /** With the build's provenance given as its two raw values. */
+    public OracleStreamLauncher(Account account, AppConfig.Network network,
+                                ObjectProvider<FluidOracleClient> oracleClient,
+                                StakerService stakerService,
+                                MeterRegistry meterRegistry,
+                                String enabled,
+                                String url,
+                                String source,
+                                String buildCommitShort,
+                                String buildDirty) {
+        this(account, network, oracleClient, stakerService, meterRegistry, enabled, url, source,
+                new BuildInfo(buildCommitShort, buildDirty));
     }
 
     /** Without the build's provenance (no {@code X-FT-Node-Version} header), with {@code loans.oracle.source=stream}. */
@@ -366,7 +381,7 @@ public class OracleStreamLauncher {
             return;
         }
         URI uri = decision.uri();
-        String nodeVersion = nodeVersion(buildCommitShort, buildDirty);
+        String nodeVersion = nodeVersion(buildInfo.commitShort(), buildInfo.dirty());
 
         events.info("on", decision.fields() + " node_ver=" + (nodeVersion == null ? "-" : nodeVersion)
                 + " source=" + (priceSource == FluidOracleClient.Source.STREAM ? "stream" : "api"));
