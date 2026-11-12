@@ -248,6 +248,39 @@ class MinswapPoolAuthenticateTest {
         assertRefused(utxo("41".repeat(32), 0, POOL_ADDR, DEEP_POOL_DATUM, amount(MSP, 1), amount(LP_OTHER, 1_000L)));
     }
 
+    @Test
+    void theOwnLpMustHaveAPositiveQuantity() {
+        var pool = authenticate(utxo("42".repeat(32), 0, POOL_ADDR, DEEP_POOL_DATUM,
+                amount(MSP, 1), amount(LP_ASCEND, 1L)));
+        assertEquals("42".repeat(32) + "#0", outRef(pool.orElseThrow()), "one LP token is a positive quantity");
+
+        assertRefused(utxo("43".repeat(32), 0, POOL_ADDR, DEEP_POOL_DATUM, amount(MSP, 1), amount(LP_ASCEND, 0L)));
+    }
+
+    // ---- a hand-built amount list may carry a null element -------------------------------------------
+
+    /** A caller-built {@link Utxo} can hold a null amount; it is skipped, and every rule is judged on the rest. */
+    @Test
+    void aNullAmountElementIsSkippedNotThrown() {
+        Utxo authentic = authenticAscend("50".repeat(32), POOL_ADDR);
+        List<Amount> withNulls = new ArrayList<>(authentic.getAmount());
+        assertEquals(MSP, withNulls.get(1).getUnit(), "fixture: MSP follows lovelace");
+        assertEquals(LP_ASCEND, withNulls.get(2).getUnit(), "fixture: the LP follows the MSP");
+        withNulls.add(2, null);
+        withNulls.add(0, null);
+        authentic.setAmount(withNulls);
+
+        var pool = assertDoesNotThrow(() -> authenticate(authentic));
+        assertEquals("50".repeat(32) + "#1", outRef(pool.orElseThrow()), "the pool still satisfies every rule");
+
+        Utxo noMsp = utxo("51".repeat(32), 0, POOL_ADDR, DEEP_POOL_DATUM, amount(LP_ASCEND, 1_000L));
+        List<Amount> noMspWithNull = new ArrayList<>(noMsp.getAmount());
+        noMspWithNull.add(1, null);
+        noMsp.setAmount(noMspWithNull);
+
+        assertRefused(noMsp);
+    }
+
     // ---- Snapshot.of ---------------------------------------------------------------------------------
 
     @Test

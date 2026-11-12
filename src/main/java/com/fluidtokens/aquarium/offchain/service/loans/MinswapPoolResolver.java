@@ -195,7 +195,9 @@ public class MinswapPoolResolver {
     /** Rules 2–4, the content rules, for a UTxO already known to sit at the pool payment credential. */
     private static Optional<ResolvedPool> authenticateContent(Utxo utxo, String poolPolicyId) {
         String msp = poolPolicyId + ConvertTxEncoder.POOL_NFT_ASSET_NAME;
-        List<Amount> amounts = utxo.getAmount() == null ? List.of() : utxo.getAmount();
+        // A null element is no amount: dropped once here, so neither rule below dereferences it.
+        List<Amount> amounts = utxo.getAmount() == null ? List.of()
+                : utxo.getAmount().stream().filter(Objects::nonNull).toList();
 
         List<Amount> msps = amounts.stream().filter(a -> msp.equals(a.getUnit())).toList();
         if (msps.size() != 1 || !BigInteger.ONE.equals(msps.getFirst().getQuantity())) {
@@ -236,7 +238,10 @@ public class MinswapPoolResolver {
         /**
          * A snapshot of these pools, each filed under {@code poolPolicyId + lpAssetName} — the one keying
          * rule {@link MinswapPoolResolver#snapshot()} also builds through. No repository is involved, so
-         * per-pair lookup and {@link Refusal#AMBIGUOUS_POOL} can be tested directly.
+         * per-pair lookup and {@link Refusal#AMBIGUOUS_POOL} can be tested directly. The pools are filed as
+         * given and are NOT re-authenticated, so callers pass only pools returned by
+         * {@link MinswapPoolResolver#authenticate} (or {@link MinswapPoolResolver#snapshot()}); a hand-built
+         * {@link ResolvedPool} is trusted as authentic.
          *
          * @throws NullPointerException for a null pool; an empty collection resolves every pair to empty
          */
