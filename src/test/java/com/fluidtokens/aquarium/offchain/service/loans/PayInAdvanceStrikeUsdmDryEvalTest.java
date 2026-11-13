@@ -456,7 +456,10 @@ class PayInAdvanceStrikeUsdmDryEvalTest {
                                 new HashCheckedScriptSupplier(StrikeUsdmFixture.rawScripts(legs)), evaluator)
                         .build(StrikeUsdmFixture.request(0, legs, w.token(), w.c(), BOT_ADDRESS, T0, TX_VALID_TO)));
 
-        assertTrue(refused.getMessage().contains("principal oracle feed window"), refused.getMessage());
+        // The COVERAGE refusal, named — not the margin refusal behind it, whose message also says "principal
+        // oracle feed window" and which a feed ending inside the window trips too.
+        assertTrue(refused.getMessage().startsWith("principal oracle feed window [")
+                        && refused.getMessage().contains("does not cover tx window"), refused.getMessage());
         assertEquals(0, evaluator.calls.get(), "refused before anything is evaluated");
     }
 
