@@ -136,6 +136,7 @@ final class ConvertAdaCollateralFixture {
         Utxo walletUtxo;
         BigInteger planEquityDelta = BigInteger.ZERO;
         boolean collateralHandedPrincipalEntry;
+        List<Utxo> walletOutputs;
 
         private Spec(TestOracleRig rig) {
             this.rig = rig;
@@ -181,6 +182,16 @@ final class ConvertAdaCollateralFixture {
         /** (v) Hand the ada collateral leg the principal leg's oracle entry. */
         Spec collateralHandedPrincipalEntry() {
             this.collateralHandedPrincipalEntry = true;
+            return this;
+        }
+
+        /**
+         * (vi) FAB-224-3 — the universe's wallet outputs U and C, in place of {@code WALLET_UTXO} and
+         * {@code COLLATERAL_UTXO} at {@code BOT_ADDRESS}: placed at an executor account's address, the executor's own
+         * wallet listing owns them. The Request this fixture builds is unchanged by it.
+         */
+        Spec walletOutputs(Utxo u, Utxo c) {
+            this.walletOutputs = List.of(u, c);
             return this;
         }
 
@@ -295,6 +306,11 @@ final class ConvertAdaCollateralFixture {
         // so a build that reached into the wallet would find something to take.
         List<Utxo> all = new ArrayList<>(List.of(loanUtxo, bondUtxo, configUtxo, lmConfigUtxo, poolUtxo,
                 WALLET_UTXO, COLLATERAL_UTXO, leg.referenceInputUtxo(), leg.referenceScriptUtxo()));
+        // (vi) FAB-224-3: the wallet outputs at another address, when stated.
+        if (spec.walletOutputs != null) {
+            all.removeAll(List.of(WALLET_UTXO, COLLATERAL_UTXO));
+            all.addAll(5, spec.walletOutputs);
+        }
         Map<String, TransactionInput> scripts = new LinkedHashMap<>();
         for (Utxo script : ConvertTokenToTokenFixture.referenceScriptUtxos()) {
             scripts.put(script.getReferenceScriptHash(),

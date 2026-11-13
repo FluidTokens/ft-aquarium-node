@@ -43,6 +43,7 @@ import static com.fluidtokens.aquarium.offchain.service.loans.ConvertTokenToToke
 import static com.fluidtokens.aquarium.offchain.service.loans.ConvertTokenToTokenFixture.withdrawalIndex;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -298,6 +299,75 @@ class ConvertAdaCollateralRouterTest {
         assertFalse(refused.getMessage().contains("collateral"), refused.getMessage());
         assertEquals(List.of(), w.asked, "the selector must not be asked");
         verify(w.builder, never()).build(any());
+    }
+
+    // ---- FAB-224-3 (the FAB-224-2 audit's residue): the fee ceiling and the equity reach the rule ----------
+
+    /**
+     * (h) A SYNTHETIC 7‰ bond (fee 56,700,000): its slack of 44,700,000 lies inside [0, feeCeiling), so it does not
+     * pay for the transaction alone but leaves nothing short — the selector is asked for exactly 0 (it adds the fee
+     * ceiling itself), and the body spends one wallet utxo. With a zero fee ceiling it would be asked nothing.
+     */
+    @Test
+    void aSevenPerMilleBondIsAskedForZeroAndBuildsWithOneWalletUtxo() throws Exception {
+        Wired w = new Wired(spec().bondFeePerMille(7).build(), 5_000_000L);
+        BigInteger slack = BigInteger.valueOf(56_700_000L).subtract(ORDER_OVERHEAD)
+                .subtract(BigInteger.valueOf(8_000_000L));
+        assertEquals(BigInteger.valueOf(44_700_000L), slack);
+        assertTrue(slack.signum() >= 0 && slack.compareTo(w.builder.feeCeiling()) < 0,
+                "the slack lies inside [0, feeCeiling): " + w.builder.feeCeiling());
+
+        w.build();
+
+        assertEquals(List.of(BigInteger.ZERO), w.asked, "asked for exactly 0");
+        Transaction body = w.capturedBody();
+        assertEquals(Set.of(new TransactionInput(LOAN_TX, LOAN_IX), new TransactionInput(LOAN_TX, BOND_IX),
+                        new TransactionInput(WALLET_UTXO.getTxHash(), WALLET_UTXO.getOutputIndex())),
+                Set.copyOf(body.getBody().getInputs()), "the loan, the bond and the wallet utxo");
+        assertEquals(3, body.getBody().getInputs().size(), "three inputs");
+    }
+
+    /** (i) A SYNTHETIC 8‰ bond (fee 64,800,000): its slack of 52,800,000 covers the fee ceiling, so it asks nothing. */
+    @Test
+    void anEightPerMilleBondIsAskedNothingAndBuildsFromTheLoanAlone() throws Exception {
+        Wired w = new Wired(spec().bondFeePerMille(8).build(), 5_000_000L);
+
+        w.build();
+
+        assertEquals(List.of(), w.asked, "the selector must not be asked");
+        Transaction body = w.capturedBody();
+        assertEquals(Set.of(new TransactionInput(LOAN_TX, LOAN_IX), new TransactionInput(LOAN_TX, BOND_IX)),
+                Set.copyOf(body.getBody().getInputs()), "the loan and the bond only");
+        assertEquals(2, body.getBody().getInputs().size(), "two inputs");
+    }
+
+    /** (j) The builder's fee ceiling is the ledger ceiling of the fixture's protocol parameters. */
+    @Test
+    void theBuildersFeeCeilingIsTheLedgerCeiling() throws Exception {
+        Wired w = new Wired(spec().build(), 5_000_000L);
+
+        assertEquals(BigInteger.valueOf(45_684_181L), w.builder.feeCeiling());
+    }
+
+    /**
+     * (k) A SYNTHETIC 1‰ bond with USDM at 1,327,000,000 / 10⁸: an equity of 979,792 raises the ask by its top-up
+     * ceiling (2,000,000 − 979,792), so the selector is asked 4,920,208 — not the 3,900,000 of an equity of 0.
+     */
+    @Test
+    void aSmallEquityRaisesTheAskByItsTopUpCeiling() throws Exception {
+        Feed thin = new Feed(BigInteger.valueOf(1_327_000_000L), DENOMINATOR, USDM_FEED.validFrom(), USDM_FEED.validTo());
+        Wired w = new Wired(spec().usdmFeed(thin).bondFeePerMille(1).build(), 0L);
+        assertEquals(BigInteger.valueOf(979_792L), w.f.equity, "0 < equity < 2,000,000");
+        BigInteger ceiling = w.builder.feeCeiling();
+        BigInteger rule = ConvertLiquidationRouter.adaCollateralWalletShortfall(BigInteger.valueOf(8_100_000L),
+                w.f.equity, ceiling).orElseThrow();
+        assertEquals(BigInteger.valueOf(4_920_208L), rule, "8,100,000 − 4,000,000 − 1,020,208 − 8,000,000");
+        assertNotEquals(ConvertLiquidationRouter.adaCollateralWalletShortfall(BigInteger.valueOf(8_100_000L),
+                BigInteger.ZERO, ceiling).orElseThrow(), rule, "the top-up ceiling moves the ask");
+
+        w.build();
+
+        assertEquals(List.of(rule), w.asked, "asked the rule's value, the equity's top-up ceiling included");
     }
 
     // ======================================================================================

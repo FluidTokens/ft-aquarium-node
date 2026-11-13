@@ -25,13 +25,19 @@ import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
 import com.bloxbean.cardano.client.transaction.spec.TransactionWitnessSet;
 import com.bloxbean.cardano.client.transaction.util.TransactionUtil;
 import com.bloxbean.cardano.client.util.HexUtil;
+import com.bloxbean.cardano.yaci.store.common.domain.Amt;
+import com.bloxbean.cardano.yaci.store.utxo.storage.impl.model.AddressUtxoEntity;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.config.HashCheckedScriptSupplier;
 import com.fluidtokens.aquarium.offchain.config.YaciConfig;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.ClaimData;
+import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderManagerDatum;
+import com.fluidtokens.aquarium.offchain.model.loans.LiquidationAssessment;
+import com.fluidtokens.aquarium.offchain.model.loans.LiquidationDecision;
 import com.fluidtokens.aquarium.offchain.model.loans.LiquidationMode;
+import com.fluidtokens.aquarium.offchain.model.loans.Loan;
 import com.fluidtokens.aquarium.offchain.model.loans.LoanDatum;
 import com.fluidtokens.aquarium.offchain.model.loans.MinswapPoolDatum;
 import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
@@ -906,6 +912,86 @@ class ConvertProductionWiringTest {
         return new YaciConfig().convertTransactionBuilder(ConvertTokenToTokenFixture.REGISTRY, mainnet,
                 LoanFixtures.utxoSupplier(a.universe), EvalFixtures.protocolParams(), scripts, evaluator,
                 mock(OracleReferenceInputProbe.class));
+    }
+
+    /**
+     * (n) ⛔ FAB-224-3: the token→ADA d832b78e convert through a REAL executor cycle ({@link ConvertExecutorRig}), with a
+     * 100-ADA U and role C at the executor's own address. The executor's floor gate now charges the Minswap order
+     * output's 4,000,000, which sits at the order credential and which the gate never saw, less the 2,000,000 the
+     * loan's own lovelace covers: min-ada 2,000,000. Before this ticket the same body's min-ada was 0 (no asset-manager
+     * output, so {@code max(0, 0 − 2,000,000)}), and its floor {@code −F + 991,856}. H3 off the captured body: the floor
+     * is the fee value plus what came back to the bot's address less what U put in. Under the default margin and
+     * absolute floor {@link ConvertEconomics} still refuses it first, as before.
+     */
+    @Test
+    void theTokenToAdaConvertFloorNowChargesTheOrderAdaItFronts() throws Exception {
+        assertEquals(REGISTRY.getLoanSpendScriptHash(), ConvertTokenToTokenFixture.REGISTRY.getLoanSpendScriptHash(),
+                "the rig's registry is this deployment's");
+        List<Utxo> wallet = ConvertExecutorRig.wallet(100_000_000L);
+        Fixture f = fixture(wallet.getFirst(), null, wallet.getLast());
+        OracleEntry entry = f.request.collateralOracle();
+        OraclePriceFeed feed = entry.feed();
+        long now = feed.validFrom() + 60_000L;
+
+        LoanDatum datum = new LoanDatumConverter().deserialize(LoanFixtures.fixture("mainnet-loan-datum-d832b78e.hex"));
+        String bondDatumHex = LoanFixtures.fixture("mainnet-lender-bond-datum-d832b78e.hex");
+        Loan loan = new Loan(LOAN_TX, LOAN_IX, f.request.loanUtxo().getAddress(), LOAN_ID,
+                BigInteger.valueOf(COLLATERAL_AMOUNT), BigInteger.valueOf(LOAN_LOVELACE), datum);
+        LenderBond bond = new LenderBond(LOAN_TX, BOND_IX, f.request.bondUtxo().getAddress(), LOAN_ID, bondDatumHex,
+                new LenderManagerDatumConverter().deserialize(bondDatumHex));
+        LiquidationAssessment assessment = LoanFixtures.assess(bond, loan, OraclePriceFeed.unit(), feed, now);
+        assertTrue(assessment.buildable(), assessment.toString());
+
+        // The pool row the resolver reads: the fixture's pool UTxO plus the LP tokens that authenticate it.
+        Utxo pool = f.request.poolRefUtxo();
+        var row = new AddressUtxoEntity();
+        row.setTxHash(pool.getTxHash());
+        row.setOutputIndex(pool.getOutputIndex());
+        row.setOwnerAddr(pool.getAddress());
+        row.setOwnerPaymentCredential(MS_POOL_SPEND);
+        row.setInlineDatum(pool.getInlineDatum());
+        List<Amt> amounts = new ArrayList<>();
+        List<Amount> poolValue = new ArrayList<>(pool.getAmount());
+        poolValue.add(Amount.asset(MS_POOL_POLICY + ConvertTxEncoder.computeLpAssetName(AssetType.ada(), FLDT),
+                BigInteger.valueOf(1_000L)));
+        for (Amount amount : poolValue) {
+            var amt = new Amt();
+            amt.setUnit(amount.getUnit());
+            amt.setQuantity(amount.getQuantity());
+            amounts.add(amt);
+        }
+        row.setAmounts(amounts);
+        var candidate = new ConvertExecutorRig.Candidate(f.universe, rigScripts(), wallet, assessment,
+                f.request.loanUtxo(), f.request.bondUtxo(), f.request.configUtxo(), f.request.lmConfigUtxo(),
+                f.request.referenceScripts(), List.of(row), List.of(entry));
+
+        // A stated loss floor: the gate's figures, pinned.
+        ConvertExecutorRig rig = ConvertExecutorRig.shadow(BigInteger.valueOf(-5_000_000L),
+                BigInteger.valueOf(-3_000_000L), candidate).cycle(now);
+        LiquidationDecision decision = rig.onlyDecision();
+        assertEquals(LiquidationDecision.Outcome.WOULD_SUBMIT, decision.outcome(), decision.detail());
+        Transaction body = rig.builtOnce();
+        BigInteger fee = body.getBody().getFee();
+        String expected = "fee slice 991856 lovelace - tx fee " + fee + " - min-ada 2000000 = floor "
+                + BigInteger.valueOf(-1_008_144L).subtract(fee) + "; - margin -5000000 = "
+                + BigInteger.valueOf(3_991_856L).subtract(fee);
+        assertTrue(decision.detail().contains(expected), "expected [" + expected + "] in: " + decision.detail());
+        assertEquals(BigInteger.valueOf(100_000_000L), rig.walletInputCoin(body), "U funds it");
+        assertEquals(ConvertExecutorRig.floor(decision.detail()), BigInteger.valueOf(991_856L)
+                        .add(ConvertExecutorRig.coinAtBot(body)).subtract(rig.walletInputCoin(body)),
+                "H3: floor == fee value + Σ coin(outputs at the bot's address) − Σ coin(wallet inputs)");
+
+        // The defaults: ConvertEconomics refuses it after the build, unchanged by this ticket.
+        ConvertExecutorRig defaults = ConvertExecutorRig.shadow(BigInteger.valueOf(5_000_000L), BigInteger.ZERO,
+                candidate).cycle(now);
+        LiquidationDecision refused = defaults.onlyDecision();
+        assertEquals(LiquidationDecision.Outcome.UNPROFITABLE, refused.outcome(), refused.detail());
+        assertEquals("NET_BELOW_FLOOR", refused.reason(), refused.detail());
+        BigInteger measured = defaults.builtOnce().getBody().getFee().add(BigInteger.valueOf(4_000_000L));
+        String economics = "fee 5000000 of collateral is worth 991856 lovelace, outlay " + measured + " (measured "
+                + measured + ", dex floor 5000000), net " + BigInteger.valueOf(991_856L).subtract(measured)
+                + " against a floor of 5000000";
+        assertTrue(refused.detail().contains(economics), "expected [" + economics + "] in: " + refused.detail());
     }
 
     // ======================================================================================

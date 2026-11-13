@@ -144,6 +144,16 @@ public class ConvertLiquidationRouter {
     }
 
     /**
+     * {@code loans.minswap.order-spend-script-hash}: the payment credential the convert's Minswap order output
+     * sits at. The executor's floor gate reads it to count that output's ada, which the bot fronts and never
+     * gets back (FAB-224). Null only for a router built without loans configuration, which cannot build a
+     * convert at all: the order address is derived from this hash.
+     */
+    String minswapOrderSpendScriptHash() {
+        return loansConfiguration == null ? null : loansConfiguration.getMinswapOrderSpendScriptHash();
+    }
+
+    /**
      * The pool snapshot of the current liquidation cycle, taken lazily by the first candidate that
      * reaches the pool step and shared by every later one. {@code null} until then.
      */

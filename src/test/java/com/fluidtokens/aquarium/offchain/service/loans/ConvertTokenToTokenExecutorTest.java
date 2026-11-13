@@ -105,9 +105,10 @@ class ConvertTokenToTokenExecutorTest {
 
         Transaction built = h.builtOnce();
         BigInteger fee = built.getBody().getFee();
-        String expected = "fee slice 20000000 lovelace - tx fee " + fee + " - min-ada 0 = floor "
-                + FEE_SLICE.subtract(fee) + "; - margin 5000000 = "
-                + BigInteger.valueOf(15_000_000L).subtract(fee);
+        // FAB-224-3: the gate now counts the order output's 4 ADA and the 2 ADA equity output, less the loan's own 3 ADA.
+        String expected = "fee slice 20000000 lovelace - tx fee " + fee + " - min-ada 3000000 = floor "
+                + BigInteger.valueOf(17_000_000L).subtract(fee) + "; - margin 5000000 = "
+                + BigInteger.valueOf(12_000_000L).subtract(fee);
         assertTrue(decision.detail().contains(expected), "expected [" + expected + "] in: " + decision.detail());
         assertEquals(fee, decision.txFeeLovelace(), "the row's tx fee is the built body's");
 
@@ -121,7 +122,7 @@ class ConvertTokenToTokenExecutorTest {
         }
         assertEquals(0, h.submissions.get(), "SHADOW never reaches the submitter");
 
-        assertEquals(new ShapeRow("convert", "token", "token", FEE_SLICE, BigInteger.ZERO),
+        assertEquals(new ShapeRow("convert", "token", "token", FEE_SLICE, BigInteger.valueOf(3_000_000L)),
                 ShapeRow.of(decision, f.loan.collateral().isAda(), f.loan.principalAsset().isAda()));
     }
 

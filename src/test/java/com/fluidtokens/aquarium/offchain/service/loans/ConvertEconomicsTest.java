@@ -410,39 +410,6 @@ class ConvertEconomicsTest {
                         + "the quieter one. Saw: " + loud);
     }
 
-    /**
-     * ⚠ §26.2's lesson, applied before it can bite: a {@code @Value} default is not a default of the
-     * class. Every construction path that is not Spring's must agree with what the shipped
-     * configuration says, or the effective default silently differs from the documented one.
-     *
-     * <p>⚑ <b>THE ARMING DEFAULT WENT FALSE ON 2026-09-09 AND CAME BACK TRUE ON 2026-09-10. Both
-     * moves are recorded here rather than erased</b>, because the file otherwise reads as though the
-     * reversal never happened. The 09-09 flip applied the standing "every mode is exposed and
-     * documented, none ships armed" rule — the same rule that put
-     * {@code scheduling.transaction-processor.enabled} at false. Giovanni took it back the next day,
-     * first-hand: <i>"convert should remain but under liquidation and be enabled by default. there is
-     * a case we want to disable conversions. so please if delete put it back."</i> <b>Convert is the
-     * documented exception to that rule</b>, and the reason is the one in this class's javadoc: the
-     * bot fronts no capital here, so the failure mode is a no-op rather than a loss.
-     *
-     * <p>⚠ <b>What did NOT come back is the convert margin.</b>
-     * {@code loans.liquidation.convert.profit-margin-lovelace} stays deleted, merged into the shared
-     * {@code loans.liquidation.profit-margin-lovelace}, which {@code LiquidationConfiguration} owns
-     * and tests. Two fields are left in this block and this test pins both.
-     *
-     * <p>⚠ <b>RENAMED this round — the old name said the opposite of a third of this method's own
-     * body.</b> {@code theDefaultsLiveOnTheFieldsNotOnlyInTheAnnotation} was true for
-     * {@code ConvertConfiguration}'s own three fields, asserted just above, but the final assertion
-     * is about a DIFFERENT class, {@code LiquidationConfiguration}, whose shared margin field is
-     * pinned to carry <b>no default at all</b> — the deliberate exception §26.2 usually argues
-     * against. A contributor who read only the name and "fixed" the margin field back to a default
-     * "for consistency" would hit a failure whose own method name endorsed the change, and the
-     * natural repair is deleting the assertion — exactly the silent-stop-testing shape this file
-     * exists to prevent. The margin is the exception because the yaml is its ONLY source of truth
-     * (§26.2's normal case is "if Spring never binds it, be sure the field still agrees with the
-     * yaml"; the margin instead ensures nothing but the yaml can ever supply it, so a bare
-     * construction fails loudly at {@code init()} rather than defaulting quietly).
-     */
     // ---- FAB-224: the equity top-up -----------------------------------------------------------
 
     /** The 6-argument form is the 7-argument form with a zero top-up: every token shape is unchanged. */
@@ -498,6 +465,39 @@ class ConvertEconomicsTest {
                 true, OraclePriceFeed.unit(), ADA, null));
     }
 
+    /**
+     * ⚠ §26.2's lesson, applied before it can bite: a {@code @Value} default is not a default of the
+     * class. Every construction path that is not Spring's must agree with what the shipped
+     * configuration says, or the effective default silently differs from the documented one.
+     *
+     * <p>⚑ <b>THE ARMING DEFAULT WENT FALSE ON 2026-09-09 AND CAME BACK TRUE ON 2026-09-10. Both
+     * moves are recorded here rather than erased</b>, because the file otherwise reads as though the
+     * reversal never happened. The 09-09 flip applied the standing "every mode is exposed and
+     * documented, none ships armed" rule — the same rule that put
+     * {@code scheduling.transaction-processor.enabled} at false. Giovanni took it back the next day,
+     * first-hand: <i>"convert should remain but under liquidation and be enabled by default. there is
+     * a case we want to disable conversions. so please if delete put it back."</i> <b>Convert is the
+     * documented exception to that rule</b>, and the reason is the one in this class's javadoc: the
+     * bot fronts no capital here, so the failure mode is a no-op rather than a loss.
+     *
+     * <p>⚠ <b>What did NOT come back is the convert margin.</b>
+     * {@code loans.liquidation.convert.profit-margin-lovelace} stays deleted, merged into the shared
+     * {@code loans.liquidation.profit-margin-lovelace}, which {@code LiquidationConfiguration} owns
+     * and tests. Two fields are left in this block and this test pins both.
+     *
+     * <p>⚠ <b>RENAMED this round — the old name said the opposite of a third of this method's own
+     * body.</b> {@code theDefaultsLiveOnTheFieldsNotOnlyInTheAnnotation} was true for
+     * {@code ConvertConfiguration}'s own three fields, asserted just above, but the final assertion
+     * is about a DIFFERENT class, {@code LiquidationConfiguration}, whose shared margin field is
+     * pinned to carry <b>no default at all</b> — the deliberate exception §26.2 usually argues
+     * against. A contributor who read only the name and "fixed" the margin field back to a default
+     * "for consistency" would hit a failure whose own method name endorsed the change, and the
+     * natural repair is deleting the assertion — exactly the silent-stop-testing shape this file
+     * exists to prevent. The margin is the exception because the yaml is its ONLY source of truth
+     * (§26.2's normal case is "if Spring never binds it, be sure the field still agrees with the
+     * yaml"; the margin instead ensures nothing but the yaml can ever supply it, so a bare
+     * construction fails loudly at {@code init()} rather than defaulting quietly).
+     */
     @Test
     void everyConvertFieldDefaultMatchesTheYaml_ExceptTheSharedMarginWhichHasDeliberatelyNone() {
         var fresh = new AppConfig.ConvertConfiguration();
