@@ -68,8 +68,9 @@ import static org.mockito.Mockito.verifyNoMoreInteractions;
  * test-oracle rig.
  * <p>
  * Until FAB-224 the convert builder refused an ada collateral as {@code COLLATERAL_ORACLE_MISSING}, and unrefused it
- * would have spent the wallet utxo U and built the equity output as "the collateral token + 2 ADA", which
- * {@code equity_sent_to_borrower}'s ada DoS guard ({@code length(flatten(value)) == 1}) refuses. Here the build is
+ * would have spent the wallet utxo U on every build and checked the equity output by the token rule — the
+ * collateral's multi-asset quantity and exactly 2 entries — which an ada equity output can never satisfy (the
+ * validator's ada rule is {@code length(flatten(value)) == 1}). Here the build is
  * paid from the loan's own lovelace with NO wallet input, evaluates through the production constructor and the real
  * Aiken evaluator, tops a small equity up to the ledger minimum exactly, and spends exactly one wallet utxo when one is
  * handed; a healthy signed price and a tampered order amount are each refused by the named validator, identified by
