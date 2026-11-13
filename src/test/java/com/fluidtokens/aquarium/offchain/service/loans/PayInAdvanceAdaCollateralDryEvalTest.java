@@ -319,10 +319,11 @@ class PayInAdvanceAdaCollateralDryEvalTest {
      * The seized ADA funds every ADA need of this shape — the fee, the lender's min-ada rider, the remainder's
      * min-ada and the change — so a token output carrying little more than its own ledger min-ada builds.
      * <p>
-     * Measured for this ticket (rig price 12.5): a token output of 1,100,000, 1,200,000, 1,300,000, 1,500,000,
-     * 2,000,000 or 3,000,000 lovelace, each with exactly the payout or the payout + 5 USDM, builds, and spends only
-     * the token output from the wallet. The ledger min-ada of that token output is about 1.17 ADA, so this test
-     * uses 1,500,000.
+     * Measured for this ticket (rig price 12.5): a token output of 1,200,000, 1,300,000, 1,500,000, 2,000,000 or
+     * 3,000,000 lovelace, with exactly the payout or the payout + 5 USDM, builds and spends only the token output
+     * from the wallet. At 1,100,000 lovelace only exactly the payout builds: with 5 USDM left over, the leftover's
+     * own output holds 1,172,320 lovelace, more than the token output brought, and the builder refuses it as
+     * STRUCTURAL_ASSERTION_FAILED (seized ada in a token-bearing output). So this test uses 1,500,000.
      */
     @Test
     void theSeizedAdaFundsThisShapeSoAThinTokenOutputBuilds() throws Exception {

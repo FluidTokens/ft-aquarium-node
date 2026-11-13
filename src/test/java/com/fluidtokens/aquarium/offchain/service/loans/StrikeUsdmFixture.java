@@ -52,6 +52,8 @@ import static com.fluidtokens.aquarium.offchain.service.loans.TestOracleRig.Blue
  * Synthetic: the bot's wallet, the six registry reference-script UTxOs (synthetic coordinates carrying the
  * derived hashes), and both oracle legs, which come from the rig. Also synthetic: the same-token loan and
  * bond ({@link #sameTokenLoan()}), derived in code from loan #0's recorded datums.
+ * And synthetic beside it, derived the same way: the two-version loan ({@link #twoVersionLoan()}), one token
+ * priced under two oracle NFTs that share one credential.
  *
  * <h2>Why the prices come from the rig</h2>
  * No recorded signed feed makes these loans liquidatable: at the 2026-10-01 STRIKE price
@@ -496,6 +498,86 @@ final class StrikeUsdmFixture {
                                                                             long validFromMillis,
                                                                             long validToMillis) {
         return request(sameTokenLoan(), sameTokenLoanUtxo(), sameTokenBond(), sameTokenBondUtxo(), legs, wallet,
+                collateral, changeAddress, validFromMillis, validToMillis);
+    }
+
+    // ---- FAB-225-2: a SYNTHETIC two-version loan -------------------------------------------------------
+
+    /*
+     * Not a recorded loan. Derived in code from recorded loan #0, as the same-token loan above is, to pin a
+     * shape the validators accept and that no recorded loan has today: one token (STRIKE) priced by two oracle
+     * versions that share one credential, as FLDT's v1 and v2 oracles do on mainnet
+     * (MainnetOracleVersionsDryEvalTest). The collateral names the v1 NFT and the principal the v2 NFT. Both
+     * entries withdraw from one credential, so one withdraw-0 serves both legs; each leg must still read its
+     * own NFT holder, because retrieve_oracle_data checks the NFT in the reference input it is pointed at.
+     */
+
+    /** The v2 "oracleSTRIKE" NFT: the v2 oracle policy, the asset name of {@link #STRIKE_ORACLE_NFT}. */
+    static final AssetType STRIKE_V2_ORACLE_NFT = new AssetType(
+            "26e60b2083c14b849e622f8e05dd46ab01a7986fe5d72eeba8680d26", "6f7261636c65535452494b45");
+
+    /**
+     * As {@link #sameTokenLoanDatumHex()}, but {@code principalOracleAsset} is {@link #STRIKE_V2_ORACLE_NFT}; the
+     * collateral still names the recorded v1 {@link #STRIKE_ORACLE_NFT}. Synthetic, derived from the recorded
+     * datum.
+     */
+    static String twoVersionLoanDatumHex() {
+        ConstrPlutusData recorded = constrOf(loanDatumHex(0));
+        List<PlutusData> fields = new ArrayList<>(recorded.getData().getPlutusDataList());
+        fields.set(1, BigIntPlutusData.of(SAME_TOKEN_PRINCIPAL));
+        fields.set(6, assetData(STRIKE));
+        fields.set(7, assetData(STRIKE_V2_ORACLE_NFT));
+        return reencoded(recorded, fields);
+    }
+
+    /**
+     * A SYNTHETIC loan, derived from the recorded loan #0 to pin a shape the validators accept and that no
+     * recorded loan has today: a STRIKE principal priced under the v2 oracle NFT against STRIKE collateral
+     * priced under the v1 one, two oracle versions on one credential. Loan #0's coordinates and value,
+     * carrying {@link #twoVersionLoanDatumHex()}.
+     */
+    static Loan twoVersionLoan() {
+        return new Loan(LOAN_TX, LOAN_INDEXES.get(0), LOAN_ADDRESS, LOAN_IDS.get(0),
+                BigInteger.valueOf(COLLATERAL_AMOUNTS.get(0)), BigInteger.valueOf(LOAN_LOVELACE),
+                new LoanDatumConverter().deserialize(twoVersionLoanDatumHex()));
+    }
+
+    static Utxo twoVersionLoanUtxo() {
+        return LoanFixtures.utxo(LOAN_TX, LOAN_INDEXES.get(0), LOAN_ADDRESS, List.of(
+                        Amount.lovelace(BigInteger.valueOf(LOAN_LOVELACE)),
+                        Amount.asset(REGISTRY.getLoanPolicyId() + LOAN_IDS.get(0), BigInteger.ONE),
+                        Amount.asset(STRIKE.toUnit(), BigInteger.valueOf(COLLATERAL_AMOUNTS.get(0)))),
+                twoVersionLoanDatumHex());
+    }
+
+    /**
+     * ONE STRIKE rig making two legs: first the v1 leg ({@link #STRIKE_ORACLE_NFT}, NFT holder {@code #1}),
+     * then the v2 leg ({@link #STRIKE_V2_ORACLE_NFT}, NFT holder {@code #2}), each signed by the key at
+     * position 0. Both entries price STRIKE and withdraw from the rig's one credential, under two NFTs.
+     */
+    static Legs twoVersionLegs(TestOracleRig.Feed feed) {
+        TestOracleRig rig = TestOracleRig.of(TestOracleRig.controlHashed("d97da4f3", AQUARIUM_SC), 3);
+        TestOracleRig.Leg v1 = rig.leg(REGISTRY_PAYLOAD, STRIKE_ORACLE_NFT, feed,
+                List.of(new TestOracleRig.Signer(0, false)), NETWORK);
+        TestOracleRig.Leg v2 = rig.leg(REGISTRY_PAYLOAD, STRIKE_V2_ORACLE_NFT, feed,
+                List.of(new TestOracleRig.Signer(0, false)), NETWORK);
+        return new Legs(rig, rig, v1, v2);
+    }
+
+    /** As {@link #universe(int, Legs, List)}, with the two-version loan and the same-token bond in loan #0's place. */
+    static List<Utxo> twoVersionUniverse(Legs legs, List<Utxo> wallet) {
+        return universe(twoVersionLoanUtxo(), sameTokenBondUtxo(), legs, wallet);
+    }
+
+    /**
+     * As {@link #request(int, Legs, Utxo, Utxo, String, long, long)}, for the two-version loan and the
+     * same-token bond: the v1 leg's entry is {@code oracle}, the v2 leg's {@code principalOracle}.
+     */
+    static LiquidatePayInAdvanceTransactionBuilder.Request twoVersionRequest(Legs legs, Utxo wallet, Utxo collateral,
+                                                                             String changeAddress,
+                                                                             long validFromMillis,
+                                                                             long validToMillis) {
+        return request(twoVersionLoan(), twoVersionLoanUtxo(), sameTokenBond(), sameTokenBondUtxo(), legs, wallet,
                 collateral, changeAddress, validFromMillis, validToMillis);
     }
 

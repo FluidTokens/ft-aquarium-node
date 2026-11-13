@@ -15,8 +15,10 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  * ⛔ <b>The token→ADA pay-in-advance build is byte-identical — pinned by SHA-256.</b>
  * <p>
  * FAB-225 changes {@link LiquidatePayInAdvanceTransactionBuilder} only on the TOKEN-principal path: two
- * oracle legs sharing one withdrawal credential are refused by name, and the principal leg's withdraw-0 is
- * emitted whenever a principal oracle is present. The ruling for this slice is that the ADA-principal path
+ * oracle legs that share one withdrawal credential while pricing different tokens are refused by name, and
+ * the principal leg's withdraw-0 is emitted whenever a principal oracle is present on a credential the
+ * collateral leg does not withdraw from (a same-token pair on one credential is served by the collateral
+ * leg's withdrawal). The ruling for this slice is that the ADA-principal path
  * (a token collateral paid out in ADA, {@code principalOracle == null}) stays byte-identical, and until
  * this class nothing pinned its bytes — {@code LiquidatePayInAdvanceDryEvalTest} and
  * {@code PayInAdvanceLiquidationRouterTest} pin its arithmetic and its shape, which a reordered body or a

@@ -418,12 +418,16 @@ jobs:
       # needs, and both profitability gates are pinned on its floor) re-measured cold keyless on
       # feat/fab-211-213-214-seams, 2026-11-13:
       # 255 files / 2927 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 255.
+      # FAB-225-2 (PayInAdvanceStrikeUsdmGateTest: both profitability checks pinned on the STRIKE→USDM token-principal
+      # pay-in-advance through a real SHADOW executor cycle, the floor read off the built body, and a token output one
+      # lovelace short refused by name) re-measured cold keyless on feat/fab-211-213-214-seams, 2026-11-13:
+      # 256 files / 2932 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 256.
       #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '255'
+          RESULT_FILE_FLOOR: '256'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET
