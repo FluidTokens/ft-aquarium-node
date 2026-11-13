@@ -373,12 +373,14 @@ class LiquidatePayInAdvanceLiveDryEvalTest {
         assertTrue(usdmEntry.usableForLiquidation(),
                 "the live USDM feed is not usable: signatures=" + usdmEntry.signatures().size()
                         + " threshold=" + usdmEntry.threshold());
-        // WALL 3's precondition: a SECOND withdraw-0 only fires when the two oracle credentials
-        // differ. If they ever collided this rig would silently stop exercising the thing it exists
-        // for, so refuse loudly rather than build a single-oracle transaction under a two-oracle name.
+        // WALL 3's precondition: FLDT and USDM are different tokens, so their legs need two
+        // withdraw-0s on two credentials. If the credentials ever collided the builder would refuse
+        // the request by name (ORACLE_LEGS_SHARE_ONE_CREDENTIAL) and this rig would prove nothing
+        // about the second withdrawal, so it refuses loudly first.
         assertFalse(fldtEntry.rewardAddress().equals(usdmEntry.rewardAddress()),
-                "FLDT and USDM share one oracle credential on mainnet today — WALL 3's second "
-                        + "withdraw-0 would be skipped and this rig would prove nothing about it");
+                "FLDT and USDM share one oracle credential on mainnet today — the builder would refuse these "
+                        + "two different-token legs (ORACLE_LEGS_SHARE_ONE_CREDENTIAL) and this rig would prove "
+                        + "nothing about WALL 3's second withdraw-0");
 
         // The window: strictly inside BOTH feeds' windows, with the operator's margin left over both,
         // then clamped inward to whole slots exactly as PayInAdvanceLiquidationRouter does — the

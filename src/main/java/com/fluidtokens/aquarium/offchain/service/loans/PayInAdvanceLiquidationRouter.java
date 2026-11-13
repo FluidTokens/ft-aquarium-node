@@ -41,11 +41,14 @@ import java.util.Map;
  * outright) and the common liquidation, not an edge case. It still throws
  * {@code IllegalStateException} on a genuinely negative equity, which
  * {@code LoanFinance.redeemerEquity}'s own floor makes unreachable — defence in depth, never the
- * expected path. Since FAB-117 the oracle preconditions -- ada collateral (no collateral oracle leg),
- * or a leg whose own oracle (the NFT its datum names, pricing its token) is missing -- are checked
+ * expected path. Since FAB-117 the oracle preconditions -- a leg whose own oracle (the NFT its datum
+ * names, pricing its token) is missing, or an ada collateral with an ada principal -- are checked
  * <em>before</em> the builder is called and refused with {@code IllegalStateException}, which the
  * executor records as a machinery failure at ERROR, every cycle, with no CONVERT advice: the convert route needs the same oracle, so advising it
- * would re-route a whole market for nothing. {@link PayInAdvanceNotModelledException} stays for
+ * would re-route a whole market for nothing. Since FAB-226 an ada collateral has no collateral oracle
+ * leg ({@code null}, as the builder's {@code Request.oracle()} documents) and is built against a token
+ * principal; only an ada collateral with an ada principal is refused.
+ * {@link PayInAdvanceNotModelledException} stays for
  * triggers this path cannot build right now: the router's negative-equity precondition, and the
  * builder's own oracle-feed refusals (feed window not covering the transaction, too little margin left,
  * an unmodelled variant, an entry not usable this cycle), which only the builder can see. Either way no
@@ -149,7 +152,9 @@ public class PayInAdvanceLiquidationRouter {
      *                        path passes
      * @throws WalletInputTooSmallException      when no nominable wallet utxo covers the lender
      *                                          payout this liquidation must fund
-     * @throws IllegalStateException            when the loan has ada collateral, or a leg's own oracle
+     * @throws IllegalStateException            when the loan has ada collateral with an ada principal
+     *                                          (an ada collateral against a token principal is built,
+     *                                          with no collateral oracle leg), or a leg's own oracle
      *                                          (the NFT its datum names, pricing that leg's token) is
      *                                          missing -- a machinery refusal the executor logs at ERROR
      *                                          with no CONVERT advice, since convert needs the same
@@ -186,21 +191,25 @@ public class PayInAdvanceLiquidationRouter {
 
         // The collateral oracle is found by the oracle NFT the loan datum names — the same key the
         // executor's snapshot and the plain builder use, never the priced asset.
-        OracleEntry collateralOracle = OracleEntry.namedForLeg(oraclesByUnit,
+        OracleEntry collateralOracle = datum.collateral().isAda() ? null : OracleEntry.namedForLeg(oraclesByUnit,
                 datum.collateral().assetType(), datum.collateral().oracleTokenAsset());
         // A token collateral is refused by name, never an NPE in numbers(), which prices it through this
-        // entry. Ada collateral is refused first, below: it has no oracle leg at all.
+        // entry. An ada collateral has no collateral oracle leg at all: its entry is null, exactly as
+        // LiquidatePayInAdvanceTransactionBuilder.Request.oracle() documents (FAB-226), so only a token
+        // collateral's missing entry is refused.
         // ⚠ IllegalStateException, NOT PayInAdvanceNotModelledException: the executor used to answer
         // that one with "set this market's action to CONVERT" (removed, FAB-126), and convert refuses
         // this loan for the same reason (ConvertLiquidationRouter throws the same) — the advice would
         // re-route a whole market for nothing. A machinery failure, like the convert router's refusal and
         // like the NPE it replaces.
-        // ⛔ Ada collateral is refused by name too (FAB-117): numbers() prices the collateral through this
-        // entry and ada has none, so it used to die as an NPE there. Same failure branch, now saying why.
-        if (datum.collateral().isAda()) {
-            throw new IllegalStateException("ada collateral: this node builds no pay-in-advance liquidation for it");
+        // ⛔ FAB-226: an ada collateral against a token principal is built — the builder prices it 1:1 with no
+        // collateral oracle leg. Only an ada collateral with an ada principal is refused by name (FAB-117), a
+        // shape this node does not build. Same failure branch, saying why.
+        if (datum.collateral().isAda() && datum.principalAsset().isAda()) {
+            throw new IllegalStateException(
+                    "ada collateral: with an ada principal this node builds no pay-in-advance liquidation for it");
         }
-        if (collateralOracle == null) {
+        if (!datum.collateral().isAda() && collateralOracle == null) {
             throw new IllegalStateException(
                     "no oracle entry for collateral oracle asset "
                             + datum.collateral().oracleTokenAsset().toUnit() + " pricing "
@@ -241,7 +250,8 @@ public class PayInAdvanceLiquidationRouter {
 
         // T-052 — THE WALLET INPUT IS CHOSEN TO COVER THIS LIQUIDATION, NOT PICKED BLIND.
         //
-        // This is the principal-repaying path: the collateral is a token, so the principal the lender
+        // This is the principal-repaying path: the collateral is seized by the bot (a token, or an ada
+        // collateral with no oracle leg against a token principal), so the principal the lender
         // is paid comes out of the BOT'S OWN WALLET (ada for an ada principal; the principal TOKEN
         // itself for a token one — see WalletInputSelection's token-aware nomination). That amount is
         // convertedLoanCollateralToPrincipalAmount, and it is knowable here because numbers() reads

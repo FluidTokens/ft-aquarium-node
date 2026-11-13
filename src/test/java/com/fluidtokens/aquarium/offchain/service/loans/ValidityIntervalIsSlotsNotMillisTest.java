@@ -161,6 +161,6 @@ class ValidityIntervalIsSlotsNotMillisTest {
     private static ConvertTransactionBuilder.Request request(long from, long to) {
         return new ConvertTransactionBuilder.Request(
                 null, null, null, null, null, null, null, java.util.Map.of(),
-                null, null, null, null, false, "addr_order", "addr_change", from, to, null);
+                null, null, null, null, false, "addr_order", "addr_change", from, to, null, null, null);
     }
 }

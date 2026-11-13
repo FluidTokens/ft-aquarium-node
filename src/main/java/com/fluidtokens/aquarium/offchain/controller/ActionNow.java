@@ -66,16 +66,20 @@ public record ActionNow(String text, String detail, boolean wouldAct) {
     }
 
     /**
-     * FAB-117: a liquidatable loan with ADA collateral whose bond ASKS FOR CONVERSION. Both routes such a
-     * bond can take refuse it (convert and pay-in-advance each need a collateral oracle, and ada has
-     * none), so whatever the market's action the row must not say ADVANCE or CONVERT.
+     * A liquidatable loan with ADA collateral against an ADA principal whose bond ASKS FOR CONVERSION.
+     * FAB-117 refused every ada collateral on both routes such a bond can take. Since FAB-224 (convert) and
+     * FAB-226 (pay-in-advance) an ada collateral against a token principal is built by both and gets the
+     * ordinary answer, so only an ada principal is left: no Minswap pool swaps ada for ada, and the
+     * pay-in-advance route refuses the pair by name. Whatever the market's action, the row must not say
+     * ADVANCE or CONVERT.
      *
      * <p>⚠ NOT for a plain bond: the PLAIN route does liquidate ada-collateral loans (the claim's oracle
      * check short-circuits for ada), and a row saying "nothing will happen" there is false.
      */
-    public static ActionNow adaCollateralNotLiquidated() {
-        return none("NONE", "ada collateral on a convert bond — neither the convert nor the pay-in-advance route "
-                + "builds a liquidation for it, whatever the market's action");
+    public static ActionNow adaCollateralAgainstAdaPrincipalNotLiquidated() {
+        return none("NONE", "ada collateral against an ada principal on a convert bond — the convert route has "
+                + "no Minswap pool to swap ada for ada and the pay-in-advance route refuses it by name, so "
+                + "nothing is built whatever the market's action");
     }
 
     /**

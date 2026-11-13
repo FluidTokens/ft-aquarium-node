@@ -166,7 +166,8 @@ class ConvertTransactionBuilderGuardTest {
                 base.poolRefUtxo(), base.collateralOracle(), base.configUtxo(), base.lmConfigUtxo(),
                 base.walletUtxo(), base.referenceScripts(), base.plan(), withEquity, base.collateral(),
                 base.lenderBondAsset(), base.repaymentReceipts(), base.orderAddress(),
-                base.changeAddress(), base.validFromSlot(), base.validToSlot(), base.collateralUtxo());
+                base.changeAddress(), base.validFromSlot(), base.validToSlot(), base.collateralUtxo(),
+                AssetType.ada(), null);
     }
 
     /** The address the equity output must reach — derived exactly as the builder derives it. */
@@ -213,7 +214,7 @@ class ConvertTransactionBuilderGuardTest {
                         BigInteger.ZERO, BigInteger.ZERO, BigInteger.ZERO,
                         new AuthorizationMethod.CardanoSignature("aa".repeat(28)),
                         BigInteger.ZERO, "6c6f616e", BigInteger.valueOf(20_000_000L)),
-                FLDT, LENDER_BOND, false, ORDER_ADDRESS, BOT, 0L, 0L, ROLE_C);
+                FLDT, LENDER_BOND, false, ORDER_ADDRESS, BOT, 0L, 0L, ROLE_C, AssetType.ada(), null);
     }
 
     private static TransactionOutput out(String address, long lovelace, PlutusData datum,
@@ -418,7 +419,7 @@ class ConvertTransactionBuilderGuardTest {
         ConvertOrderPlan p = plan();
         var noOracle = new ConvertTransactionBuilder.Request(null, bondUtxo(bondDatumHex()), null,
                 null, null, null, null, Map.of(), p, request(p, bondDatumHex()).claim(),
-                FLDT, LENDER_BOND, false, ORDER_ADDRESS, BOT, 0L, 0L, ROLE_C);
+                FLDT, LENDER_BOND, false, ORDER_ADDRESS, BOT, 0L, 0L, ROLE_C, AssetType.ada(), null);
 
         var e = assertThrows(ConvertTransactionBuilder.RefusedException.class,
                 () -> builder().build(noOracle));
@@ -441,7 +442,7 @@ class ConvertTransactionBuilderGuardTest {
         assertTrue(wrongToken.usableForLiquidation(), "usable, so only the token can be what refuses it");
         var req = new ConvertTransactionBuilder.Request(null, bondUtxo(bondDatumHex()), null,
                 wrongToken, null, null, null, Map.of(), p, request(p, bondDatumHex()).claim(),
-                FLDT, LENDER_BOND, false, ORDER_ADDRESS, BOT, 0L, 0L, ROLE_C);
+                FLDT, LENDER_BOND, false, ORDER_ADDRESS, BOT, 0L, 0L, ROLE_C, AssetType.ada(), null);
 
         var e = assertThrows(ConvertTransactionBuilder.RefusedException.class, () -> builder().build(req));
         assertEquals(ConvertTransactionBuilder.Refusal.COLLATERAL_ORACLE_MISSING, e.reason());
@@ -456,7 +457,7 @@ class ConvertTransactionBuilderGuardTest {
         ConvertOrderPlan p = plan();
         var req = new ConvertTransactionBuilder.Request(null, bondUtxo(bondDatumHex()), null,
                 oracle(), null, null, null, Map.of(), p, request(p, bondDatumHex()).claim(),
-                FLDT, LENDER_BOND, false, ORDER_ADDRESS, BOT, 0L, 0L, ROLE_C);
+                FLDT, LENDER_BOND, false, ORDER_ADDRESS, BOT, 0L, 0L, ROLE_C, AssetType.ada(), null);
 
         try {
             builder().build(req);
@@ -581,7 +582,8 @@ class ConvertTransactionBuilderGuardTest {
                 base.poolRefUtxo(), base.collateralOracle(), base.configUtxo(), base.lmConfigUtxo(),
                 base.walletUtxo(), base.referenceScripts(), base.plan(), base.claim(),
                 base.collateral(), base.lenderBondAsset(), true, base.orderAddress(),
-                base.changeAddress(), base.validFromSlot(), base.validToSlot(), base.collateralUtxo());
+                base.changeAddress(), base.validFromSlot(), base.validToSlot(), base.collateralUtxo(),
+                AssetType.ada(), null);
 
         var e = assertThrows(ConvertTransactionBuilder.RefusedException.class,
                 () -> builder().build(withReceipts));
@@ -607,7 +609,7 @@ class ConvertTransactionBuilderGuardTest {
                     base.poolRefUtxo(), base.collateralOracle(), base.configUtxo(), base.lmConfigUtxo(),
                     (Utxo) scenario[1], base.referenceScripts(), base.plan(), base.claim(), base.collateral(),
                     base.lenderBondAsset(), false, base.orderAddress(), base.changeAddress(),
-                    base.validFromSlot(), base.validToSlot(), (Utxo) scenario[2]);
+                    base.validFromSlot(), base.validToSlot(), (Utxo) scenario[2], AssetType.ada(), null);
 
             var e = assertThrows(ConvertTransactionBuilder.RefusedException.class, () -> builder().build(req),
                     scenario[0] + " C must be refused");
@@ -642,5 +644,154 @@ class ConvertTransactionBuilderGuardTest {
                 () -> builder().assertStructure(txWith(goodOutputs(p, bondDatumHex())),
                         request(p, bondDatumHex()), 3, 4, 1));
         assertEquals(ConvertTransactionBuilder.Refusal.INDEX_MISMATCH, e.reason());
+    }
+
+    // ======================================================================================
+    // FAB-223 — the principal oracle leg, refused by name before anything is built
+    // ======================================================================================
+
+    /** A token principal (synthetic) the principal leg must price. */
+    private static final AssetType TOKEN_PRINCIPAL = new AssetType("d".repeat(56), "55534454");
+
+    /** A usable signed entry pricing {@code token}, on its own credential, NFT and reference inputs. */
+    private static OracleEntry principalOracle(AssetType token, String credential, String rewardAddress,
+                                               List<OracleSignature> signatures) {
+        return new OracleEntry(token, new AssetType("26e60b2083c14b849e622f8e05dd46ab01a7986fe5d72eeba8680d26",
+                "6f7261636c655553444d4333"), rewardAddress, credential,
+                new TransactionInput("dd".repeat(32), 1), new TransactionInput("dd".repeat(32), 0),
+                List.of("cb1506c82c3143948618c50834a527b8d471ebae067bc0a5dee1627dc511e914"), 1,
+                OraclePriceFeed.aggregated(token, BigInteger.valueOf(400_000_000L), BigInteger.valueOf(100_000_000L),
+                        0L, Long.MAX_VALUE),
+                signatures, null);
+    }
+
+    private static OracleEntry principalOracle(AssetType token) {
+        return principalOracle(token, "7".repeat(56), "stake_test17" + "p".repeat(51),
+                List.of(new OracleSignature(0, "cd".repeat(64))));
+    }
+
+    /** The guard fixture's request with the collateral oracle and the principal leg replaced. */
+    private static ConvertTransactionBuilder.Request withLegs(OracleEntry collateralOracle, AssetType principal,
+                                                              OracleEntry principalOracle) {
+        var base = request(plan(), bondDatumHex());
+        return new ConvertTransactionBuilder.Request(base.loanUtxo(), base.bondUtxo(), base.poolRefUtxo(),
+                collateralOracle, base.configUtxo(), base.lmConfigUtxo(), base.walletUtxo(), base.referenceScripts(),
+                base.plan(), base.claim(), base.collateral(), base.lenderBondAsset(), base.repaymentReceipts(),
+                base.orderAddress(), base.changeAddress(), base.validFromSlot(), base.validToSlot(),
+                base.collateralUtxo(), principal, principalOracle);
+    }
+
+    private static ConvertTransactionBuilder.RefusedException refusal(ConvertTransactionBuilder.Request request) {
+        return assertThrows(ConvertTransactionBuilder.RefusedException.class, () -> builder().build(request));
+    }
+
+    /**
+     * (m) ⛔ FAB-223: a token principal with no usable principal oracle — none, one pricing another token
+     * ({@code is_feed_token_correct}), or a signed one carrying 0 signatures — is refused by name as the
+     * PRINCIPAL leg's, never as the collateral's.
+     */
+    @Test
+    void aTokenPrincipalWithNoUsablePrincipalOracleIsRefusedByName() {
+        OracleEntry pricesAnother = principalOracle(new AssetType("e".repeat(56), "55534454"));
+        OracleEntry unsigned = principalOracle(TOKEN_PRINCIPAL, "7".repeat(56), "stake_test17" + "p".repeat(51),
+                List.of());
+        assertTrue(pricesAnother.usableForLiquidation(), "usable, so only the token can be what refuses it");
+        assertTrue(!unsigned.usableForLiquidation(), "0 signatures against a threshold of 1");
+        java.util.Map<String, OracleEntry> cases = new java.util.LinkedHashMap<>();
+        cases.put("no entry", null);
+        cases.put("an entry pricing another token", pricesAnother);
+        cases.put("a 0-signature multisig entry", unsigned);
+        for (var c : cases.entrySet()) {
+            var e = refusal(withLegs(oracle(), TOKEN_PRINCIPAL, c.getValue()));
+            assertEquals(ConvertTransactionBuilder.Refusal.PRINCIPAL_ORACLE_MISSING, e.reason(), c.getKey() + ": "
+                    + e.getMessage());
+            assertNotEquals(ConvertTransactionBuilder.Refusal.COLLATERAL_ORACLE_MISSING, e.reason(), c.getKey());
+        }
+        // The control: a usable entry pricing the principal passes the principal guard.
+        try {
+            builder().build(withLegs(oracle(), TOKEN_PRINCIPAL, principalOracle(TOKEN_PRINCIPAL)));
+        } catch (ConvertTransactionBuilder.RefusedException e) {
+            assertNotEquals(ConvertTransactionBuilder.Refusal.PRINCIPAL_ORACLE_MISSING, e.reason(), e.getMessage());
+        } catch (RuntimeException expectedLaterFailure) {
+            // past the principal guard: anything after it is outside this test's question
+        }
+    }
+
+    /** (n) An ada principal handed an oracle entry: retrieve_oracle_data never reads one, so it is refused. */
+    @Test
+    void anAdaPrincipalHandedAnOracleIsRefusedByName() {
+        var e = refusal(withLegs(oracle(), AssetType.ada(), principalOracle(TOKEN_PRINCIPAL)));
+        assertEquals(ConvertTransactionBuilder.Refusal.PRINCIPAL_ORACLE_MISSING, e.reason(), e.getMessage());
+        assertNotEquals(ConvertTransactionBuilder.Refusal.COLLATERAL_ORACLE_MISSING, e.reason());
+        assertTrue(e.getMessage().contains("ada"), e.getMessage());
+    }
+
+    /**
+     * (o) ⛔ M1: the two token legs withdraw from ONE credential — spelled in different hex case — and price
+     * different tokens. One reward address carries one withdrawal, so get_first would hand the principal leg the
+     * collateral's feed: refused by name.
+     */
+    @Test
+    void twoLegsOnOneCredentialAreRefusedEvenWhenTheHexCaseDiffers() {
+        OracleEntry collateral = oracle();
+        String sameCredentialUpper = collateral.withdrawCredentialHash().toUpperCase();
+        assertNotEquals(collateral.withdrawCredentialHash(), sameCredentialUpper, "the case must differ");
+        OracleEntry principal = principalOracle(TOKEN_PRINCIPAL, sameCredentialUpper, "stake_test17" + "p".repeat(51),
+                List.of(new OracleSignature(0, "cd".repeat(64))));
+        var e = refusal(withLegs(collateral, TOKEN_PRINCIPAL, principal));
+        assertEquals(ConvertTransactionBuilder.Refusal.ORACLE_LEGS_SHARE_ONE_CREDENTIAL, e.reason(), e.getMessage());
+        assertNotEquals(ConvertTransactionBuilder.Refusal.PRINCIPAL_ORACLE_MISSING, e.reason());
+        assertTrue(e.getMessage().startsWith("ORACLE_LEGS_SHARE_ONE_CREDENTIAL:"), e.getMessage());
+        for (String named : List.of(collateral.oracleToken().toUnit(), principal.oracleToken().toUnit(),
+                FLDT.toUnit(), TOKEN_PRINCIPAL.toUnit(), collateral.withdrawCredentialHash())) {
+            assertTrue(e.getMessage().contains(named), "the refusal names " + named + ": " + e.getMessage());
+        }
+    }
+
+    /**
+     * (p) A token leg whose feed this builder cannot encode — {@code PRICE_DATA_CHARLIE}, here with a provider
+     * reference input so {@code usableForLiquidation()} is true — is refused by name, naming the leg, before
+     * assembly (where {@code OracleFeedConverter} would throw). A signed {@code AGGREGATED} leg is not.
+     */
+    @Test
+    void aCharli3OrOrcfaxLegIsRefusedByNameBeforeAssembly() {
+        OracleEntry signed = oracle();
+        OracleEntry charli3Collateral = new OracleEntry(signed.token(), signed.oracleToken(), signed.rewardAddress(),
+                signed.withdrawCredentialHash(), signed.referenceInput(), signed.referenceScript(),
+                signed.verificationKeys(), signed.threshold(),
+                OraclePriceFeed.priceDataCharlie(FLDT, BigInteger.valueOf(22_265_406L), BigInteger.valueOf(100_000_000L),
+                        0L, Long.MAX_VALUE),
+                List.of(), new TransactionInput("cc".repeat(32), 0));
+        assertTrue(charli3Collateral.usableForLiquidation(), "usable, so only the variant can be what refuses it");
+        var collateral = refusal(withLegs(charli3Collateral, AssetType.ada(), null));
+        assertEquals(ConvertTransactionBuilder.Refusal.ORACLE_VARIANT_NOT_MODELLED, collateral.reason(),
+                collateral.getMessage());
+        assertNotEquals(ConvertTransactionBuilder.Refusal.COLLATERAL_ORACLE_MISSING, collateral.reason());
+        assertTrue(collateral.getMessage().contains("collateral") && collateral.getMessage().contains("PRICE_DATA_CHARLIE"),
+                collateral.getMessage());
+
+        OracleEntry tokenSigned = principalOracle(TOKEN_PRINCIPAL);
+        OracleEntry charli3Principal = new OracleEntry(tokenSigned.token(), tokenSigned.oracleToken(),
+                tokenSigned.rewardAddress(), tokenSigned.withdrawCredentialHash(), tokenSigned.referenceInput(),
+                tokenSigned.referenceScript(), tokenSigned.verificationKeys(), tokenSigned.threshold(),
+                OraclePriceFeed.priceDataCharlie(TOKEN_PRINCIPAL, BigInteger.valueOf(400_000_000L),
+                        BigInteger.valueOf(100_000_000L), 0L, Long.MAX_VALUE),
+                List.of(), new TransactionInput("cb".repeat(32), 0));
+        assertTrue(charli3Principal.usableForLiquidation(), "usable, so only the variant can be what refuses it");
+        var principal = refusal(withLegs(signed, TOKEN_PRINCIPAL, charli3Principal));
+        assertEquals(ConvertTransactionBuilder.Refusal.ORACLE_VARIANT_NOT_MODELLED, principal.reason(),
+                principal.getMessage());
+        assertNotEquals(ConvertTransactionBuilder.Refusal.PRINCIPAL_ORACLE_MISSING, principal.reason());
+        assertTrue(principal.getMessage().contains("principal") && principal.getMessage().contains("PRICE_DATA_CHARLIE"),
+                principal.getMessage());
+
+        // AGGREGATED on both legs is not refused by it: the build goes past the variant check.
+        try {
+            builder().build(withLegs(signed, TOKEN_PRINCIPAL, tokenSigned));
+        } catch (ConvertTransactionBuilder.RefusedException e) {
+            assertNotEquals(ConvertTransactionBuilder.Refusal.ORACLE_VARIANT_NOT_MODELLED, e.reason(), e.getMessage());
+        } catch (RuntimeException expectedLaterFailure) {
+            // past the variant check: anything after it is outside this test's question
+        }
     }
 }

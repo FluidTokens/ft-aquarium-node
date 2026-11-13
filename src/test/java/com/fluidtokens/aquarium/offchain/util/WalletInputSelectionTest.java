@@ -230,11 +230,13 @@ class WalletInputSelectionTest {
                 BigInteger.valueOf(3_000_000L), BigInteger.valueOf(4_405_077L));
         String note = holding.adaFloorNote(IN_USDM, BigInteger.valueOf(1_600_000L), true);
         assertEquals("the wallet has 3000000 USDM in total, but 3000000 USDM of it sits in UTxOs carrying "
-                + "less than 4405077 lovelace (4.405077 ADA) each — the ada a build needs beside the token, "
-                + "the fee ceiling plus a 2 ADA min-ada rider — so the bot cannot spend it and does not count "
+                + "less than 4405077 lovelace (4.405077 ADA) each — the ada a build needs beside the token: "
+                + "the fee ceiling plus a 2 ADA min-ada rider when the loan's collateral is a token, or, when it "
+                + "is ada, whatever of the fee ceiling and the outputs' min-ada the seized ada does not cover, "
+                + "and never less than 2 ADA — so the bot cannot spend it and does not count "
                 + "it. Consolidate the token into one UTxO carrying at least 4405077 lovelace; the wallet "
                 + "rebalancer does this automatically when it is enabled and this market is action: "
-                + "ANTICIPATE.", note);
+                + "ANTICIPATE or CONVERT_BEFORE_ANTICIPATE.", note);
         assertFalse(note.contains(VARIANT_B_WORDING), note);
     }
 
@@ -258,12 +260,14 @@ class WalletInputSelectionTest {
                 BigInteger.valueOf(500L), BigInteger.valueOf(4_000_000L));
         String note = holding.adaFloorNote(IN_USDM, BigInteger.valueOf(2_000L), true);
         assertEquals("the wallet has 2500 USDM in total, but 500 USDM of it sits in UTxOs carrying less "
-                + "than 4000000 lovelace (4 ADA) each — the ada a build needs beside the token, the fee "
-                + "ceiling plus a 2 ADA min-ada rider — so the bot cannot spend it and does not count it. "
+                + "than 4000000 lovelace (4 ADA) each — the ada a build needs beside the token: the fee "
+                + "ceiling plus a 2 ADA min-ada rider when the loan's collateral is a token, or, when it is ada, "
+                + "whatever of the fee ceiling and the outputs' min-ada the seized ada does not cover, and never "
+                + "less than 2 ADA — so the bot cannot spend it and does not count it. "
                 + "Even counted, 1500 USDM would be short of the 2000 USDM required: consolidate the token "
                 + "into one UTxO carrying at least 4000000 lovelace and add at least 500 USDM; the wallet "
                 + "rebalancer consolidates automatically when it is enabled and this market is action: "
-                + "ANTICIPATE, but it cannot add funds.", note);
+                + "ANTICIPATE or CONVERT_BEFORE_ANTICIPATE, but it cannot add funds.", note);
         assertFalse(note.contains(VARIANT_A_WORDING), note);
     }
 
@@ -274,8 +278,10 @@ class WalletInputSelectionTest {
                 BigInteger.valueOf(3_000L), BigInteger.valueOf(2_000_000L));
         String unknown = holding.adaFloorNote(IN_USDM, BigInteger.valueOf(1_000L), false);
         assertTrue(unknown.contains("carrying less than 2000000 lovelace (2 ADA) each — the ada a build needs "
-                + "beside the token, the fee ceiling plus a 2 ADA min-ada rider (the fee ceiling was "
-                + "unavailable this cycle, so this floor leaves it out and the real one is higher) — so the "
+                + "beside the token: the fee ceiling plus a 2 ADA min-ada rider when the loan's collateral is a "
+                + "token, or, when it is ada, whatever of the fee ceiling and the outputs' min-ada the seized ada "
+                + "does not cover, and never less than 2 ADA (the fee ceiling was "
+                + "unavailable this cycle, so this floor leaves it out and the real one may be higher) — so the "
                 + "bot cannot spend it"), unknown);
         String known = holding.adaFloorNote(IN_USDM, BigInteger.valueOf(1_000L), true);
         assertFalse(known.contains("unavailable"), known);

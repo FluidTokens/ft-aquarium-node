@@ -380,12 +380,54 @@ jobs:
       # returns, and the auto-configuration is listed and kept out of component scanning) re-measured cold keyless
       # on feat/fab-211-213-214-seams, 2026-11-12: 245 files / 2820 tests / 0 failures / 0 errors / 51 skipped,
       # 0 orphans. Floor 245.
+      # FAB-222 (TestOracleRigTest: the oracle code control-hashed to the deployed mainnet oracles, re-parameterised
+      # with runtime test keys, liquidates the d832b78e convert offline; wrong-key, threshold and window controls)
+      # re-measured cold keyless on feat/fab-211-213-214-seams, 2026-11-12: 246 files / 2835 tests / 0 failures /
+      # 0 errors / 51 skipped, 0 orphans. Floor 246.
+      # FAB-225-1 (PayInAdvanceStrikeUsdmDryEvalTest + PayInAdvanceAdaPrincipalByteIdentityTest: a STRIKE→USDM
+      # pay-in-advance evaluates offline through two rig oracles, a shared oracle credential is refused by name, and
+      # the token→ADA build is pinned byte-identical) re-measured cold keyless on feat/fab-211-213-214-seams,
+      # 2026-11-13: 248 files / 2847 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 248.
+      # FAB-223-1 (ConvertTokenToTokenRigTest: a NIGHT→USDM convert evaluates offline through two rig oracles, one
+      # oracle leg per token, with the shared-credential and leg-credential refusals by name and the token→ADA
+      # convert pinned byte-identical) re-measured cold keyless on feat/fab-211-213-214-seams, 2026-11-13:
+      # 249 files / 2867 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 249.
+      # FAB-223-2 (ConvertTokenToTokenExecutorTest: the token→token convert through a real executor cycle, both
+      # profitability gates pinned, and the empty STRIKE/USDM pool refused POOL_TOO_THIN before any build)
+      # re-measured cold keyless on feat/fab-211-213-214-seams, 2026-11-13:
+      # 250 files / 2870 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 250.
+      # FAB-226-1 (PayInAdvanceAdaCollateralDryEvalTest: an ADA-collateral, USDM-principal pay-in-advance evaluates
+      # offline through one rig oracle, the seized ADA comes back ADA-only, and a collateral oracle that does not
+      # match the collateral is refused by name) re-measured cold keyless on feat/fab-211-213-214-seams, 2026-11-13:
+      # 251 files / 2882 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 251.
+      # FAB-224-1 (ConvertAdaCollateralRigTest: an ADA→USDM convert evaluates offline paid from the collateral with
+      # no wallet input, a small equity is topped up exactly to the ledger minimum, and one handed wallet utxo is the
+      # only one spent) re-measured cold keyless on feat/fab-211-213-214-seams, 2026-11-13:
+      # 252 files / 2895 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 252.
+      # FAB-224-2 (ConvertAdaCollateralRouterTest: the convert router builds an ADA collateral with no wallet input
+      # when its liquidation fee pays for the order, the bot's outputs and the fee ceiling, otherwise with one wallet
+      # utxo sized to the shortfall, and charges a small equity's min-ada top-up to ConvertEconomics) re-measured
+      # cold keyless on feat/fab-211-213-214-seams, 2026-11-13:
+      # 253 files / 2908 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 253.
+      # FAB-224-3 (ConvertAdaCollateralExecutorTest: the executor's convert floor charges the Minswap order ada the
+      # bot fronts, an ADA-collateral convert paid from its collateral names no wallet output, and both gates are
+      # pinned through real executor cycles) re-measured cold keyless on feat/fab-211-213-214-seams, 2026-11-13:
+      # 254 files / 2919 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 254.
+      # FAB-226-2 (PayInAdvanceAdaCollateralGateTest: an ADA-collateral, token-principal pay-in-advance is built
+      # through a real LIVE executor cycle, its token output needs only 2 ADA because the seized ADA pays the ADA
+      # needs, and both profitability gates are pinned on its floor) re-measured cold keyless on
+      # feat/fab-211-213-214-seams, 2026-11-13:
+      # 255 files / 2927 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 255.
+      # FAB-225-2 (PayInAdvanceStrikeUsdmGateTest: both profitability checks pinned on the STRIKE→USDM token-principal
+      # pay-in-advance through a real SHADOW executor cycle, the floor read off the built body, and a token output one
+      # lovelace short refused by name) re-measured cold keyless on feat/fab-211-213-214-seams, 2026-11-13:
+      # 256 files / 2932 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 256.
       #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '245'
+          RESULT_FILE_FLOOR: '256'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET

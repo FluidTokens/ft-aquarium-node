@@ -1614,6 +1614,13 @@ public class LiquidationExecutor {
      * that owns its failure (CCL trap 19): a missing U is {@link #designated}'s single
      * {@code WALLET_ROLE_MISSING} row, carried out of the router by {@link CandidateEnded} and answered by
      * nothing else — not an ERROR, not a second row, not a fallback.
+     *
+     * <p>⛔ <b>A convert whose router never asked the selector is funded from no wallet output</b> (FAB-224). An
+     * ada-collateral convert whose liquidation fee covers the order overhead, the bot's outputs and the fee
+     * is built from the loan alone. It spends no wallet output, so its row names none ({@code output} is
+     * {@code none} and the built record designates nothing), and its SUBMITTED row carries no note that U
+     * stays in the check: U was never at risk. A {@code CONVERT} market still designated U before the router
+     * was asked; that designation is simply not carried.
      */
     private Built convert(LiquidationAssessment assessment, long now, WalletCheck walletCheck, CandidatePass pass,
                           BuildInputs inputs, AppConfig.LiquidationConfiguration.Mode marketMode) {
@@ -1634,6 +1641,9 @@ public class LiquidationExecutor {
         Need needed = new Need();
         // FAB-185 — funded from U, and only from U. Held for the row that names it.
         Utxo[] funding = new Utxo[1];
+        // FAB-224 — whether the router asked the selector at all: an ada-collateral convert whose fee pays for
+        // everything is built from the loan alone and never asks.
+        boolean[] asked = new boolean[1];
         if (!mayFallBack) {
             Utxo u = designated(assessment, pass, now, walletCheck, ROLE_U, walletCheck.roles().u());
             if (u == null) {
@@ -1651,6 +1661,7 @@ public class LiquidationExecutor {
                     // (WalletInputSelection.nominable), so a published REFERENCE SCRIPT can never
                     // be handed out here (CCL trap 9b/26a, the 2026-08-24 incident class).
                     orderLovelace -> {
+                        asked[0] = true;
                         if (funding[0] == null) {
                             // CONVERT_BEFORE_ANTICIPATE: the pool verdict is in, so U is designated now.
                             Utxo u = designated(assessment, pass, now, walletCheck, ROLE_U, walletCheck.roles().u());
@@ -1676,6 +1687,12 @@ public class LiquidationExecutor {
             }
             refuseConvert(assessment, now, pass, e, funding[0], needed);
             return null;
+        }
+        if (!asked[0]) {
+            // FAB-224: paid from its collateral, this convert spends no wallet output, so its row must not name
+            // U — U was never at risk, and nothing about it stays in this check.
+            pass.output = "none";
+            return new Built(transaction, null);
         }
         return new Built(transaction, funding[0]);
     }
@@ -1899,6 +1916,14 @@ public class LiquidationExecutor {
         // FAB-128 — the token split behind principalBalance, kept for the market-gate catch below;
         // null on the ada branch, whose count is untouched.
         WalletInputSelection.TokenHolding principalHolding = null;
+        // FAB-226: on an ada collateral the seized ada (collateral − equity) pays this shape's ada needs, so the
+        // token output carries only the shortfall of the token-collateral ceilings, floored at the min-ada
+        // ceiling. A null equity keeps today's requirement: the router refuses it before the selector.
+        BigInteger adaCollateralTokenOutputAda = assessment.loan().datum().collateral().isAda()
+                && assessment.equity() != null
+                ? WalletRoles.adaCollateralTokenOutputRequiredAda(feeCeiling,
+                        assessment.loan().collateralAmount().subtract(assessment.equity()))
+                : null;
         try {
             // Part 3 — the balance MarketGate's decide() checks. ⚠ FAB-185 residue: it still sums the
             // whole wallet as read at the start of this check, so a candidate it allows can still be
@@ -1909,7 +1934,8 @@ public class LiquidationExecutor {
                 // candidate the wallet could never actually fund (M13).
                 principalHolding = WalletInputSelection.tokenHolding(walletCheck.wallet(),
                         payInAdvancePrincipal,
-                        WalletInputSelection.tokenPrincipalRequiredAda(Optional.of(feeCeiling)));
+                        adaCollateralTokenOutputAda != null ? adaCollateralTokenOutputAda
+                                : WalletInputSelection.tokenPrincipalRequiredAda(Optional.of(feeCeiling)));
             }
             BigInteger principalBalance = payInAdvancePrincipal.isAda()
                     ? walletCheck.wallet().stream().filter(WalletInputSelection::nominable)
@@ -1934,7 +1960,8 @@ public class LiquidationExecutor {
                                         WalletRoles.adaAnticipateRequired(lenderPayout, feeCeiling), needed)
                                 : sizedToken(loanUtxoRef, payInAdvanceRole, payInAdvanceFunding,
                                         payInAdvancePrincipal.toUnit(), lenderPayout,
-                                        WalletRoles.tokenOutputRequiredAda(feeCeiling), needed);
+                                        adaCollateralTokenOutputAda != null ? adaCollateralTokenOutputAda
+                                                : WalletRoles.tokenOutputRequiredAda(feeCeiling), needed);
                     },
                     // FAB-185 — role C, pinned by the builder as the only collateral and never spent.
                     walletCheck.roles().c().orElse(null),
@@ -1984,18 +2011,20 @@ public class LiquidationExecutor {
             return null;
         } catch (PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException e) {
             // All seven construction sites describe a candidate or oracle state this route cannot
-            // build this cycle: PayInAdvanceLiquidationRouter:164 is negative equity (unreachable
-            // through a real assessment because LoanFinance.redeemerEquity floors at zero);
-            // LiquidatePayInAdvanceTransactionBuilder:522 and :528 are the collateral feed window
-            // and margin; :539 and :545 are the principal feed window and margin; :1243-1244 is a
-            // POOLED or PRICE_DATA_ORCFAX variant; and :1264 is an entry not usable this cycle.
+            // build this cycle: PayInAdvanceLiquidationRouter.buildConvertLiquidation's guard is
+            // negative equity (unreachable through a real assessment because
+            // LoanFinance.redeemerEquity floors at zero); LiquidatePayInAdvanceTransactionBuilder's
+            // collateral feed window and margin checks (skipped for an ada collateral, which has no
+            // feed) and principal feed window and margin checks (skipped for an ada principal) are
+            // the next four; refuseUnmodelledVariant's POOLED or PRICE_DATA_ORCFAX arm is a variant
+            // it cannot encode; and its usableForLiquidation() check is an entry not usable this cycle.
             //
             // Setting a market to CONVERT cures none of them. Window and margin are per-cycle feed
             // timing and clear by themselves unless the configured oracle margin exceeds what any
             // feed can leave after validTo. Variant and usability are oracle-entry properties:
-            // OracleEntry.usableForLiquidation() is false for POOLED/ORCFAX (OracleEntry.java:124),
-            // and ConvertTransactionBuilder.build refuses a collateral oracle that is not usable
-            // for liquidation (ConvertTransactionBuilder.java:237). Negative equity says nothing
+            // OracleEntry.usableForLiquidation() is false for POOLED/ORCFAX, and
+            // ConvertTransactionBuilder.build refuses a collateral oracle that is not usable for
+            // liquidation (Refusal.COLLATERAL_ORACLE_MISSING). Negative equity says nothing
             // about the mechanism. Since `action` is market-wide, that advice would re-route every
             // loan in the market on the strength of a refusal conversion cannot repair.
             //
@@ -2213,13 +2242,13 @@ public class LiquidationExecutor {
      * feed the scanner and the builder used, not a special case invented here.
      *
      * <h3>The min-ada the bot funds is counted (E5-A / F4)</h3>
-     * {@link #minAdaFunded} is the lovelace the builder puts into the emitted asset-manager outputs
-     * (compensation + claim) <em>beyond</em> what the loan UTxO's own collateral already carried — the
-     * per-loan {@code Σ(assetManagerOutput.ada) − adaFromTheCollateralInput} that
-     * cardano-client-lib tops to the min-ada floor out of the bot's own inputs. It is real lovelace
-     * leaving the wallet that {@code txFee} does not include, and it is per-loan rather than a
-     * constant: on token collateral the outputs carry no ada of their own, so the whole rider is
-     * funded; on ada collateral only the shortfall between a sub-floor payout and the floor is.
+     * {@link #minAdaFunded} is the lovelace the bot puts into outputs it does not get back,
+     * <em>beyond</em> what the loan input's own ada pays into them. That covers the asset-manager
+     * outputs (compensation and claim) on every route, the Minswap order output on the convert route,
+     * and the collateral rider on the pay-in-advance route. It is real lovelace leaving the wallet that
+     * {@code txFee} does not include, and it is per loan, not a constant: {@code minAdaFunded}'s
+     * javadoc table gives what is counted and what offsets it, per route and collateral kind, with the
+     * result on the pinned fixtures.
      *
      * <h3>Two numbers, deliberately kept apart (E5-B Finding 1 / F1.i)</h3>
      * <ul>
@@ -2851,12 +2880,44 @@ public class LiquidationExecutor {
      *       {@code liquidationFee} slice returns to the bot rather than to the outputs, so the ada that
      *       actually flows into the outputs is {@code L − liquidationFee = collateralAmount −
      *       liquidationFee} regardless of how the builder split it between {@code equity} and
-     *       {@code collateralPayout}. Only the shortfall between a sub-floor payout and the floor is
-     *       actually funded.</li>
+     *       {@code collateralPayout}, or between the equity and the swap. Only what the outputs carry
+     *       beyond that is funded. On the pay-in-advance route the offset is {@code equity} instead (FAB-226):
+     *       the bot acquires {@code collateralAmount − equity}, fee slice included, which {@code record()}'s
+     *       REPLACED bracket prices, so only the equity flows from the collateral into the outputs; the plain
+     *       offset would clamp this shape to 0. That arm assumes a token principal, and it is reached only
+     *       because {@link PayInAdvanceLiquidationRouter} refuses an ADA collateral against an ADA principal by
+     *       name. Were that refusal lifted, the lender's ADA payout would be counted as min-ADA here: the safe
+     *       direction, since the candidate would read UNPROFITABLE.</li>
      *   <li><b>token collateral</b> — the outputs carry tokens and no ada of their own, so the whole of
      *       the loan UTxO's ada {@code L} is available to cover their min-ada floor; the offset is that
      *       ada ({@code loan().lovelace()}), and only the min-ada beyond it is funded.</li>
      * </ul>
+     *
+     * <h3>⛔ The Minswap order output is counted too, on the convert route (FAB-224)</h3>
+     * The convert's order output sits at the Minswap order spend credential, not the asset manager, so the
+     * loop over asset-manager outputs never saw it: the 4,000,000 order overhead the bot fronts and never
+     * gets back was free here, while {@link ConvertEconomics} charges it. On the convert route the coin of
+     * every output at {@link ConvertLiquidationRouter#minswapOrderSpendScriptHash()} is therefore added
+     * before the offset. For a token collateral that coin is the overhead alone, and the loan's own lovelace
+     * covers part of it. For an ada collateral it is the swapped ada plus the overhead; the swapped part is
+     * the collateral's own, and the offset cancels it.
+     * <table>
+     *   <caption>What is counted, per route and collateral, and the result on the pinned fixtures</caption>
+     *   <tr><th>route × collateral</th><th>counted</th><th>offset</th><th>min-ada on the pinned fixture</th></tr>
+     *   <tr><td>plain × either, pay-in-advance × token</td><td>asset-manager outputs (+ pay-in-advance's
+     *       collateral rider)</td><td>as above</td><td>unchanged by FAB-224</td></tr>
+     *   <tr><td>pay-in-advance × ada</td><td>asset-manager outputs</td><td>{@code equity}</td><td>2d067dae:
+     *       472,814,657 − 471,150,997 = 1,663,660, the lender output's min-ada (was 0)</td></tr>
+     *   <tr><td>convert × ada</td><td>asset-manager outputs + the order output</td>
+     *       <td>{@code collateralAmount − liquidationFee}</td><td>2d067dae: 4,000,000, plus the equity
+     *       top-up when the equity is below the ledger minimum (was 0)</td></tr>
+     *   <tr><td>convert × token</td><td>asset-manager outputs + the order output</td>
+     *       <td>{@code loan().lovelace()}</td><td>d832b78e: 4,000,000 − 2,000,000 = 2,000,000; NIGHT→USDM
+     *       328e44f9: 4,000,000 + 2,000,000 − 3,000,000 = 3,000,000 (both were 0)</td></tr>
+     * </table>
+     * The convert floor is then {@code token fee value (0 for ada) + Σ coin(outputs at the bot's address) −
+     * Σ coin(wallet inputs)}: what actually comes back to the bot, never a prediction.
+     * <p>
      * Read off the finished body by credential (never a predicted position), exactly as the builder's
      * own {@code assetOutputIndexes} locates the same outputs. Clamped at zero as defence in depth: the
      * outputs can only ever carry their intrinsic ada plus a non-negative top-up.
@@ -2867,6 +2928,17 @@ public class LiquidationExecutor {
         for (TransactionOutput output : transaction.getBody().getOutputs()) {
             if (assetManagerCredential.equals(paymentCredentialOf(output.getAddress()))) {
                 outputAda = outputAda.add(output.getValue().getCoin());
+            }
+        }
+        // FAB-224: the Minswap order output, at the order credential rather than the asset manager. Scoped to
+        // the route the candidate was BUILT on, like the rider below: no other route emits an order.
+        String orderCredential = ROUTE_CONVERT.equals(pass.route) && convertRouter != null
+                ? convertRouter.minswapOrderSpendScriptHash() : null;
+        if (orderCredential != null) {
+            for (TransactionOutput output : transaction.getBody().getOutputs()) {
+                if (orderCredential.equalsIgnoreCase(paymentCredentialOf(output.getAddress()))) {
+                    outputAda = outputAda.add(output.getValue().getCoin());
+                }
             }
         }
         BigInteger collateralAdaOffset = assessment.loan().datum().collateral().isAda()
@@ -2942,6 +3014,14 @@ public class LiquidationExecutor {
             }
             funded = funded.add(rider);
         }
+        // FAB-226: pay-in-advance of an ada collateral. The bot acquires collateral − equity (the REPLACED
+        // bracket in record() prices it), so only the equity flows from the collateral into the asset-manager
+        // outputs, and the rest of their coin is the bot's own: the lender output's min-ada. The rider loop above
+        // finds nothing here, because the seized ada comes back ada-only and quantityOf of lovelace is 0. The
+        // plain offset (collateralAmount − liquidationFee) would clamp this shape to 0.
+        if (ROUTE_PAY_IN_ADVANCE.equals(pass.route) && assessment.loan().datum().collateral().isAda()) {
+            funded = outputAda.subtract(assessment.equity());
+        }
 
         return funded.signum() > 0 ? funded : BigInteger.ZERO;
     }
@@ -2973,10 +3053,11 @@ public class LiquidationExecutor {
      * {@code MARKET_DISABLED} refusal. A {@code CONVERT_BEFORE_ANTICIPATE} market builds either route, so the
      * action no longer says which one a candidate was built on.
      *
-     * <p>⚠ <b>The convert route funds ada the rider deliberately does NOT count</b> — the Minswap
-     * order carries ~2.8 ADA to the asset manager and does not come back to the bot. Whether that
-     * belongs in the profitability floor is an ECONOMICS decision and is not made here: adding it
-     * would be a new cost term, not a correction of a miscount. Recorded in findings §57 as open.
+     * <p>⚠ <b>The convert route's order output is counted, though not as the rider</b> — since FAB-224
+     * {@link #minAdaFunded} adds the Minswap order output (its 4,000,000 overhead,
+     * {@link ConvertEconomics#MINSWAP_ORDER_OVERHEAD}) to what the bot funds, so the executor's floor
+     * charges it, as {@link ConvertEconomics} already did. The S-15 rider still applies to the
+     * pay-in-advance route alone.
      */
     private String plannedRoute(LiquidationAssessment assessment, CandidatePass pass) {
         if (!assessment.bond().datum().shouldLiquidationConvertToPrincipal()) {

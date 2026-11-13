@@ -1,5 +1,6 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
+import com.bloxbean.cardano.client.api.MinAdaCalculator;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
 import com.bloxbean.cardano.client.api.ScriptSupplier;
 import com.bloxbean.cardano.client.api.TransactionEvaluator;
@@ -15,8 +16,11 @@ import com.bloxbean.cardano.client.quicktx.ScriptTx;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
+import com.bloxbean.cardano.client.transaction.spec.Withdrawal;
+import com.bloxbean.cardano.client.address.Address;
 import com.bloxbean.cardano.client.address.AddressProvider;
 import com.bloxbean.cardano.client.address.Credential;
+import com.bloxbean.cardano.client.address.CredentialType;
 import com.bloxbean.cardano.client.util.HexUtil;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.ClaimData;
@@ -60,10 +64,11 @@ import java.util.stream.Stream;
  * <b>by their datum bytes</b> rather than by arithmetic, and the whole thing is assembled again with
  * the observed values. {@link #assertStructure} then re-derives them from the finished body.
  *
- * <h2>⚠ Trap 17 is unavoidable on this path</h2>
- * The bot's income is the liquidation fee <b>in the collateral token</b>, so every convert produces a
- * change output carrying native assets. A subsequent build that spends it must cope with a
- * multi-asset wallet UTxO; that is a property of the path, not a defect to design away.
+ * <h2>⚠ Trap 17 is unavoidable on this path — for a TOKEN collateral</h2>
+ * The bot's income is the liquidation fee <b>in the collateral token</b>, so every convert of a token
+ * collateral produces a change output carrying native assets. A subsequent build that spends it must cope
+ * with a multi-asset wallet UTxO; that is a property of the path, not a defect to design away. An ADA
+ * collateral's fee is lovelace, and its change is ada-only (FAB-224).
  *
  * <h2>Collateral and the wallet: C is pinned, U is the only wallet input — on BOTH passes (FAB-185)</h2>
  * <ul>
@@ -80,7 +85,39 @@ import java.util.stream.Stream;
  *       holds U and nothing else (CCL trap 9b: guard every seam, not one). The layout probe sees the same
  *       view as the strict pass, so it lays out the body that is evaluated. <b>A U too small for the build
  *       refuses; it never pulls a second wallet output.</b></li>
+ *   <li><b>Or no wallet input at all</b> (FAB-224): a request whose wallet utxo is {@code null} spends nothing
+ *       from the wallet. Neither pass collects a wallet input, and every supplier either pass hands
+ *       cardano-client-lib is a {@link DesignatedInputUtxoSupplier#withoutWalletInput} view, in which the
+ *       wallet's payment credential holds nothing, so the body balances from its own script inputs or not at
+ *       all. That is the ADA-collateral shape: the loan's own lovelace funds the order, the equity, the carriers
+ *       and the fee. C stays the only collateral, checked as above. <b>This builder never decides between the
+ *       two shapes; its caller, the router, does</b>, and a body the loan cannot fund fails in
+ *       cardano-client-lib's balancing rather than reaching into the wallet.</li>
  * </ul>
+ *
+ * <h2>⛔ Oracle legs: one per TOKEN, collateral and principal (FAB-223)</h2>
+ * {@code loan_claim_action} calls {@code retrieve_oracle_data} twice, once for the collateral and once for the
+ * principal. For a token leg it reads the reference input at the index the claim redeemer names, takes that
+ * input's PAYMENT credential, and resolves the feed with {@code pairs.get_first(redeemers,
+ * Withdraw(credential))}: the leg needs its own reference input, its own withdraw-0 at that credential, and
+ * the real canonical index of that input in the claim. An ada leg short-circuits on the empty policy id and
+ * reads nothing. Until FAB-223 this builder emitted the collateral leg only and hard-coded the principal's
+ * index to 0, so every convert with a token principal failed at {@code loan_claim_action}.
+ * <p>
+ * Both legs now go through one representation ({@link OracleLeg}): a token leg's oracle is validated, its
+ * reference input, reference script and (when present) Charli3 provider are referenced, the probe is asked
+ * about it, its withdraw-0 is added, and its canonical reference-input index goes into the claim. An ada leg
+ * contributes nothing, and its index stays 0. Four refusals guard it: {@link Refusal#PRINCIPAL_ORACLE_MISSING},
+ * {@link Refusal#ORACLE_VARIANT_NOT_MODELLED}, {@link Refusal#ORACLE_LEGS_SHARE_ONE_CREDENTIAL} and
+ * {@link Refusal#ORACLE_LEG_CREDENTIAL_MISMATCH} — the last checked by {@link #assertOracleLegs} on the layout
+ * probe's body, before any evaluator is asked, and again on the finished body.
+ * <p>
+ * <p>
+ * FAB-224 — an ADA collateral is an ada leg like an ada principal: it carries no oracle entry, and so no
+ * reference input, no probe entry and no withdrawal, and its claim index is 0. An ada collateral handed an
+ * entry is refused {@link Refusal#COLLATERAL_ORACLE_MISSING}: {@code retrieve_oracle_data} never reads an
+ * oracle for an ada leg. Its equity output is ada only, and its fee to the bot is checked in lovelace
+ * ({@link #assertStructure}).
  */
 @Slf4j
 public class ConvertTransactionBuilder {
@@ -100,6 +137,9 @@ public class ConvertTransactionBuilder {
         REPAYMENT_RECEIPTS_NOT_MODELLED,
         /**
          * The equity output is absent, short, or carries something the validator's DoS guard forbids.
+         * FAB-224 — for an ADA collateral: it holds anything but ada (the DoS guard's {@code
+         * length(flatten(value)) == 1}), or its coin is not exactly {@code max(equity, min-ada of that output)}:
+         * below the equity, or topped up by more than the ledger minimum demands.
          */
         EQUITY_OUTPUT_MISMATCH,
         /** The lender bond's datum did not survive a decode→re-encode, so it cannot be echoed. */
@@ -108,7 +148,12 @@ public class ConvertTransactionBuilder {
         ORDER_OUTPUT_MISMATCH,
         /** A carrier output's inline datum does not hash to the value the order datum embeds. */
         CARRIER_DATUM_MISMATCH,
-        /** The bot's collateral-token fee is absent from the built body. */
+        /**
+         * The bot's collateral-token fee is absent from the built body. FAB-224 — for an ADA collateral the fee
+         * is lovelace and mixes with the bot's own, so what is checked is the net: the bot's outputs, less what
+         * its wallet input brought, plus the transaction fee, must reach the liquidation fee less the order's
+         * 4 ADA overhead and the equity output's min-ada top-up.
+         */
         FEE_NOT_PAID_TO_BOT,
         /** An index the redeemer claims does not point at what it claims, on the finished body. */
         INDEX_MISMATCH,
@@ -117,6 +162,10 @@ public class ConvertTransactionBuilder {
          * least one leg is a token and {@code loan_claim_action} requires an oracle withdrawal for it.
          * Building without one produces a transaction that assembles, serialises and passes every
          * structural check here — and fails on chain.
+         * <p>
+         * FAB-224 — an ADA collateral needs no oracle and must be handed none: an ada collateral carrying an
+         * entry is refused by this name too, because {@code retrieve_oracle_data} never reads an oracle for an
+         * ada leg and this builder would reference and withdraw for nothing.
          */
         COLLATERAL_ORACLE_MISSING,
         /**
@@ -124,7 +173,39 @@ public class ConvertTransactionBuilder {
          * ({@code WalletInputSelection.nominable}), or is the wallet utxo itself. C is pinned as the ONLY
          * collateral and is never spent, so it has to be a separate, pure-ada output.
          */
-        COLLATERAL_UTXO_INVALID
+        COLLATERAL_UTXO_INVALID,
+        /**
+         * ⛔ FAB-223 — the principal leg's oracle is unusable or mismatched: no principal asset; a token
+         * principal with no entry, an entry that is not {@code usableForLiquidation()}, or one that prices
+         * another token ({@code is_feed_token_correct}); or an ADA principal handed an entry, which
+         * {@code retrieve_oracle_data} would never read and this builder would reference and withdraw for
+         * nothing.
+         */
+        PRINCIPAL_ORACLE_MISSING,
+        /**
+         * ⛔ FAB-223 — the two TOKEN legs withdraw from one credential (equal {@code withdrawCredentialHash},
+         * ignoring case, or equal reward addresses) AND price different tokens. One reward address carries one
+         * withdrawal, and {@code get_first} would hand the principal leg the collateral's feed — for the wrong
+         * token. A same-token pair on one credential is NOT refused: one withdrawal serves both legs, and no
+         * second withdraw-0 is emitted at that credential (the rule the pay-in-advance builder refuses by the
+         * same name).
+         */
+        ORACLE_LEGS_SHARE_ONE_CREDENTIAL,
+        /**
+         * ⛔ FAB-223 — a token leg's oracle is not bound the way {@code retrieve_oracle_data} binds it, on a
+         * body this builder assembled: its reference input is not at the canonical index the claim names, it
+         * does not resolve to an output whose payment credential is the leg's {@code withdrawCredentialHash},
+         * or the body has no withdrawal at the leg's reward address carrying that credential. Checked on the
+         * layout probe's body, before any evaluator is asked, and again on the finished body.
+         */
+        ORACLE_LEG_CREDENTIAL_MISMATCH,
+        /**
+         * FAB-223 — a token leg's feed is neither {@code AGGREGATED} nor {@code DEDICATED}. This builder encodes
+         * only the signed oracle redeemer ({@code LiquidationTxEncoder.oracleRedeemer(feed, signatures)}), and
+         * {@code OracleFeedConverter.toPlutusData} would throw at assembly for a {@code PRICE_DATA_CHARLIE},
+         * {@code PRICE_DATA_ORCFAX} or {@code POOLED} feed. Refused by name, naming the leg and the variant.
+         */
+        ORACLE_VARIANT_NOT_MODELLED
     }
 
     public static final class RefusedException extends RuntimeException {
@@ -148,10 +229,10 @@ public class ConvertTransactionBuilder {
      * @param poolRefUtxo the authentic Minswap pool UTxO from {@link MinswapPoolResolver}'s per-cycle
      *                    index snapshot — never a pinned coordinate, because a pool is respent on
      *                    every swap
-     * @param collateralOracle the feed for the COLLATERAL leg. ⛔ Never {@code null} on this path:
-     *                    a convert exchanges two distinct assets, so at least one leg is a token and
-     *                    {@code retrieve_oracle_data} demands an oracle withdrawal for it. The
-     *                    principal leg needs none when it is ada, which the ada short-circuit handles
+     * @param collateralOracle the oracle entry for the COLLATERAL leg, {@code null} iff the collateral is ada
+     *                    (FAB-224). A token collateral's leg needs one, because {@code retrieve_oracle_data}
+     *                    demands an oracle withdrawal for a token leg; an ada collateral's leg must have none.
+     *                    {@link #build} refuses anything else as {@link Refusal#COLLATERAL_ORACLE_MISSING}
      * @param orderAddress {@code Address(Script(minswapOrderSpendScriptHash), lenderStakeCredential)}
      *                     — the validator checks this exactly, including the LENDER's stake part
      * @param claim       the loan-claim redeemer's per-input data; its {@code lenderBondOutputIndex}
@@ -160,13 +241,20 @@ public class ConvertTransactionBuilder {
      *                    output which this builder does not mint, so it is a named refusal
      * @param walletUtxo  ⛔ FAB-185 — U, the ONE wallet output this build may spend. It alone funds the order's
      *                    lovelace, the equity output, the two carriers' min-ada, the fee and the change's
-     *                    min-ada: no other wallet output is visible to either pass
+     *                    min-ada: no other wallet output is visible to either pass. FAB-224 — may be
+     *                    {@code null}: then nothing from the wallet is spent, and the loan's own inputs fund
+     *                    the build (the ADA-collateral shape; the router decides which shape it asks for)
      * @param collateralUtxo ⛔ FAB-185 — wallet role C, pinned as the transaction's ONLY collateral input on
      *                    both passes and never spent. Ada-only with no datum and no script
      *                    ({@code WalletInputSelection.nominable}), and a different output from
      *                    {@code walletUtxo}; {@link #build} refuses anything else as
      *                    {@link Refusal#COLLATERAL_UTXO_INVALID}. Chosen by the executor's wallet roles, never
      *                    by the router or this builder
+     * @param principal   FAB-223 — the loan's principal asset ({@code loan.principalAsset()}): ada, or the token
+     *                    the principal oracle leg must price
+     * @param principalOracle FAB-223 — the principal's own oracle entry, {@code null} iff the principal is ada.
+     *                    A token principal's leg gets its own reference input, withdraw-0 and claim index;
+     *                    {@link #build} refuses anything else as {@link Refusal#PRINCIPAL_ORACLE_MISSING}
      */
     public record Request(Utxo loanUtxo,
                           Utxo bondUtxo,
@@ -185,7 +273,9 @@ public class ConvertTransactionBuilder {
                           String changeAddress,
                           long validFromSlot,
                           long validToSlot,
-                          Utxo collateralUtxo) {
+                          Utxo collateralUtxo,
+                          AssetType principal,
+                          com.fluidtokens.aquarium.offchain.model.loans.OracleEntry principalOracle) {
 
         /**
          * ⛔ <b>A SLOT THIS LARGE IS A MILLISECOND TIMESTAMP, and javac cannot tell you so.</b>
@@ -236,8 +326,8 @@ public class ConvertTransactionBuilder {
     private final ScriptSupplier scriptSupplier;
     private final TransactionEvaluator scriptCostEvaluator;
     /**
-     * ⛔ FAB-138: asks Blockfrost, inside {@link #build} and before any evaluation, whether the collateral
-     * oracle's out-refs — its feed and, for a Charli3 feed, its provider — are still live; or {@code null}
+     * ⛔ FAB-138: asks Blockfrost, inside {@link #build} and before any evaluation, whether every token oracle
+     * leg's out-refs — its feed and, for a Charli3 feed, its provider — are still live; or {@code null}
      * for the test-built builders, which are unprobed by design. Production's is {@code YaciConfig}'s bean,
      * pinned by {@code YaciConfigWiringTest}. Without it a spent feed reaches Blockfrost's evaluation as an
      * empty {@code ScriptFailures}, which the executor reads as a spent WALLET input
@@ -306,6 +396,16 @@ public class ConvertTransactionBuilder {
         this.oracleReferenceInputProbe = oracleReferenceInputProbe;
     }
 
+    /**
+     * {@code LedgerCeilings.maxPossibleFee} over this builder's protocol parameters — the same ceiling the executor
+     * sizes the wallet utxo with. {@code ConvertLiquidationRouter}'s no-wallet decision for an ada collateral
+     * (FAB-224) uses it, so the router and the executor agree on whether a wallet input is needed at all.
+     */
+    BigInteger feeCeiling() {
+        return com.fluidtokens.aquarium.offchain.util.LedgerCeilings.maxPossibleFee(
+                protocolParamsSupplier.getProtocolParams());
+    }
+
     // ---- the one entry point --------------------------------------------------------------------
 
     public Transaction build(Request request) {
@@ -315,14 +415,15 @@ public class ConvertTransactionBuilder {
         }
         // ⛔ THE LIMB THIS BUILDER SHIPPED WITHOUT. Checked first because its absence is invisible
         // downstream: every structural assertion in this class inspects what we EMIT, and none can
-        // see a withdrawal that was never added.
-        if (request.collateralOracle() == null || !request.collateralOracle().usableForLiquidation()
-                // the collateral oracle must price the loan's collateral token (is_feed_token_correct)
-                || !request.collateralOracle().token().equals(request.collateral())) {
-            throw refuse(Refusal.COLLATERAL_ORACLE_MISSING,
-                    "the collateral leg has no usable oracle entry; loan_claim_action would refuse "
-                            + "this transaction on chain and nothing here would have noticed");
-        }
+        // see a withdrawal that was never added. FAB-223: and the principal's limb, which it shipped
+        // without too — the same checks, per leg, through one representation.
+        OracleLeg collateralLeg = collateralLeg(request);
+        OracleLeg principalLeg = principalLeg(request);
+        // ⛔ This builder encodes the SIGNED oracle redeemer only; any other variant is refused by name
+        // here, rather than as an UnsupportedOperationException from OracleFeedConverter at assembly.
+        refuseUnmodelledVariant(collateralLeg);
+        refuseUnmodelledVariant(principalLeg);
+        refuseSharedOracleCredential(collateralLeg, principalLeg);
         if (request.repaymentReceipts()) {
             throw refuse(Refusal.REPAYMENT_RECEIPTS_NOT_MODELLED,
                     "this loan has repaymentReceipts = true, so equity_sent_to_borrower demands a "
@@ -333,8 +434,9 @@ public class ConvertTransactionBuilder {
         // spent. Refused by name, before anything is probed or assembled.
         refuseInvalidCollateral(request);
 
-        // ⛔ FAB-138: the collateral oracle's out-refs (its feed and, for a Charli3 feed, its provider) must
-        // still be LIVE — asked once per build, here, after the refusals above and before either pass below:
+        // ⛔ FAB-138: every token oracle leg's out-refs (its feed and, for a Charli3 feed, its provider) must
+        // still be LIVE — collateral then principal, an ada principal adding nothing (FAB-223) — asked once
+        // per build, here, after the refusals above and before either pass below:
         // pass 1 (the layout probe) and pass 2 share this one answer. Spent, wrong NFT or a provider error
         // throws OracleReferenceInputNotLiveException, which the executor records REFUSED and logs at ERROR
         // every cycle. An out-ref whose content is unknown (not yet visible to this node) throws it marked
@@ -342,39 +444,51 @@ public class ConvertTransactionBuilder {
         // with the nominated wallet utxo kept (FAB-183). After evaluation it would be too late: a spent feed
         // comes back from Blockfrost as an empty ScriptFailures, which the executor reads as a spent WALLET
         // input (CCL trap 13).
+        List<OracleLeg> tokenLegs = Stream.of(collateralLeg, principalLeg).filter(OracleLeg::isToken).toList();
         if (oracleReferenceInputProbe != null) {
-            oracleReferenceInputProbe.requireLive(List.of(request.collateralOracle()));
+            oracleReferenceInputProbe.requireLive(tokenLegs.stream().map(OracleLeg::entry).toList());
         }
-        List<TransactionInput> refInputs = referenceInputs(request);
+        List<TransactionInput> refInputs = referenceInputs(request, tokenLegs);
         long configRefIndex = indexOf(refInputs, inputOf(request.configUtxo()), "main config");
         // ⛔ The LM config, not the main one: lender_manager.withdraw resolves the ACTION script from
         // the LM config datum it is handed (§22.3's fourth wrinkle, found by dry-eval not by reading).
         long lmConfigRefIndex = indexOf(refInputs, inputOf(request.lmConfigUtxo()), "lm config");
         // The pool's index is into the FILTERED list of pool reference inputs, of which there is one.
         long poolRefIndex = 0L;
-        long collateralOracleRefIndex = indexOf(refInputs,
-                request.collateralOracle().referenceInput(), "collateral oracle");
-        // ⚠ The principal leg is ada here: retrieve_oracle_data short-circuits on an empty policy id
-        // and never reads this input — but the index must still be IN RANGE. Index 0 of the
-        // canonically sorted reference inputs always is, which is what the sibling builders pass too.
-        long principalOracleRefIndex = 0L;
+        // FAB-223 — each leg's index into the canonically sorted reference inputs, by lookup: a token leg's is
+        // the real position of its NFT-holding reference input. An ada leg is never read by
+        // retrieve_oracle_data (it short-circuits on the empty policy id), but its index must still be IN
+        // RANGE: index 0 of the canonically sorted reference inputs always is, which is what the sibling
+        // builders give an ada leg too.
+        long collateralOracleRefIndex = collateralLeg.refIndexIn(refInputs);
+        long principalOracleRefIndex = principalLeg.refIndexIn(refInputs);
 
         // ⛔ PASS 1. The two carrier indexes and lenderBondOutputIndex are ABSOLUTE positions in
         // self.outputs, and a withdrawing transaction gets a dummy output prepended plus change
         // appended (trap 1). Build once with placeholders purely to read the finished layout.
-        Transaction probe = assembleAndComplete(request, refInputs, configRefIndex, lmConfigRefIndex,
+        Transaction probe = assembleAndComplete(request, tokenLegs, refInputs, configRefIndex, lmConfigRefIndex,
                 poolRefIndex, collateralOracleRefIndex, principalOracleRefIndex, 0L, 0L, 0L, null);
+        // ⛔ FAB-223 — the oracle legs' binding, read off the probe's BODY (its reference inputs, its
+        // withdrawals, and the out-refs through the utxo supplier). Nothing here evaluates: pass 1 stays on
+        // LAYOUT_PROBE_EVALUATOR. It runs here because cardano-client-lib evaluates pass 2 BEFORE its
+        // postBalanceTx hook, so the hook's re-check alone could not pre-empt an evaluation that fails at
+        // loan_claim_action for a leg bound to the wrong credential.
+        assertOracleLegs(probe, request, collateralOracleRefIndex, principalOracleRefIndex);
 
         long successIndex = outputIndexWithDatum(probe, request.plan().successDatum(), "success carrier");
         long refundIndex = outputIndexWithDatum(probe, request.plan().refundDatum(), "refund carrier");
         long bondOutputIndex = outputIndexWithDatumHex(probe, request.bondUtxo().getInlineDatum(),
                 "lender bond echo");
 
-        // PASS 2, with the observed layout, and a post-assert that re-derives it from the body.
-        Transaction transaction = assembleAndComplete(request, refInputs, configRefIndex, lmConfigRefIndex,
-                poolRefIndex, collateralOracleRefIndex, principalOracleRefIndex, successIndex, refundIndex,
+        // PASS 2, with the observed layout, and a post-assert that re-derives it — and the oracle legs'
+        // binding — from the finished body.
+        Transaction transaction = assembleAndComplete(request, tokenLegs, refInputs, configRefIndex,
+                lmConfigRefIndex, poolRefIndex, collateralOracleRefIndex, principalOracleRefIndex, successIndex, refundIndex,
                 bondOutputIndex,
-                (ctx, txn) -> assertStructure(txn, request, successIndex, refundIndex, bondOutputIndex));
+                (ctx, txn) -> {
+                    assertStructure(txn, request, successIndex, refundIndex, bondOutputIndex);
+                    assertOracleLegs(txn, request, collateralOracleRefIndex, principalOracleRefIndex);
+                });
 
         // ⛔ FAB-185 (m3) — C is the ONLY collateral now, so its capacity is the whole of it: the built body's
         // collateral_return must not be negative (an unparseable artefact, CCL trap 16) and its
@@ -408,6 +522,210 @@ public class ConvertTransactionBuilder {
         }
     }
 
+    // ---- the oracle legs (FAB-223) ----------------------------------------------------------------
+
+    /**
+     * FAB-223 — one leg {@code loan_claim_action} prices through {@code retrieve_oracle_data}: its role
+     * ({@code collateral} / {@code principal}), the asset it prices, and its oracle entry, {@code null} exactly
+     * when the asset is ada. Validation, reference inputs, the probe list, the withdrawals, the claim indexes and
+     * {@link #assertOracleLegs} all read the legs through this one shape.
+     */
+    record OracleLeg(String role, AssetType asset,
+                     com.fluidtokens.aquarium.offchain.model.loans.OracleEntry entry) {
+
+        /** A token leg: it has an oracle entry, and with it a reference input, a withdrawal and a real index. */
+        boolean isToken() {
+            return entry != null;
+        }
+
+        /**
+         * The leg's index into the canonically sorted reference inputs: a token leg's NFT holder's position; an
+         * ada leg's 0, the one index always in range (never read: the ada short-circuit).
+         */
+        long refIndexIn(List<TransactionInput> refInputs) {
+            return isToken() ? indexOf(refInputs, entry.referenceInput(), role + " oracle") : 0L;
+        }
+    }
+
+    /**
+     * The collateral leg, "ada or token" (FAB-224): an ada collateral carries no entry, and is an ada leg; a token
+     * collateral one that is {@code usableForLiquidation()} and prices exactly that token. An absent collateral,
+     * an ada collateral handed an entry, or a token collateral with a missing, unusable or mismatched entry is
+     * {@link Refusal#COLLATERAL_ORACLE_MISSING}.
+     */
+    private static OracleLeg collateralLeg(Request request) {
+        var entry = request.collateralOracle();
+        if (request.collateral() != null && request.collateral().isAda()) {
+            if (entry != null) {
+                throw refuse(Refusal.COLLATERAL_ORACLE_MISSING, "the collateral is ada, but the request hands it "
+                        + "the oracle " + unitOf(entry.oracleToken()) + "; retrieve_oracle_data never reads an "
+                        + "oracle for an ada leg");
+            }
+            return new OracleLeg("collateral", request.collateral(), null);
+        }
+        if (request.collateral() == null
+                || entry == null || !entry.usableForLiquidation()
+                // the collateral oracle must price the loan's collateral token (is_feed_token_correct)
+                || !request.collateral().equals(entry.token())) {
+            throw refuse(Refusal.COLLATERAL_ORACLE_MISSING,
+                    "the collateral leg has no usable oracle entry; loan_claim_action would refuse "
+                            + "this transaction on chain and nothing here would have noticed");
+        }
+        return new OracleLeg("collateral", request.collateral(), entry);
+    }
+
+    /**
+     * The principal leg, "ada or token": an ada principal carries no entry, a token principal one that is
+     * {@code usableForLiquidation()} and prices exactly that token. Anything else is
+     * {@link Refusal#PRINCIPAL_ORACLE_MISSING}.
+     */
+    private static OracleLeg principalLeg(Request request) {
+        AssetType principal = request.principal();
+        var entry = request.principalOracle();
+        if (principal == null) {
+            throw refuse(Refusal.PRINCIPAL_ORACLE_MISSING, "the request names no principal asset");
+        }
+        if (principal.isAda()) {
+            if (entry != null) {
+                throw refuse(Refusal.PRINCIPAL_ORACLE_MISSING, "the principal is ada, but the request hands it "
+                        + "the oracle " + unitOf(entry.oracleToken()) + "; retrieve_oracle_data never reads an "
+                        + "oracle for an ada leg");
+            }
+            return new OracleLeg("principal", principal, null);
+        }
+        if (entry == null || !entry.usableForLiquidation()
+                // the principal oracle must price the loan's principal token (is_feed_token_correct)
+                || !principal.equals(entry.token())) {
+            throw refuse(Refusal.PRINCIPAL_ORACLE_MISSING, "the token principal " + principal.toUnit()
+                    + " has no usable oracle entry pricing it; loan_claim_action would refuse this transaction "
+                    + "on chain at its principal leg");
+        }
+        return new OracleLeg("principal", principal, entry);
+    }
+
+    /**
+     * {@link Refusal#ORACLE_VARIANT_NOT_MODELLED} for a token leg whose feed is not a SIGNED one: this builder
+     * emits {@code LiquidationTxEncoder.oracleRedeemer(feed, signatures)} only, which cannot encode a
+     * {@code PRICE_DATA_CHARLIE}, {@code PRICE_DATA_ORCFAX} or {@code POOLED} feed. An ada leg is skipped.
+     */
+    private static void refuseUnmodelledVariant(OracleLeg leg) {
+        if (!leg.isToken()) {
+            return;
+        }
+        var variant = leg.entry().feed().variant();
+        switch (variant) {
+            case AGGREGATED, DEDICATED -> {
+            }
+            case PRICE_DATA_CHARLIE, PRICE_DATA_ORCFAX, POOLED -> throw refuse(Refusal.ORACLE_VARIANT_NOT_MODELLED,
+                    "the %s oracle %s publishes a %s feed; this builder encodes only the signed "
+                            .formatted(leg.role(), unitOf(leg.entry().oracleToken()), variant)
+                            + "(AGGREGATED/DEDICATED) oracle redeemer");
+        }
+    }
+
+    /**
+     * {@link Refusal#ORACLE_LEGS_SHARE_ONE_CREDENTIAL} for two token legs on one credential pricing different
+     * tokens ({@link #sharesOneOracleCredential}). A same-token pair passes, and is served by one withdrawal.
+     */
+    private static void refuseSharedOracleCredential(OracleLeg collateral, OracleLeg principal) {
+        if (!collateral.isToken() || !principal.isToken()) {
+            return;
+        }
+        var c = collateral.entry();
+        var p = principal.entry();
+        if (sharesOneOracleCredential(c, p) && !Objects.equals(c.token(), p.token())) {
+            String shared = c.withdrawCredentialHash() != null
+                    && c.withdrawCredentialHash().equalsIgnoreCase(p.withdrawCredentialHash())
+                    ? c.withdrawCredentialHash() : c.rewardAddress();
+            throw refuse(Refusal.ORACLE_LEGS_SHARE_ONE_CREDENTIAL, ("the collateral oracle %s (pricing %s) and the "
+                    + "principal oracle %s (pricing %s) both withdraw from %s; one withdraw-0 redeemer carries one "
+                    + "feed, and these two legs need feeds for two different tokens").formatted(
+                    unitOf(c.oracleToken()), unitOf(c.token()), unitOf(p.oracleToken()), unitOf(p.token()), shared));
+        }
+    }
+
+    /**
+     * Whether two oracle entries withdraw from one credential: the same withdrawal credential (ignoring case)
+     * or the same reward address — the predicate the pay-in-advance builder uses. {@link #build} refuses such a
+     * pair when its tokens differ; {@link #assembleAndComplete} emits a single withdraw-0 for it when they do not.
+     */
+    private static boolean sharesOneOracleCredential(com.fluidtokens.aquarium.offchain.model.loans.OracleEntry a,
+                                                     com.fluidtokens.aquarium.offchain.model.loans.OracleEntry b) {
+        boolean sameCredential = a.withdrawCredentialHash() != null
+                && a.withdrawCredentialHash().equalsIgnoreCase(b.withdrawCredentialHash());
+        boolean sameRewardAddress = a.rewardAddress() != null && a.rewardAddress().equals(b.rewardAddress());
+        return sameCredential || sameRewardAddress;
+    }
+
+    private static String unitOf(AssetType asset) {
+        return asset != null ? asset.toUnit() : "(none)";
+    }
+
+    /**
+     * ⛔ FAB-223 — the binding {@code retrieve_oracle_data} relies on, checked on a body this builder assembled.
+     * For each TOKEN leg (an ada leg is skipped):
+     * <ol>
+     *   <li>the canonical sort of the body's reference inputs holds the leg's reference input at the index the
+     *       claim names;</li>
+     *   <li>that out-ref resolves, through this builder's utxo supplier, to an output whose payment credential
+     *       is a script hash equal (ignoring case) to the leg's {@code withdrawCredentialHash};</li>
+     *   <li>the body withdraws at the leg's reward address, whose delegation credential is that hash.</li>
+     * </ol>
+     * The validator resolves the leg's feed by {@code Withdraw(<the reference input's payment credential>)}, so
+     * a registry entry whose reward address and reference input disagree assembles cleanly and fails there.
+     * Anything else is {@link Refusal#ORACLE_LEG_CREDENTIAL_MISMATCH}, naming the leg and the out-ref. It reads
+     * the body only, and never evaluates.
+     */
+    void assertOracleLegs(Transaction txn, Request request, long collateralOracleRefIndex,
+                          long principalOracleRefIndex) {
+        List<TransactionInput> bodyRefInputs = canonical(txn.getBody().getReferenceInputs() == null
+                ? List.of() : txn.getBody().getReferenceInputs());
+        List<Withdrawal> withdrawals =
+                txn.getBody().getWithdrawals() == null ? List.of() : txn.getBody().getWithdrawals();
+        assertOracleLeg(collateralLeg(request), collateralOracleRefIndex, bodyRefInputs, withdrawals);
+        assertOracleLeg(principalLeg(request), principalOracleRefIndex, bodyRefInputs, withdrawals);
+    }
+
+    private void assertOracleLeg(OracleLeg leg, long refIndex, List<TransactionInput> bodyRefInputs,
+                                 List<Withdrawal> withdrawals) {
+        if (!leg.isToken()) {
+            return;
+        }
+        var entry = leg.entry();
+        TransactionInput outRef = entry.referenceInput();
+        String where = "the " + leg.role() + " oracle leg's reference input "
+                + outRef.getTransactionId() + "#" + outRef.getIndex();
+        String credential = entry.withdrawCredentialHash();
+        // (1) at the index the claim names, in the order the validator sees.
+        if (refIndex < 0 || refIndex >= bodyRefInputs.size() || !outRef.equals(bodyRefInputs.get((int) refIndex))) {
+            throw refuse(Refusal.ORACLE_LEG_CREDENTIAL_MISMATCH, where + " is not at reference-input index "
+                    + refIndex + " of the body's " + bodyRefInputs.size() + ", the index the claim names");
+        }
+        // (2) the out-ref's payment credential is the leg's withdrawal credential.
+        Utxo resolved = utxoSupplier.getTxOutput(outRef.getTransactionId(), outRef.getIndex()).orElseThrow(() ->
+                refuse(Refusal.ORACLE_LEG_CREDENTIAL_MISMATCH, where + " does not resolve to an output"));
+        var payment = new Address(resolved.getAddress()).getPaymentCredential();
+        if (credential == null || payment.isEmpty()
+                || payment.get().getType() != CredentialType.Script
+                || !credential.equalsIgnoreCase(HexUtil.encodeHexString(payment.get().getBytes()))) {
+            throw refuse(Refusal.ORACLE_LEG_CREDENTIAL_MISMATCH, where + " sits at " + resolved.getAddress()
+                    + ", whose payment credential is not the script " + credential
+                    + " the leg withdraws from; retrieve_oracle_data would look for a withdrawal at another credential");
+        }
+        // (3) the body withdraws at the leg's reward address, carrying that credential.
+        boolean withdrawn = withdrawals.stream()
+                .filter(w -> w.getRewardAddress() != null && w.getRewardAddress().equals(entry.rewardAddress()))
+                .anyMatch(w -> new Address(w.getRewardAddress())
+                        .getDelegationCredentialHash()
+                        .map(hash -> credential.equalsIgnoreCase(HexUtil.encodeHexString(hash)))
+                        .orElse(false));
+        if (!withdrawn) {
+            throw refuse(Refusal.ORACLE_LEG_CREDENTIAL_MISMATCH, "the body has no withdrawal at the " + leg.role()
+                    + " oracle's reward address " + entry.rewardAddress() + " carrying the credential " + credential
+                    + " that " + where + " sits at");
+        }
+    }
+
     /**
      * ⛔ For PASS 1 ONLY. Reports success and costs nothing, so the layout probe cannot fail on the
      * placeholder indexes it is built with — see the two-site note in {@link #assembleAndComplete}.
@@ -426,7 +744,8 @@ public class ConvertTransactionBuilder {
 
     // ---- assembly -------------------------------------------------------------------------------
 
-    private Transaction assembleAndComplete(Request request, List<TransactionInput> refInputs,
+    private Transaction assembleAndComplete(Request request, List<OracleLeg> tokenLegs,
+                                            List<TransactionInput> refInputs,
                                             long configRefIndex, long lmConfigRefIndex, long poolRefIndex,
                                             long collateralOracleRefIndex, long principalOracleRefIndex,
                                             long successIndex, long refundIndex, long bondOutputIndex,
@@ -436,11 +755,17 @@ public class ConvertTransactionBuilder {
 
         tx.collectFrom(request.loanUtxo(), GENERAL_SPEND_REDEEMER);
         tx.collectFrom(request.bondUtxo(), GENERAL_SPEND_REDEEMER);
-        tx.collectFrom(request.walletUtxo());
+        // FAB-224 — U only when the request hands one. With none, nothing from the wallet is collected here, and
+        // complete() hands cardano-client-lib a view in which the wallet holds nothing, so balancing cannot add
+        // one either: the loan's own inputs fund the build.
+        if (request.walletUtxo() != null) {
+            tx.collectFrom(request.walletUtxo());
+        }
 
         // 1. The Minswap order. Its value is the validator's, not a min-ada estimate: an ADA
-        //    collateral's order holds exactly the swappable amount, a token collateral's holds the
-        //    tokens plus exactly 2_800_000 lovelace.
+        //    collateral's order holds the swappable amount plus the 4_000_000 overhead, a token
+        //    collateral's holds the swappable tokens plus exactly that overhead
+        //    (ConvertOrderPlan.orderLovelace, ConvertEconomics.MINSWAP_ORDER_OVERHEAD).
         tx.payToContract(request.orderAddress(), orderValue(request), plan.orderDatum());
 
         // 2. The lender bond, restored byte-for-byte. equals_data compares the WHOLE output, so the
@@ -458,11 +783,19 @@ public class ConvertTransactionBuilder {
         //    hold ada and the equity token and NOTHING ELSE. One stray asset — a change adjustment,
         //    a merged output — fails it on chain (CCL trap 17 territory, which this path already
         //    fights because the bot's fee is a native token).
+        //
+        //    FAB-224 — for an ADA collateral the equity IS ada, and the DoS guard is
+        //    `length(flatten(value)) == 1`: the output holds the equity's lovelace and nothing else.
+        //    cardano-client-lib raises it to the ledger minimum when the equity is smaller (CCL trap 6), out
+        //    of the bot's change; assertStructure checks that top-up is exactly the minimum and charges it to
+        //    the bot's fee check.
         BigInteger equity = request.claim().equity();
         if (equity.signum() > 0) {
             tx.payToContract(assetManagerAddress(),
-                    List.of(Amount.lovelace(EQUITY_OUTPUT_LOVELACE),
-                            Amount.asset(request.collateral().toUnit(), equity)),
+                    request.collateral().isAda()
+                            ? List.of(Amount.lovelace(equity))
+                            : List.of(Amount.lovelace(EQUITY_OUTPUT_LOVELACE),
+                                    Amount.asset(request.collateral().toUnit(), equity)),
                     LiquidationTxEncoder.assetManagerDatumWithToken(
                             new com.fluidtokens.aquarium.offchain.model.loans.AssetManagerDatumWithToken(
                                     request.loanUtxo().getTxHash(),
@@ -520,9 +853,24 @@ public class ConvertTransactionBuilder {
         // against the feed's published signatures and an empty list fails the threshold. Copying the
         // sibling verbatim is the hurried fix, and it would emit a transaction that assembles cleanly
         // and dies in phase 2.
-        tx.withdraw(request.collateralOracle().rewardAddress(), BigInteger.ZERO,
-                LiquidationTxEncoder.oracleRedeemer(request.collateralOracle().feed(),
-                        request.collateralOracle().signatures()));
+        //
+        // ⛔ FAB-223 — ONE WITHDRAW-0 PER TOKEN LEG, collateral first and the principal immediately after it:
+        // loan_claim_action's second retrieve_oracle_data resolves the principal feed by Withdraw(<the
+        // principal oracle's reference input's payment credential>), so a token principal's oracle runs as its
+        // own withdraw-0 with its own signed redeemer. Until FAB-223 it was never emitted and every
+        // token-principal convert failed at loan_claim_action. An ada leg emits nothing. A same-token pair on
+        // one credential is served by the first leg's withdrawal (the ledger allows one withdrawal per reward
+        // address, and its feed prices the right token for both legs); a different-token pair on one
+        // credential never gets here (ORACLE_LEGS_SHARE_ONE_CREDENTIAL).
+        List<OracleLeg> withdrawn = new ArrayList<>();
+        for (OracleLeg leg : tokenLegs) {
+            if (withdrawn.stream().anyMatch(w -> sharesOneOracleCredential(w.entry(), leg.entry()))) {
+                continue;
+            }
+            tx.withdraw(leg.entry().rewardAddress(), BigInteger.ZERO,
+                    LiquidationTxEncoder.oracleRedeemer(leg.entry().feed(), leg.entry().signatures()));
+            withdrawn.add(leg);
+        }
 
         tx.withdraw(rewardAddress(registry.getLmLiquidateAndConvertActionScriptHash()), BigInteger.ZERO,
                 ConvertTxEncoder.convertRedeemer(Math.toIntExact(configRefIndex),
@@ -565,8 +913,11 @@ public class ConvertTransactionBuilder {
         // to be chosen — so a U too small for the build refuses rather than pulling a second output. Out-refs
         // (C, the loan, the bond, the pool, every reference input) still resolve through it unchanged.
         // Mirrors LiquidateTransactionBuilder.complete (FAB-185-2) and the pay-in-advance builder (FAB-185-3).
-        UtxoSupplier walletView = DesignatedInputUtxoSupplier.of(utxoSupplier, request.changeAddress(),
-                request.walletUtxo());
+        // FAB-224 — a request with no wallet utxo gets the view in which the wallet holds NOTHING, built here for
+        // the same reason: both passes balance from the loan's own inputs, or neither does.
+        UtxoSupplier walletView = request.walletUtxo() == null
+                ? DesignatedInputUtxoSupplier.withoutWalletInput(utxoSupplier, request.changeAddress())
+                : DesignatedInputUtxoSupplier.of(utxoSupplier, request.changeAddress(), request.walletUtxo());
         // Production: the injected utxo supplier (the local index first) seen through that view, the
         // per-epoch protocol params, and a SCRIPT SUPPLIER serving the bytes of every validator travelling as
         // a reference script — without which cardano-client-lib prices that script's fee as zero (CCL trap 9).
@@ -707,6 +1058,9 @@ public class ConvertTransactionBuilder {
         // ⛔ The equity output, when one was owed. Checked on the FINISHED body, because the exact-value
         // guard is about what survives balancing rather than what we intended to emit.
         BigInteger equity = request.claim().equity();
+        // FAB-224 — the lovelace the library added to an ADA equity output to reach the ledger minimum: paid out
+        // of the bot's change, so the bot's fee check below is owed that much less.
+        BigInteger equityTopUp = BigInteger.ZERO;
         if (equity.signum() > 0) {
             String amAddress = assetManagerAddress();
             TransactionOutput equityOut = outs.stream()
@@ -715,7 +1069,21 @@ public class ConvertTransactionBuilder {
                     .orElseThrow(() -> refuse(Refusal.EQUITY_OUTPUT_MISMATCH,
                             "the borrower is owed " + equity + " of equity and no output reaches the "
                                     + "asset-manager credential"));
-            if (quantityOf(equityOut, request.collateral()).compareTo(equity) < 0) {
+            if (request.collateral().isAda()) {
+                // ⛔ FAB-224 — an ADA equity: its coin is the equity, raised to the ledger minimum only when the
+                // equity is smaller, and never by more. A coin below the equity fails containsCorrectAmount on
+                // chain; one above max(equity, min-ada) is bot money handed to the borrower (CCL trap 6).
+                BigInteger coin = equityOut.getValue().getCoin();
+                BigInteger exact = equity.max(new MinAdaCalculator(protocolParamsSupplier.getProtocolParams())
+                        .calculateMinAda(equityOut));
+                if (coin.compareTo(equity) < 0 || coin.compareTo(exact) != 0) {
+                    throw refuse(Refusal.EQUITY_OUTPUT_MISMATCH,
+                            ("the ada equity output holds %s lovelace; the borrower is owed %s, and the output "
+                                    + "must hold exactly max(equity, its min-ada) = %s").formatted(coin, equity,
+                                    exact));
+                }
+                equityTopUp = coin.subtract(equity);
+            } else if (quantityOf(equityOut, request.collateral()).compareTo(equity) < 0) {
                 throw refuse(Refusal.EQUITY_OUTPUT_MISMATCH,
                         "the equity output holds %s of the collateral, the borrower is owed %s"
                                 .formatted(quantityOf(equityOut, request.collateral()), equity));
@@ -743,7 +1111,15 @@ public class ConvertTransactionBuilder {
             // token and NOTHING else. A change adjustment or a merged output adds an entry here and
             // the validator refuses — on chain, after the fee is spent.
             int entries = flattenedLength(equityOut);
-            if (entries != 2) {
+            if (request.collateral().isAda()) {
+                // FAB-224 — for an ADA equity the guard is `length(flatten(value)) == 1`: ada and nothing else.
+                if (entries != 1) {
+                    throw refuse(Refusal.EQUITY_OUTPUT_MISMATCH,
+                            ("the equity output carries %d distinct assets; equity_sent_to_borrower's DoS guard "
+                                    + "demands exactly 1 (ada only) for an ada collateral when repaymentReceipts "
+                                    + "is false").formatted(entries));
+                }
+            } else if (entries != 2) {
                 throw refuse(Refusal.EQUITY_OUTPUT_MISMATCH,
                         ("the equity output carries %d distinct assets; equity_sent_to_borrower's DoS "
                                 + "guard demands exactly 2 (ada and the equity token) when "
@@ -782,7 +1158,38 @@ public class ConvertTransactionBuilder {
                         "the bot's outputs carry %s of the collateral but the fee it earned is %s"
                                 .formatted(toBot, request.plan().liquidationFee()));
             }
+        } else {
+            // ⛔ FAB-224 — an ADA collateral's fee is lovelace, the same unit as everything else the bot holds, so
+            // it is checked NET: what the bot's outputs hold, less what its wallet input brought, plus the
+            // transaction fee it paid, must reach the liquidation fee less the order's overhead (which the order
+            // carries on the bot's behalf) and less the equity output's min-ada top-up (which balancing took from
+            // the bot's change). A builder that left the fee in the order or paid it elsewhere fails here.
+            BigInteger toBot = outs.stream()
+                    .filter(o -> request.changeAddress().equals(o.getAddress()))
+                    .map(o -> o.getValue().getCoin())
+                    .reduce(BigInteger.ZERO, BigInteger::add);
+            BigInteger brought = request.walletUtxo() == null ? BigInteger.ZERO : lovelaceOf(request.walletUtxo());
+            BigInteger received = toBot.subtract(brought).add(txn.getBody().getFee());
+            BigInteger owed = request.plan().liquidationFee()
+                    .subtract(ConvertEconomics.MINSWAP_ORDER_OVERHEAD)
+                    .subtract(equityTopUp);
+            if (received.compareTo(owed) < 0) {
+                throw refuse(Refusal.FEE_NOT_PAID_TO_BOT,
+                        ("the bot received %s lovelace net (its outputs %s, less its wallet input's %s, plus the "
+                                + "fee %s) but is owed %s (the liquidation fee %s, less the order overhead %s and "
+                                + "the equity top-up %s)").formatted(received, toBot, brought,
+                                txn.getBody().getFee(), owed, request.plan().liquidationFee(),
+                                ConvertEconomics.MINSWAP_ORDER_OVERHEAD, equityTopUp));
+            }
         }
+    }
+
+    /** The lovelace a utxo holds. */
+    private static BigInteger lovelaceOf(Utxo utxo) {
+        return utxo.getAmount().stream()
+                .filter(a -> "lovelace".equals(a.getUnit()))
+                .map(Amount::getQuantity)
+                .reduce(BigInteger.ZERO, BigInteger::add);
     }
 
     private void assertCarrier(List<TransactionOutput> outs, long index, PlutusData datum,
@@ -807,9 +1214,10 @@ public class ConvertTransactionBuilder {
     // ---- plumbing ---------------------------------------------------------------------------------
 
     /**
-     * The ada this builder puts in the equity output. Comfortably over min-ada for an
+     * The ada this builder puts in a TOKEN collateral's equity output. Comfortably over min-ada for an
      * ada-plus-one-token output, and fixed rather than computed so the DoS guard's exact-value
-     * requirement is not at the mercy of a min-ada calculation that could round differently.
+     * requirement is not at the mercy of a min-ada calculation that could round differently. An ADA
+     * collateral's equity output holds the equity itself and nothing else (FAB-224), so it is not used there.
      *
      * <p>⚠ Counted as the bot's outlay by the same conservative rule §30 applies to the order's
      * 2.8 ada: the loan input carries ada of its own and it is not yet measured how much of it
@@ -878,19 +1286,22 @@ public class ConvertTransactionBuilder {
                 claim.lenderAuth(), claim.equity(), claim.loanId(), claim.remainingDebt());
     }
 
-    private List<TransactionInput> referenceInputs(Request request) {
+    private List<TransactionInput> referenceInputs(Request request, List<OracleLeg> tokenLegs) {
         var all = new java.util.LinkedHashSet<TransactionInput>(List.of(
                 inputOf(request.configUtxo()), inputOf(request.lmConfigUtxo()),
                 inputOf(request.poolRefUtxo())));
-        // The oracle's own three: the NFT-bearing input the validator reads the credential and value
-        // from, its published script, and — for a provider-backed feed — the provider UTxO. Any of
-        // them may be null (a multisig feed has no provider), and a null is skipped rather than
-        // encoded as a coordinate that resolves to nothing.
-        Stream.of(request.collateralOracle().referenceInput(),
-                        request.collateralOracle().referenceScript(),
-                        request.collateralOracle().charlieProviderReferenceInput())
-                .filter(Objects::nonNull)
-                .forEach(all::add);
+        // Each TOKEN oracle leg's own three (FAB-223: the principal's too, collateral first): the NFT-bearing
+        // input the validator reads the credential and value from, its published script, and — for a
+        // provider-backed feed — the provider UTxO. Any of them may be null (a multisig feed has no
+        // provider), and a null is skipped rather than encoded as a coordinate that resolves to nothing. An
+        // ada leg adds nothing: retrieve_oracle_data never reads a reference input for it.
+        for (OracleLeg leg : tokenLegs) {
+            Stream.of(leg.entry().referenceInput(),
+                            leg.entry().referenceScript(),
+                            leg.entry().charlieProviderReferenceInput())
+                    .filter(Objects::nonNull)
+                    .forEach(all::add);
+        }
         all.addAll(request.referenceScripts().values());
         return canonical(new ArrayList<>(all));
     }

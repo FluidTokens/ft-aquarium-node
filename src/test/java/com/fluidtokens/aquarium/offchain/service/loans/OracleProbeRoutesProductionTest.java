@@ -76,6 +76,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
@@ -905,39 +906,57 @@ class OracleProbeRoutesProductionTest {
     }
 
     /**
-     * (5) convert with a Charli3 collateral oracle, live: the feed and the provider are each asked exactly
-     * once per build, the provider with the c3 NFT. ⚠ The build then stops where it stopped before this
-     * slice: the convert builder encodes its oracle redeemer with the signed-feed overload, which refuses a
-     * PRICE_DATA_CHARLIE feed — pinned here so the probe is seen to run AHEAD of that refusal.
+     * (5) convert with a Charli3 collateral oracle, live: refused BY NAME, {@code ORACLE_VARIANT_NOT_MODELLED},
+     * before any provider call. ⚠ FAB-223 changed the order this test used to pin. The convert builder encodes
+     * only the signed oracle redeemer, so a Charli3 leg could never build; it used to fail late, at assembly,
+     * which is why the probe ran first. It is now a CHEAP named refusal, and by this class's FAB-135 rule
+     * ("the probe runs after every cheap refusal") a convert this builder cannot encode costs zero provider calls.
      */
     @Test
-    void convertWithAC3CollateralOracleProbesTheFeedAndTheProviderWithTheC3Nft() throws Exception {
+    void convertWithAC3CollateralOracleIsRefusedByNameBeforeAnyProviderCall() throws Exception {
         ConvertRig rig = new ConvertRig().prepare(true).allLive().wire(AppConfig.LiquidationConfiguration.Mode.SHADOW,
                 List.of(CV_WALLET_A));
 
         rig.cycles(CV_NOW, 1);
 
-        verify(rig.utxoService, times(1)).getUtxos(CV_ORACLE_ADDRESS, rig.collateralOracle.oracleToken().toUnit(),
-                100, 1);
-        verify(rig.utxoService, times(1)).getUtxos(CV_C3_ADDRESS, CV_C3_NFT.toUnit(), 100, 1);
-        verifyNoMoreInteractions(rig.utxoService);
         LiquidationDecision decision = rig.decisions().getFirst();
-        assertTrue(decision.detail().contains("PRICE_DATA_CHARLIE"), decision.detail());
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
+        assertVariantRefusal(decision.detail());
+        verifyNoInteractions(rig.utxoService);
         assertFalse(rig.droppedAWalletUtxo(), rig.events.toString());
     }
 
-    /** (3) and (5) convert: SHADOW probes too, and a spent c3 provider refuses — named with the c3 NFT. */
+    /**
+     * (3) and (5) convert in SHADOW with a Charli3 collateral oracle whose c3 provider is spent: the refusal is
+     * the builder's named variant refusal, NOT the spent-provider one — the provider is never asked. FAB-223:
+     * a cheap refusal runs ahead of the probe (FAB-135), and convert never encodes Charli3.
+     */
     @Test
-    void convertAShadowBuildIsProbedAndASpentC3ProviderRefuses() throws Exception {
+    void convertAShadowBuildWithAC3CollateralIsRefusedByNameAndNeverProbed() throws Exception {
         ConvertRig rig = new ConvertRig().prepare(true).allLive();
         rig.answers(CV_C3_ADDRESS, CV_C3_NFT, notFound());
         rig.wire(AppConfig.LiquidationConfiguration.Mode.SHADOW, List.of(CV_WALLET_A));
 
         rig.cycles(CV_NOW, 1);
 
-        assertRefusedAtErrorEveryCycle(rig, 1, CV_C3_REF, CV_C3_NFT);
-        verify(rig.utxoService).getUtxos(CV_C3_ADDRESS, CV_C3_NFT.toUnit(), 100, 1);
-        verify(rig.utxoService, never()).getUtxos(CV_C3_ADDRESS, rig.collateralOracle.oracleToken().toUnit(), 100, 1);
+        LiquidationDecision decision = rig.decisions().getFirst();
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
+        assertVariantRefusal(decision.detail());
+        assertFalse(decision.detail().contains(ref(CV_C3_REF)), "not the spent-provider refusal: " + decision.detail());
+        verify(rig.utxoService, never()).getUtxos(eq(CV_C3_ADDRESS), anyString(), anyInt(), anyInt());
+        verify(rig.utxoService, never()).getUtxos(eq(CV_ORACLE_ADDRESS), anyString(), anyInt(), anyInt());
+        verifyNoMoreInteractions(rig.utxoService);
+    }
+
+    /**
+     * The convert builder's variant refusal for the collateral leg's Charli3 feed. The executor records the
+     * exception's simple class name ahead of its message, so the refusal starts after that prefix.
+     */
+    private static void assertVariantRefusal(String detail) {
+        assertTrue(detail.replaceFirst("^RefusedException: ", "").startsWith("ORACLE_VARIANT_NOT_MODELLED:"),
+                "the builder's named variant refusal: " + detail);
+        assertTrue(detail.contains("PRICE_DATA_CHARLIE"), detail);
+        assertTrue(detail.contains("collateral"), detail);
     }
 
     /**

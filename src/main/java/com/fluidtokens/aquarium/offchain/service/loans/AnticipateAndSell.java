@@ -5,6 +5,8 @@ import java.util.List;
 
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.MinswapPoolDatum;
+import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
+import com.fluidtokens.aquarium.offchain.model.loans.Rational;
 
 /**
  * What an operator would net by <b>anticipating the principal and then selling the collateral
@@ -65,14 +67,38 @@ public record AnticipateAndSell(BigInteger netInPrincipal, String detail) {
     }
 
     /**
+     * The order's {@link ConvertEconomics#MINSWAP_ORDER_OVERHEAD} (4 ADA) in the units {@link #estimate}'s net
+     * is in: the principal's. For an ada principal that is the lovelace itself, and the feed is ignored. For a
+     * token principal it is converted through the principal's own feed, rounded UP — a cost that errs high
+     * never flatters the estimate.
+     *
+     * @param principalFeed the principal's oracle feed; ignored for an ada principal
+     * @throws IllegalArgumentException when the principal is a token and {@code principalFeed} is null
+     */
+    public static BigInteger orderCostInPrincipal(AssetType principal, OraclePriceFeed principalFeed) {
+        if (principal.isAda()) {
+            return ConvertEconomics.MINSWAP_ORDER_OVERHEAD;
+        }
+        if (principalFeed == null) {
+            throw new IllegalArgumentException("no oracle feed for the principal " + principal.toUnit()
+                    + ", so the order cost cannot be priced in it");
+        }
+        return LoanFinance.convertFromAToBWithOracles(OraclePriceFeed.unit(), principalFeed,
+                Rational.fromInt(ConvertEconomics.MINSWAP_ORDER_OVERHEAD));
+    }
+
+    /**
      * @param swappable      {@code collateral − equity − liquidationFee} — the slice the lender would
      *                       have received, and which the operator buys at the oracle's price
      * @param liquidationFee the operator's own slice, sold alongside it at no cost
      * @param advanceCost    {@code convertedLoanCollateralToPrincipalAmount} — what the lender is paid
-     * @param orderCost      the fixed outlay of the Minswap order the operator would place. Null
-     *                       falls back to {@link ConvertEconomics#MINSWAP_ORDER_OVERHEAD}, which the
-     *                       validator forces the order to carry — an operator may believe the cost
-     *                       is HIGHER, but never lower, because the chain spends it regardless
+     * @param orderCost      the fixed outlay of the Minswap order the operator would place, in the
+     *                       PRINCIPAL's units, the units the net is in. Null falls back to
+     *                       {@link ConvertEconomics#MINSWAP_ORDER_OVERHEAD}, which the validator forces
+     *                       the order to carry — an operator may believe the cost is HIGHER, but never
+     *                       lower, because the chain spends it regardless. That fallback is lovelace, so
+     *                       it is right only for an ada principal; a token principal's caller passes
+     *                       {@link #orderCostInPrincipal}
      */
     public static AnticipateAndSell estimate(AssetType collateral, AssetType principal,
                                              BigInteger swappable, BigInteger liquidationFee,

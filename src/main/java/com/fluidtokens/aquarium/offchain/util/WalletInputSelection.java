@@ -150,7 +150,8 @@ public final class WalletInputSelection {
      * {@link #TOKEN_PRINCIPAL_MIN_ADA_CEILING}. One formula for the selector ({@code nominate()}) and
      * for the balance the market gate is shown, so the two can never describe different wallets. An
      * unavailable fee ceiling contributes zero — the floor then understates, which
-     * {@link TokenHolding#adaFloorNote} says out loud.
+     * {@link TokenHolding#adaFloorNote} says out loud. It is the token-collateral shape's floor; an ada
+     * collateral's is {@code WalletRoles.adaCollateralTokenOutputRequiredAda}.
      */
     public static BigInteger tokenPrincipalRequiredAda(Optional<BigInteger> feeCeiling) {
         return feeCeiling.orElse(BigInteger.ZERO).add(TOKEN_PRINCIPAL_MIN_ADA_CEILING);
@@ -189,21 +190,23 @@ public final class WalletInputSelection {
             String adaFloorInAda = new BigDecimal(requiredAda).movePointLeft(6).stripTrailingZeros()
                     .toPlainString();
             String why = ("the wallet has %s in total, but %s of it sits in UTxOs carrying less than %s "
-                    + "lovelace (%s ADA) each — the ada a build needs beside the token, the fee ceiling plus "
-                    + "a 2 ADA min-ada rider%s — so the bot cannot spend it and does not count it.").formatted(
+                    + "lovelace (%s ADA) each — the ada a build needs beside the token: the fee ceiling plus "
+                    + "a 2 ADA min-ada rider when the loan's collateral is a token, or, when it is ada, whatever "
+                    + "of the fee ceiling and the outputs' min-ada the seized ada does not cover, and never less "
+                    + "than 2 ADA%s — so the bot cannot spend it and does not count it.").formatted(
                     amount.apply(total), amount.apply(belowAdaFloor), requiredAda, adaFloorInAda,
                     feeCeilingKnown ? "" : " (the fee ceiling was unavailable this cycle, so this floor "
-                            + "leaves it out and the real one is higher)");
+                            + "leaves it out and the real one may be higher)");
             BigInteger counted = spendable.add(belowAdaFloor);
             if (counted.compareTo(required) >= 0) {
                 return why + (" Consolidate the token into one UTxO carrying at least %s lovelace; the "
                         + "wallet rebalancer does this automatically when it is enabled and this market is "
-                        + "action: ANTICIPATE.").formatted(requiredAda);
+                        + "action: ANTICIPATE or CONVERT_BEFORE_ANTICIPATE.").formatted(requiredAda);
             }
             return why + (" Even counted, %s would be short of the %s required: consolidate the token "
                     + "into one UTxO carrying at least %s lovelace and add at least %s; the wallet "
-                    + "rebalancer consolidates automatically when it is enabled and this market is action: "
-                    + "ANTICIPATE, but it cannot add funds.").formatted(amount.apply(counted),
+                    + "rebalancer consolidates automatically when it is enabled and this market is action: ANTICIPATE "
+                    + "or CONVERT_BEFORE_ANTICIPATE, but it cannot add funds.").formatted(amount.apply(counted),
                     amount.apply(required), requiredAda, amount.apply(required.subtract(counted)));
         }
     }
