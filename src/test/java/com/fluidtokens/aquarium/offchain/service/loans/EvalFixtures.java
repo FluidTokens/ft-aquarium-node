@@ -134,9 +134,11 @@ final class EvalFixtures {
     /**
      * As above, plus scripts the registry cannot derive — today only the deployed FluidTokens
      * <b>oracle</b>, which is applied to eight parameter values (verification keys, threshold, the
-     * Charli3 and Orcfax token specs, …) that FluidTokens does not publish, so it cannot be built from
-     * the committed blueprint. {@link RealLoanDryEvalTest} supplies the real applied code instead,
-     * fetched from the reference-script UTxO the oracle registry publishes, and pins its hash.
+     * Charli3 and Orcfax token specs, …) that the registry does not derive. {@link RealLoanDryEvalTest}
+     * supplies the real applied code instead, fetched from the reference-script UTxO the oracle registry
+     * publishes, and pins its hash. {@code TestOracleRig.controlHashed} shows that code is a committed
+     * blueprint's {@code oracle.oracle.withdraw} re-applied to the parameters decoded from the applied
+     * script (FAB-222).
      * <p>
      * Extras are keyed the same way as the registry's own — by {@link PlutusScript#getScriptHash()} —
      * so an extra whose hash collides with a registry script would replace it rather than shadow it

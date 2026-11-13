@@ -69,8 +69,8 @@ import static org.mockito.Mockito.when;
  * loan refused {@code POOL_TOO_THIN} before anything is built. The fee {@code F} is read off the transaction the
  * real builder returned, never off an evaluation result or a constant (CCL traps 8 and 13).
  * <p>
- * ⚠ The executor's convert-route floor does not charge the Minswap order's 4 ADA, which {@link ConvertEconomics}
- * does. That is pre-existing and pinned here as it is; whoever adds the overhead to the floor updates (a)'s detail.
+ * Since FAB-224 the executor's convert floor charges the Minswap order's 4 ADA, as {@link ConvertEconomics} does:
+ * (a)'s min-ada is the order output's 4,000,000 plus the 2,000,000 equity output, less the loan's own 3,000,000.
  */
 class ConvertTokenToTokenExecutorTest {
 
@@ -87,8 +87,8 @@ class ConvertTokenToTokenExecutorTest {
 
     /**
      * (a) The executor's floor gate on the NIGHT→USDM convert: the fee slice is the 160 NIGHT fee priced through
-     * the COLLATERAL feed (20,000,000), the body funds no min-ada beyond the loan's own 3 ADA, and the margin is
-     * the shared 5,000,000.
+     * the COLLATERAL feed (20,000,000), the body funds 3,000,000 of min-ada (the order's 4 ADA and the 2 ADA equity
+     * output, less the loan's own 3 ADA), and the margin is the shared 5,000,000.
      */
     @Test
     void theTokenToTokenConvertClearsBothGatesWithTheFiguresPinned() throws Exception {

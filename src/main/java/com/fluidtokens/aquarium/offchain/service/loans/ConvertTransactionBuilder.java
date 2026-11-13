@@ -763,8 +763,9 @@ public class ConvertTransactionBuilder {
         }
 
         // 1. The Minswap order. Its value is the validator's, not a min-ada estimate: an ADA
-        //    collateral's order holds exactly the swappable amount, a token collateral's holds the
-        //    tokens plus exactly 2_800_000 lovelace.
+        //    collateral's order holds the swappable amount plus the 4_000_000 overhead, a token
+        //    collateral's holds the swappable tokens plus exactly that overhead
+        //    (ConvertOrderPlan.orderLovelace, ConvertEconomics.MINSWAP_ORDER_OVERHEAD).
         tx.payToContract(request.orderAddress(), orderValue(request), plan.orderDatum());
 
         // 2. The lender bond, restored byte-for-byte. equals_data compares the WHOLE output, so the

@@ -2221,8 +2221,9 @@ class LiquidationReadinessControllerTest {
      * cost through that one entry, so non-null figures mean the order cost has the same non-null entry.
      *
      * <p>Every k renders. k = 0 has no entry for the row's one lookup and shows the unknown estimate; from k = 1 the
-     * row's lookup, the first of the render, finds it and the whole row is priced from it, however many later
-     * lookups go empty. Controls: Y1 (the estimate looks the entry up again) throws at k = 1 and k = 2; Y2 (the
+     * row's lookup, the first of the render, finds it and the row's figures, anticipate estimate and funds floor are
+     * priced from it (the pool verdict comes from {@code usabilityFor}'s own lookup), however many later lookups go
+     * empty. Controls: Y1 (the estimate looks the entry up again) throws at k = 1 and k = 2; Y2 (the
      * figures look the principal up again instead of using the row's entry) leaves k = 1 unpriced.
      */
     @Test
@@ -2259,6 +2260,27 @@ class LiquidationReadinessControllerTest {
                 assertTrue(priced, "k = " + k + ": " + detail);
             }
         }
+    }
+
+    /**
+     * FAB-227: a null oracle client is reachable in production — {@code FluidOracleClient} is conditional on
+     * {@code loans.oracle.enabled}, while the controller is conditional only on {@code loans.ui.enabled} — so the
+     * token-principal row renders with no client at all. This pins {@code row()}'s {@code client == null} arm: the
+     * page renders, and the row's figures are shown as unpriced. Control: mutation P2 (the arm removed) throws a
+     * NullPointerException on the null client.
+     */
+    @Test
+    void aNullOracleClientLeavesATokenPrincipalRowUnpricedAndNeverFailsThePage() {
+        LiquidationReadinessController.Row row;
+        try {
+            row = renderAdaCollateralTokenPrincipalRow(liveConfiguration(),
+                    PoolIndex.of(adaPrincipalTokenPool("10000000000000")).resolver(), null);
+        } catch (RuntimeException e) {
+            throw new AssertionError("a null oracle client failed the page: " + e, e);
+        }
+
+        String detail = row.anticipateAndSell().detail();
+        assertTrue(detail.contains("this loan's figures could not be priced"), detail);
     }
 
     /**

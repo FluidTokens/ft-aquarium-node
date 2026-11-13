@@ -63,6 +63,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *       <td>−4,000,000 − F</td></tr>
  *   <tr><td>(f)</td><td>40‰, USDM at 13.27</td><td>324,000,000</td><td>none</td><td>4,000,000 + (E − e)</td>
  *       <td>320,000,000 − F − (E − e)</td></tr>
+ *   <tr><td>(g)</td><td>7‰ (synthetic)</td><td>56,700,000</td><td>U, 100,000,000</td><td>4,000,000</td>
+ *       <td>52,700,000 − F</td></tr>
  * </table>
  */
 class ConvertAdaCollateralExecutorTest {
@@ -231,6 +233,52 @@ class ConvertAdaCollateralExecutorTest {
                 "a positive equity " + equity + " below the output's " + equityOutput + ": topped up");
         assertRow(rig, decision, body, 324_000_000L, BigInteger.ZERO,
                 ORDER_OVERHEAD.add(equityOutput.subtract(equity)));
+    }
+
+    /**
+     * (g) A SYNTHETIC 7‰ bond on a LIVE node: the fee slice of 56,700,000 covers the order overhead and the
+     * bot's own outputs but leaves a slack below the fee ceiling, so the router asks the selector for exactly 0.
+     * 0 is still asked: the selector sizes U at 0 plus the fee ceiling, and the body spends U for the fee headroom,
+     * so the row must name U and carry the "U stays in this check" note.
+     * <p>
+     * This pins the row against a selector call recorded by its argument: a flag set only for a positive amount
+     * records this convert as funded from no output while U is spent. (b) defends the other side of the same flag:
+     * a convert the router never asked names no output.
+     */
+    @Test
+    void aSevenPerMilleBondAskedForZeroIsFundedFromUAndItsRowSaysUStays() throws Exception {
+        Shape s = shape(ConvertAdaCollateralFixture.spec().bondFeePerMille(7));
+        ConvertExecutorRig rig = ConvertExecutorRig.live(MARGIN, BigInteger.ZERO, ACCEPTED, s.candidate()).cycle(NOW);
+
+        LiquidationDecision decision = rig.onlyDecision();
+        assertEquals(LiquidationDecision.Outcome.SUBMITTED, decision.outcome(), decision.detail());
+        assertEquals(1, rig.submitted.size(), "one submission");
+        Transaction body = rig.builtOnce();
+        BigInteger fee = body.getBody().getFee();
+        assertEquals("fee slice 56700000 lovelace - tx fee " + fee + " - min-ada 4000000 = floor "
+                        + BigInteger.valueOf(52_700_000L).subtract(fee) + "; - margin 5000000 = "
+                        + BigInteger.valueOf(47_700_000L).subtract(fee) + "; submitted as " + ACCEPTED
+                        + LiquidationExecutor.U_STAYS_NOTE,
+                decision.detail());
+        assertTrue(decision.detail().endsWith(LiquidationExecutor.U_STAYS_NOTE), decision.detail());
+
+        Utxo u = s.u();
+        String uRef = u.getTxHash() + "#" + u.getOutputIndex();
+        assertEquals(Set.of(uRef), rig.walletInputs(body), "the body spends U");
+        assertEquals(Set.of(uRef), rig.walletInputs(Transaction.deserialize(rig.submitted.getFirst())),
+                "and so do the submitted bytes");
+        assertEquals(Set.of(new TransactionInput(LOAN_TX, LOAN_IX), new TransactionInput(LOAN_TX, BOND_IX),
+                        new TransactionInput(u.getTxHash(), u.getOutputIndex())),
+                Set.copyOf(body.getBody().getInputs()), "the loan, the bond and U, nothing else");
+        assertEquals(3, body.getBody().getInputs().size(), "three inputs");
+
+        BigInteger requirement = LedgerCeilings.maxPossibleFee(EvalFixtures.protocolParams().getProtocolParams());
+        String funded = LOAN_TX + "#" + LOAN_IX + " is funded from wallet output " + uRef
+                + " (role U, 100000000 lovelace) for a requirement of " + requirement + " lovelace";
+        assertTrue(rig.info.contains(funded), "expected the funding line [" + funded + "] (asked for 0) in: "
+                + rig.info);
+        assertEquals(TransactionUtil.getTxHash(body), decision.txHash(), "the row is the built body's");
+        assertRow(rig, decision, body, 56_700_000L, U_LOVELACE, ORDER_OVERHEAD);
     }
 
     // ======================================================================================

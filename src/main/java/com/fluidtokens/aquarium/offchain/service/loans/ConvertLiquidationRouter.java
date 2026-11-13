@@ -560,10 +560,10 @@ public class ConvertLiquidationRouter {
         // (`WalletInputSelection.smallestSufficient`), so the reference-script hazard is closed
         // structurally rather than by this call site remembering to filter.
         //
-        // ⚠ `plan.orderLovelace()` and not a re-derivation: the plan already computed it from the
-        // validator's own rule, and a second derivation here could disagree with the one the order is
-        // actually built from — the figures on this path are taken at the BODY's validFrom, not the
-        // assessment's, which is precisely how such a pair drifts apart.
+        // ⚠ For a token collateral, `plan.orderLovelace()` and not a re-derivation: the plan already
+        // computed it from the validator's own rule, and a second derivation here could disagree with
+        // the one the order is actually built from — the figures on this path are taken at the BODY's
+        // validFrom, not the assessment's, which is precisely how such a pair drifts apart.
         //
         // FAB-224 — an ADA collateral is paid from the collateral: its liquidation fee is lovelace and leaves the
         // loan input with the swap, so the wallet is asked only for what that fee leaves short, and not at all
@@ -588,9 +588,7 @@ public class ConvertLiquidationRouter {
                                     + "reference script covers that plus the fee ceiling. Fund the wallet "
                                     + "with one such utxo of at least that amount plus fee headroom.")
                                     .formatted(plan.orderLovelace(),
-                                            collateral.isAda()
-                                                    ? "the swappable ada plus the order overhead"
-                                                    : "the order overhead; the collateral is a token")));
+                                            "the order overhead; the collateral is a token")));
         }
 
         ClaimData claim = new ClaimData((LiquidationMode.Liquidation) loan.liquidationMode(),

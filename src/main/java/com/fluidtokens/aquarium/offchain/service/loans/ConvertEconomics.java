@@ -32,6 +32,7 @@ import java.math.BigInteger;
  * {@code equityTopUp} (FAB-224) is the lovelace an ADA equity output smaller than the ledger minimum is raised by.
  * Balancing fronts it out of the collateral's fee, which is the bot's, so it is the bot's spend. The router measures
  * it off the built body for an ada collateral and passes 0 for a token one, whose equity output it never applies to.
+ * <p>
  * ⚑ <b>The order ada is an explicit, configurable FIXED EXPENSE since 2026-09-09</b>, and that is
  * what makes a stated margin of {@code 0} mean something on this path: <b>a convert must cover the
  * order cost before it counts as break-even.</b> The configured figure is what the bot <em>spends</em>;

@@ -111,13 +111,14 @@ import java.util.stream.Stream;
  *       {@code lib/fluidtokens/types/lender_manager.ak} at {@code ff005fb}), not {@code Liquidate};</li>
  *   <li>the action withdraw is {@code lm_liquidate_and_pay_in_advance_action}, whose redeemer adds a
  *       {@code principalAndCollateralOracleRefInputIndexes} list to the four fields the plain one has;
- *       its script is <b>witness-attached</b> because {@code EvalFixtures#scriptSupplier} does not
- *       carry it;</li>
- *   <li>the lender is paid in ADA — {@code convertedLoanCollateralToPrincipalAmount}, an
- *       ADA-only output ({@code dosProtection} demands {@code flatten == 1}) carrying the
- *       {@code converted_to_liquidity} action — instead of the collateral itself.</li>
+ *       its script travels by reference when {@code ReferenceScripts#lmLiquidateAndPayInAdvanceAction()}
+ *       names a published one, and is attached to the witness set otherwise ({@link #attachValidators});</li>
+ *   <li>the lender is paid {@code convertedLoanCollateralToPrincipalAmount} in the principal, in an
+ *       output carrying the {@code converted_to_liquidity} action: ada-only for an ADA principal
+ *       ({@code flatten == 1}), the principal token plus its min-ada for a token principal
+ *       ({@code flatten == 2}) — instead of the collateral itself.</li>
  * </ul>
- * The borrower's equity compensation (in the collateral currency, tFLDT) and the loan-NFT burn are
+ * The borrower's equity compensation (in the collateral currency) and the loan-NFT burn are
  * unchanged: {@code loan_claim_action} governs them exactly as in a plain liquidation, so on a
  * positive-equity loan the compensation output sits at the bare loan index in the asset-manager
  * filtered output list and the lender's converted output is reached through
@@ -1649,8 +1650,10 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
     // Package-private (not private) for the same reason LiquidateTransactionBuilder's
     // assetOutputIndexesForEquities is: M19 (F4, slice-3 round-2 audit) needs to prove the
     // flatten == 2 boundary is actually ENFORCED, not merely coincidentally true of every fixture's
-    // OUTPUT — see LiquidatePayInAdvanceTransactionBuilderTest, which hand-mutates a real built body
-    // and re-invokes this method directly rather than going through reflection.
+    // OUTPUT — see PayInAdvanceLiquidationRouterTest#assertStructureRequiresFlattenExactlyTwoForATokenPrincipalLenderOutput,
+    // which hand-mutates a real built body and re-invokes this method directly rather than going
+    // through reflection. PayInAdvanceAdaCollateralDryEvalTest calls it the same way for the
+    // ada-collateral change-shape check.
     void assertStructure(Transaction transaction, Request request, Numbers numbers,
                                  long lenderBondOutputIndex, long assetOutputIndex) {
         // The bond echo is where the claim redeemer says, and it is byte-identical to the input.

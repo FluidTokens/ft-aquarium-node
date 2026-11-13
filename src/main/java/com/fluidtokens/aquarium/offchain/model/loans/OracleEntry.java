@@ -29,9 +29,10 @@ import java.util.List;
  *                        for a given loan.
  * @param referenceInput  the UTxO holding {@link #oracleToken}, included as a reference input
  * @param referenceScript the UTxO the oracle script is published at
- * @param verificationKeys the keys {@link OracleSignature#keyPosition()} indexes into. Believed to
- *                        match the validator's {@code verification_keys} parameter in order; see
- *                        docs/auto-liquidation-design.md §6.3 for why that is not yet proven.
+ * @param verificationKeys the keys {@link OracleSignature#keyPosition()} indexes into. For each
+ *                        deployed mainnet oracle in the recorded registry payload, the published
+ *                        list equals the validator's applied {@code verification_keys} parameter,
+ *                        in order ({@code TestOracleRigTest} (a), FAB-222).
  * @param threshold       how many valid signatures the validator requires. Taken from the entry
  *                        level; the registry sometimes reports a different number alongside the
  *                        feed, which is why {@link #signatures()} carries every published

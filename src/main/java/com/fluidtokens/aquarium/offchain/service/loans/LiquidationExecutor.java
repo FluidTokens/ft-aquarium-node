@@ -2011,18 +2011,20 @@ public class LiquidationExecutor {
             return null;
         } catch (PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException e) {
             // All seven construction sites describe a candidate or oracle state this route cannot
-            // build this cycle: PayInAdvanceLiquidationRouter:164 is negative equity (unreachable
-            // through a real assessment because LoanFinance.redeemerEquity floors at zero);
-            // LiquidatePayInAdvanceTransactionBuilder:522 and :528 are the collateral feed window
-            // and margin; :539 and :545 are the principal feed window and margin; :1243-1244 is a
-            // POOLED or PRICE_DATA_ORCFAX variant; and :1264 is an entry not usable this cycle.
+            // build this cycle: PayInAdvanceLiquidationRouter.buildConvertLiquidation's guard is
+            // negative equity (unreachable through a real assessment because
+            // LoanFinance.redeemerEquity floors at zero); LiquidatePayInAdvanceTransactionBuilder's
+            // collateral feed window and margin checks (skipped for an ada collateral, which has no
+            // feed) and principal feed window and margin checks (skipped for an ada principal) are
+            // the next four; refuseUnmodelledVariant's POOLED or PRICE_DATA_ORCFAX arm is a variant
+            // it cannot encode; and its usableForLiquidation() check is an entry not usable this cycle.
             //
             // Setting a market to CONVERT cures none of them. Window and margin are per-cycle feed
             // timing and clear by themselves unless the configured oracle margin exceeds what any
             // feed can leave after validTo. Variant and usability are oracle-entry properties:
-            // OracleEntry.usableForLiquidation() is false for POOLED/ORCFAX (OracleEntry.java:124),
-            // and ConvertTransactionBuilder.build refuses a collateral oracle that is not usable
-            // for liquidation (ConvertTransactionBuilder.java:237). Negative equity says nothing
+            // OracleEntry.usableForLiquidation() is false for POOLED/ORCFAX, and
+            // ConvertTransactionBuilder.build refuses a collateral oracle that is not usable for
+            // liquidation (Refusal.COLLATERAL_ORACLE_MISSING). Negative equity says nothing
             // about the mechanism. Since `action` is market-wide, that advice would re-route every
             // loan in the market on the strength of a refusal conversion cannot repair.
             //
@@ -2240,13 +2242,13 @@ public class LiquidationExecutor {
      * feed the scanner and the builder used, not a special case invented here.
      *
      * <h3>The min-ada the bot funds is counted (E5-A / F4)</h3>
-     * {@link #minAdaFunded} is the lovelace the builder puts into the emitted asset-manager outputs
-     * (compensation + claim) <em>beyond</em> what the loan UTxO's own collateral already carried — the
-     * per-loan {@code Σ(assetManagerOutput.ada) − adaFromTheCollateralInput} that
-     * cardano-client-lib tops to the min-ada floor out of the bot's own inputs. It is real lovelace
-     * leaving the wallet that {@code txFee} does not include, and it is per-loan rather than a
-     * constant: on token collateral the outputs carry no ada of their own, so the whole rider is
-     * funded; on ada collateral only the shortfall between a sub-floor payout and the floor is.
+     * {@link #minAdaFunded} is the lovelace the bot puts into outputs it does not get back,
+     * <em>beyond</em> what the loan input's own ada pays into them. That covers the asset-manager
+     * outputs (compensation and claim) on every route, the Minswap order output on the convert route,
+     * and the collateral rider on the pay-in-advance route. It is real lovelace leaving the wallet that
+     * {@code txFee} does not include, and it is per loan, not a constant: {@code minAdaFunded}'s
+     * javadoc table gives what is counted and what offsets it, per route and collateral kind, with the
+     * result on the pinned fixtures.
      *
      * <h3>Two numbers, deliberately kept apart (E5-B Finding 1 / F1.i)</h3>
      * <ul>
@@ -2882,7 +2884,10 @@ public class LiquidationExecutor {
      *       beyond that is funded. On the pay-in-advance route the offset is {@code equity} instead (FAB-226):
      *       the bot acquires {@code collateralAmount − equity}, fee slice included, which {@code record()}'s
      *       REPLACED bracket prices, so only the equity flows from the collateral into the outputs; the plain
-     *       offset would clamp this shape to 0.</li>
+     *       offset would clamp this shape to 0. That arm assumes a token principal, and it is reached only
+     *       because {@link PayInAdvanceLiquidationRouter} refuses an ADA collateral against an ADA principal by
+     *       name. Were that refusal lifted, the lender's ADA payout would be counted as min-ADA here: the safe
+     *       direction, since the candidate would read UNPROFITABLE.</li>
      *   <li><b>token collateral</b> — the outputs carry tokens and no ada of their own, so the whole of
      *       the loan UTxO's ada {@code L} is available to cover their min-ada floor; the offset is that
      *       ada ({@code loan().lovelace()}), and only the min-ada beyond it is funded.</li>

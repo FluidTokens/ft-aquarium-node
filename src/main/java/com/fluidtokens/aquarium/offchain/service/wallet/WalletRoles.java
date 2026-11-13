@@ -181,10 +181,11 @@ public final class WalletRoles {
      * transaction before any wallet ADA, so the token output tops up only the shortfall of the ceilings
      * {@link #tokenOutputRequiredAda} sums.
      * <p>
-     * The result is floored at the 2 ADA min-ADA ceiling
-     * ({@link WalletInputSelection#TOKEN_PRINCIPAL_MIN_ADA_CEILING}) because the token output's leftover tokens come
-     * back in their own min-ADA output: a thinner token output would pass this check and then be refused by the
-     * builder's change-shape check as a machinery error, instead of here by name.
+     * The result is floored at 2 ADA: the existing per-output min-ADA ceiling
+     * ({@link WalletInputSelection#TOKEN_PRINCIPAL_MIN_ADA_CEILING}), applied as a conservative floor because the
+     * token output's leftover tokens come back in their own min-ADA output, so a thin wallet is refused here by name
+     * before any build. The builder's change-shape check fires only below that leftover output's own min-ADA, which a
+     * ledger-valid wallet output cannot be.
      * <p>
      * A pre-build ceiling, like the others here: the build is the judge.
      */

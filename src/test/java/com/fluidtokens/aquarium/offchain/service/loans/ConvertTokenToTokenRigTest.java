@@ -150,7 +150,8 @@ class ConvertTokenToTokenRigTest {
         // H1, per leg, independently of the builder.
         String collateralCredential = assertLegBoundAtItsCredential(f, reread, NIGHT_V2_NFT, f.collateralRig);
         String principalCredential = assertLegBoundAtItsCredential(f, reread, USDM_V2_NFT, f.principalRig);
-        assertNotEquals(collateralCredential, principalCredential, "the two legs share one credential");
+        assertNotEquals(collateralCredential, principalCredential,
+                "the fixture's two legs must not share one credential");
 
         // The order, the equity and the fee, exactly.
         List<TransactionOutput> outs = reread.getBody().getOutputs();

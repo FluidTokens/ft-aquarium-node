@@ -484,7 +484,7 @@ class PayInAdvanceStrikeUsdmDryEvalTest {
      * {@code RedeemerError { tag: "Withdraw", index: 0, …} (the pay-in-advance action) in its cause chain.
      */
     @Test
-    void twoLegsSharingOneWithdrawalCredentialAreRefusedByNameBeforeAnythingIsPriced() throws Exception {
+    void twoLegsPricingDifferentTokensOnOneWithdrawalCredentialAreRefusedByNameBeforeAnythingIsPriced() throws Exception {
         StrikeUsdmFixture.Legs legs = StrikeUsdmFixture.sharedLegs(StrikeUsdmFixture.collateralFeed(),
                 StrikeUsdmFixture.principalFeed());
         assertEquals(legs.collateral().entry().withdrawCredentialHash(), legs.principal().entry().withdrawCredentialHash(),
