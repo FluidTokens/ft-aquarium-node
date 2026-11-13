@@ -67,6 +67,7 @@ import static com.fluidtokens.aquarium.offchain.service.loans.TestOracleRig.Blue
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -87,9 +88,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * through BOTH feeds — {@code convertFromAToBWithOracles(collateralFeed, principalFeed, …)} — and
  * {@code lib/fluidtokens/oracle.ak}'s {@code retrieve_oracle_data} finds each feed by
  * {@code Withdraw(<the reference input's payment credential>)}, requiring {@code valid_from <= txValidFrom},
- * {@code valid_to >= txValidTo} and the feed token equal to the leg's. So each leg needs its own
- * withdraw-0, at the credential its NFT holder sits at — and one credential cannot carry two legs' feeds,
- * which the builder now refuses by name ({@code ORACLE_LEGS_SHARE_ONE_CREDENTIAL}).
+ * {@code valid_to >= txValidTo} and the feed token equal to the leg's. So each leg needs a withdraw-0 at
+ * the credential its NFT holder sits at — and one credential cannot carry feeds for two DIFFERENT tokens,
+ * which the builder now refuses by name ({@code ORACLE_LEGS_SHARE_ONE_CREDENTIAL}). Two legs pricing the
+ * SAME token through one entry are served by one withdrawal (k).
  *
  * <h2>Reading a failure</h2>
  * The evaluator reports only the first failing redeemer ({@link EvalFixtures}, harness limitation 1), so
@@ -498,6 +500,171 @@ class PayInAdvanceStrikeUsdmDryEvalTest {
                 "refused by name: " + LiquidationExecutor.causeChain(refused));
         assertTrue(refused.getMessage().contains(legs.collateralRig().scriptHash()),
                 "the refusal names the shared credential: " + refused.getMessage());
+        assertEquals(0, evaluator.calls.get(), "refused before anything is priced or evaluated");
+    }
+
+    // ======================================================================================
+    // (k), (l) one credential: a same-token pair is served by one withdrawal, a different-token pair refused
+    // ======================================================================================
+
+    /** The same-token loan's payout: collateral − its 40‰ fee slice, at equity 0 and a 1:1 conversion. */
+    private static final BigInteger SAME_TOKEN_PAYOUT = BigInteger.valueOf(2_359_820_932L);
+
+    /**
+     * ⛔ A SAME-token pair on one credential is served by ONE withdraw-0 and evaluates. The loan is synthetic
+     * ({@link StrikeUsdmFixture#sameTokenLoan}): recorded loan #0 with a STRIKE principal priced by the
+     * collateral's own oracle NFT, and one STRIKE rig entry as both legs. {@code retrieve_oracle_data} finds
+     * the one redeemer at that credential for each leg, and its feed's token is STRIKE, which both legs need.
+     * Nothing in {@code validators/} forbids principal == collateral.
+     * <p>
+     * <b>Measured:</b> the builder before FAB-225 built and evaluated this shape (5 withdrawals, 8 redeemers);
+     * FAB-225's first round refused it as {@code ORACLE_LEGS_SHARE_ONE_CREDENTIAL}, a refusal broader than the
+     * validator's reason for it.
+     */
+    @Test
+    void aSameTokenLoanIsServedByOneOracleWithdrawalAndEvaluates() throws Exception {
+        // The synthetic datums are the recorded ones with only the replaced fields changed.
+        LoanDatum recorded = StrikeUsdmFixture.loanDatum(0);
+        assertEquals(new LoanDatum(recorded.doneRecasts(), StrikeUsdmFixture.SAME_TOKEN_PRINCIPAL, recorded.lendDate(),
+                        recorded.repaidInstallments(), recorded.interestRate(), recorded.totalInstallments(), STRIKE,
+                        STRIKE_ORACLE_NFT, recorded.installmentPeriod(), recorded.initialGracePeriod(),
+                        recorded.liquidationMode(), recorded.repaymentMode(), recorded.repaymentTimeWindow(),
+                        recorded.penaltyFeeForLateRepayment(), recorded.repaymentReceipts(), recorded.originId(),
+                        recorded.collateral()),
+                StrikeUsdmFixture.sameTokenLoan().datum(), "loan #0 with a 2,300,000,000 STRIKE principal");
+        LenderManagerDatum recordedBond = StrikeUsdmFixture.bondDatum(0);
+        LenderManagerDatum sameTokenBond = StrikeUsdmFixture.sameTokenBond().datum();
+        assertEquals(STRIKE, sameTokenBond.principalAsset(), "bond #9 with a STRIKE principal");
+        assertEquals(recordedBond.lenderAuth(), sameTokenBond.lenderAuth());
+        assertEquals(recordedBond.lenderStakeCredential().serializeToHex(),
+                sameTokenBond.lenderStakeCredential().serializeToHex());
+        assertEquals(recordedBond.shouldLiquidationConvertToPrincipal(), sameTokenBond.shouldLiquidationConvertToPrincipal());
+        assertEquals(recordedBond.liquidationFeePerMille(), sameTokenBond.liquidationFeePerMille());
+        assertEquals(recordedBond.poolId(), sameTokenBond.poolId());
+
+        StrikeUsdmFixture.Legs legs = StrikeUsdmFixture.sameTokenLegs(StrikeUsdmFixture.collateralFeed());
+        OracleEntry entry = legs.collateral().entry();
+        assertSame(entry, legs.principal().entry(), "fixture: one entry is both legs");
+        assertEquals(STRIKE, entry.token());
+        String rigHash = legs.collateralRig().scriptHash();
+        assertEquals(rigHash, entry.withdrawCredentialHash(), "fixture: the entry withdraws from the rig");
+
+        Utxo c = StrikeUsdmFixture.collateral(BOT_ADDRESS);
+        Utxo u = StrikeUsdmFixture.u(BOT_ADDRESS);
+        Utxo token = StrikeUsdmFixture.tokenOutput(BOT_ADDRESS, TOKEN_OUTPUT_LOVELACE, STRIKE, SAME_TOKEN_PAYOUT);
+        List<Utxo> universe = StrikeUsdmFixture.sameTokenUniverse(legs, List.of(c, u, token));
+        Recording evaluator = new Recording(StrikeUsdmFixture.aiken(universe, legs));
+        LiquidatePayInAdvanceTransactionBuilder builder = StrikeUsdmFixture.production(universe,
+                new HashCheckedScriptSupplier(StrikeUsdmFixture.rawScripts(legs)), evaluator);
+        var request = StrikeUsdmFixture.sameTokenRequest(legs, token, c, BOT_ADDRESS, T0, TX_VALID_TO);
+
+        LiquidatePayInAdvanceTransactionBuilder.Numbers numbers = builder.numbers(request);
+        assertEquals(BigInteger.ZERO, numbers.equity(), "underwater at a 1:1 conversion: equity 0");
+        assertEquals(SAME_TOKEN_PAYOUT, numbers.convertedLoanCollateralToPrincipalAmount(),
+                "2,458,146,804 − 98,325,872 STRIKE, converted 1:1");
+
+        Transaction body = Transaction.deserialize(builder.build(request).serialize());
+        log.info("FAB-225 same-token pay-in-advance: fee {}, withdrawals {}", body.getBody().getFee(),
+                rewardAddresses(body));
+
+        // Evaluated, with real ex-units on the BUILT body.
+        assertEquals(1, evaluator.calls.get(), "exactly one evaluation per build");
+        List<Redeemer> redeemers = body.getWitnessSet().getRedeemers();
+        assertEquals(8, redeemers.size(), "two spends, one burn, five withdrawals: " + redeemers);
+        assertEquals(5, redeemers.stream().filter(r -> r.getTag() == RedeemerTag.Reward).count(),
+                "loan, loan_claim_action, lenderManager, the pay-in-advance action, ONE oracle withdrawal");
+        for (Redeemer redeemer : redeemers) {
+            String key = redeemer.getTag() + "#" + redeemer.getIndex();
+            EvaluationResult costing = costingFor(evaluator.last.get(), redeemer);
+            assertEquals(costing.getExUnits().getMem(), redeemer.getExUnits().getMem(), key + " mem");
+            assertEquals(costing.getExUnits().getSteps(), redeemer.getExUnits().getSteps(), key + " steps");
+            assertTrue(redeemer.getExUnits().getMem().compareTo(PLACEHOLDER) > 0, key + " carries a placeholder mem");
+            assertTrue(redeemer.getExUnits().getSteps().compareTo(PLACEHOLDER) > 0, key + " carries placeholder steps");
+        }
+
+        // ONE withdrawal at the rig's credential, serving both legs.
+        String rigReward = StrikeUsdmFixture.rewardAddress(rigHash);
+        assertEquals(1, rewardAddresses(body).stream().filter(rigReward::equals).count(),
+                "exactly one withdrawal at the shared oracle credential: " + rewardAddresses(body));
+        assertEquals(Set.of(
+                        StrikeUsdmFixture.rewardAddress(REGISTRY.getLoanPolicyId()),
+                        StrikeUsdmFixture.rewardAddress(REGISTRY.getLoanClaimActionScriptHash()),
+                        StrikeUsdmFixture.rewardAddress(REGISTRY.getLenderManagerWithdrawScriptHash()),
+                        StrikeUsdmFixture.rewardAddress(REGISTRY.getLmLiquidateAndPayInAdvanceActionScriptHash()),
+                        rigReward),
+                new HashSet<>(rewardAddresses(body)), "the five withdrawals");
+        assertEquals(5, rewardAddresses(body).size());
+
+        // Both legs read the one rig reference input.
+        List<TransactionInput> refInputs = body.getBody().getReferenceInputs();
+        ConstrPlutusData claimRedeemer = (ConstrPlutusData) rewardRedeemer(body,
+                REGISTRY.getLoanClaimActionScriptHash()).getData();
+        ListPlutusData claims = (ListPlutusData) claimRedeemer.getData().getPlutusDataList().get(1);
+        assertEquals(1, claims.getPlutusDataList().size(), "one loan input, one claim");
+        List<PlutusData> claim = ((ConstrPlutusData) claims.getPlutusDataList().get(0)).getData().getPlutusDataList();
+        int collateralIndex = ((BigIntPlutusData) claim.get(2)).getValue().intValueExact();
+        int principalIndex = ((BigIntPlutusData) claim.get(3)).getValue().intValueExact();
+        for (int index : List.of(collateralIndex, principalIndex)) {
+            assertEquals(entry.referenceInput(), refInputs.get(index), "a leg's index points at the rig leg's input");
+            assertEquals(rigHash, paymentCredentialOf(resolve(refInputs.get(index), universe).getAddress()),
+                    "the rig leg's reference input sits at the rig's credential");
+        }
+        ConstrPlutusData action = (ConstrPlutusData) rewardRedeemer(body,
+                REGISTRY.getLmLiquidateAndPayInAdvanceActionScriptHash()).getData();
+        List<PlutusData> pair = ((ListPlutusData) ((ListPlutusData) action.getData().getPlutusDataList().get(3))
+                .getPlutusDataList().get(0)).getPlutusDataList();
+        assertEquals(List.of(BigInteger.valueOf(principalIndex), BigInteger.valueOf(collateralIndex)),
+                pair.stream().map(p -> ((BigIntPlutusData) p).getValue()).toList(),
+                "the pay-in-advance action's [principal, collateral] pair is the claim's");
+
+        // The outputs: no compensation at equity 0; the lender paid in STRIKE; the bot keeps the collateral.
+        List<TransactionOutput> assetOutputs = assetManagerOutputs(body);
+        assertEquals(1, assetOutputs.size(), "the lender's payout alone: " + assetOutputs);
+        TransactionOutput lender = assetOutputs.get(payInAdvanceAssetOutputIndexes(body).get(0).intValueExact());
+        assertTrue(quantityOf(lender, STRIKE).compareTo(SAME_TOKEN_PAYOUT) >= 0,
+                "the lender's STRIKE: " + quantityOf(lender, STRIKE));
+        assertEquals(2, flattenedCount(lender), "STRIKE plus its min-ada rider (dosProtection flatten == 2)");
+        assertEquals(1, body.getBody().getOutputs().stream()
+                        .filter(o -> BOT_ADDRESS.equals(o.getAddress()))
+                        .filter(o -> quantityOf(o, STRIKE).equals(BigInteger.valueOf(COLLATERAL_AMOUNTS.get(0))))
+                        .count(),
+                "exactly one bot output carries the whole 2,458,146,804 STRIKE collateral");
+
+        // The wallet: the token output is the only wallet input, C the only collateral.
+        assertEquals(List.of(ref(token)), walletInputs(body, universe), "the wallet spends its token output alone");
+        assertEquals(List.of(ref(c)), collateralRefs(body), "the collateral is exactly C");
+        assertFalse(inputRefs(body).contains(ref(c)), "C is never spent");
+        assertFalse(inputRefs(body).contains(ref(u)), "U is never spent");
+
+        assertConserved(body, universe);
+    }
+
+    /**
+     * ⛔ A DIFFERENT-token pair on one credential is still refused by name: (i)'s setup, one rig making a
+     * STRIKE leg and a USDM leg. One withdraw-0 redeemer carries one feed, and these two legs need feeds
+     * for two different tokens; the refusal names both, and nothing is evaluated.
+     */
+    @Test
+    void aDifferentTokenPairOnOneCredentialIsStillRefusedAndTheMessageNamesBothTokens() throws Exception {
+        StrikeUsdmFixture.Legs legs = StrikeUsdmFixture.sharedLegs(StrikeUsdmFixture.collateralFeed(),
+                StrikeUsdmFixture.principalFeed());
+        assertEquals(legs.collateral().entry().withdrawCredentialHash(), legs.principal().entry().withdrawCredentialHash(),
+                "fixture: both legs withdraw from one credential");
+        assertEquals(STRIKE, legs.collateral().entry().token(), "fixture: the collateral leg prices STRIKE");
+        assertEquals(USDM, legs.principal().entry().token(), "fixture: the principal leg prices USDM");
+        Wallet w = wallet();
+        List<Utxo> universe = StrikeUsdmFixture.universe(0, legs, w.all());
+        Recording evaluator = new Recording(StrikeUsdmFixture.aiken(universe, legs));
+
+        IllegalStateException refused = assertThrows(IllegalStateException.class,
+                () -> StrikeUsdmFixture.production(universe,
+                                new HashCheckedScriptSupplier(StrikeUsdmFixture.rawScripts(legs)), evaluator)
+                        .build(StrikeUsdmFixture.request(0, legs, w.token(), w.c(), BOT_ADDRESS, T0, TX_VALID_TO)));
+
+        assertTrue(refused.getMessage().startsWith("ORACLE_LEGS_SHARE_ONE_CREDENTIAL:"),
+                "refused by name: " + LiquidationExecutor.causeChain(refused));
+        assertTrue(refused.getMessage().contains(STRIKE.toUnit()), "names the STRIKE leg's token: " + refused.getMessage());
+        assertTrue(refused.getMessage().contains(USDM.toUnit()), "names the USDM leg's token: " + refused.getMessage());
         assertEquals(0, evaluator.calls.get(), "refused before anything is priced or evaluated");
     }
 

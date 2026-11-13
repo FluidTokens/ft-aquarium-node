@@ -9,7 +9,13 @@ import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.common.model.Network;
 import com.bloxbean.cardano.client.common.model.Networks;
+import com.bloxbean.cardano.client.common.cbor.CborSerializationUtil;
 import com.bloxbean.cardano.client.common.model.SlotConfigs;
+import com.bloxbean.cardano.client.plutus.spec.BigIntPlutusData;
+import com.bloxbean.cardano.client.plutus.spec.BytesPlutusData;
+import com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData;
+import com.bloxbean.cardano.client.plutus.spec.ListPlutusData;
+import com.bloxbean.cardano.client.plutus.spec.PlutusData;
 import com.bloxbean.cardano.client.plutus.spec.PlutusScript;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.client.util.HexUtil;
@@ -44,7 +50,8 @@ import static com.fluidtokens.aquarium.offchain.service.loans.TestOracleRig.Blue
  * config UTxOs' coordinates, addresses and values ({@code mainnet-strike-usdm-pay-in-advance.PROVENANCE.md}).
  * The registry is the shipped mainnet deployment ({@code ConvertProductionWiringTest}'s seven coordinates).
  * Synthetic: the bot's wallet, the six registry reference-script UTxOs (synthetic coordinates carrying the
- * derived hashes), and both oracle legs, which come from the rig.
+ * derived hashes), and both oracle legs, which come from the rig. Also synthetic: the same-token loan and
+ * bond ({@link #sameTokenLoan()}), derived in code from loan #0's recorded datums.
  *
  * <h2>Why the prices come from the rig</h2>
  * No recorded signed feed makes these loans liquidatable: at the 2026-10-01 STRIKE price
@@ -164,7 +171,10 @@ final class StrikeUsdmFixture {
         return new TestOracleRig.Feed(PRINCIPAL_PRICE, PRICE_DENOMINATOR, T0 - 200_000L, T0 + 600_000L);
     }
 
-    /** The two oracle legs and the rig that made each; the two rigs are one object in {@link #sharedLegs}. */
+    /**
+     * The two oracle legs and the rig that made each; the two rigs are one object in {@link #sharedLegs}, and
+     * the two legs too in {@link #sameTokenLegs}.
+     */
     record Legs(TestOracleRig collateralRig, TestOracleRig principalRig, TestOracleRig.Leg collateral,
                 TestOracleRig.Leg principal) {
     }
@@ -185,8 +195,9 @@ final class StrikeUsdmFixture {
     }
 
     /**
-     * ONE rig — the STRIKE base — making both legs, so both entries withdraw from one credential. The shape
-     * the builder must refuse by name: one withdraw-0 redeemer carries one feed.
+     * ONE rig — the STRIKE base — making both legs, so both entries withdraw from one credential while
+     * pricing two different tokens (STRIKE and USDM). The shape the builder must refuse by name: one withdraw-0
+     * redeemer carries one feed, and these two legs need feeds for two different tokens.
      */
     static Legs sharedLegs(TestOracleRig.Feed collateral, TestOracleRig.Feed principal) {
         TestOracleRig rig = TestOracleRig.of(TestOracleRig.controlHashed("d97da4f3", AQUARIUM_SC), 3);
@@ -315,8 +326,13 @@ final class StrikeUsdmFixture {
 
     /** The token output: {@code lovelace} plus {@code usdm} units of USDM. */
     static Utxo tokenOutput(String address, long lovelace, BigInteger usdm) {
+        return tokenOutput(address, lovelace, USDM, usdm);
+    }
+
+    /** The token output: {@code lovelace} plus {@code quantity} units of {@code token}. */
+    static Utxo tokenOutput(String address, long lovelace, AssetType token, BigInteger quantity) {
         return LoanFixtures.utxo("e1".repeat(32), 0, address, List.of(Amount.lovelace(BigInteger.valueOf(lovelace)),
-                Amount.asset(USDM.toUnit(), usdm)), null);
+                Amount.asset(token.toUnit(), quantity)), null);
     }
 
     // ---- the universe, the scripts, the evaluator, the builder ----------------------------------------
@@ -326,8 +342,12 @@ final class StrikeUsdmFixture {
      * and {@code wallet}. An out-ref that two legs of one rig share (its script holder) is listed once.
      */
     static List<Utxo> universe(int i, Legs legs, List<Utxo> wallet) {
+        return universe(loanUtxo(i), bondUtxo(i), legs, wallet);
+    }
+
+    private static List<Utxo> universe(Utxo loanUtxo, Utxo bondUtxo, Legs legs, List<Utxo> wallet) {
         Map<String, Utxo> byRef = new LinkedHashMap<>();
-        List<Utxo> all = new ArrayList<>(List.of(loanUtxo(i), bondUtxo(i), configUtxo(), lmConfigUtxo()));
+        List<Utxo> all = new ArrayList<>(List.of(loanUtxo, bondUtxo, configUtxo(), lmConfigUtxo()));
         all.addAll(legs.collateral().utxos());
         all.addAll(legs.principal().utxos());
         all.addAll(referenceScriptUtxos());
@@ -367,10 +387,136 @@ final class StrikeUsdmFixture {
     static LiquidatePayInAdvanceTransactionBuilder.Request request(int i, Legs legs, Utxo wallet, Utxo collateral,
                                                                    String changeAddress, long validFromMillis,
                                                                    long validToMillis) {
-        return new LiquidatePayInAdvanceTransactionBuilder.Request(loan(i), loanUtxo(i), bond(i), bondUtxo(i),
+        return request(loan(i), loanUtxo(i), bond(i), bondUtxo(i), legs, wallet, collateral, changeAddress,
+                validFromMillis, validToMillis);
+    }
+
+    private static LiquidatePayInAdvanceTransactionBuilder.Request request(Loan loan, Utxo loanUtxo, LenderBond bond,
+                                                                           Utxo bondUtxo, Legs legs, Utxo wallet,
+                                                                           Utxo collateral, String changeAddress,
+                                                                           long validFromMillis, long validToMillis) {
+        return new LiquidatePayInAdvanceTransactionBuilder.Request(loan, loanUtxo, bond, bondUtxo,
                 wallet, configUtxo(), lmConfigUtxo(), legs.collateral().entry(), legs.principal().entry(),
                 validFromMillis, validToMillis, slot(validFromMillis), slot(validToMillis), changeAddress,
                 REFERENCE_SCRIPTS, ORACLE_WINDOW_MARGIN_MILLIS, collateral);
+    }
+
+    // ---- FAB-225 r2: a SYNTHETIC same-token loan ------------------------------------------------------
+
+    /*
+     * Not a recorded loan. Derived in code from recorded loan #0 and its bond #9 to pin a shape the validators
+     * accept and that no recorded mainnet loan has today: principal AND collateral both STRIKE, priced by one
+     * STRIKE oracle entry that serves as both legs — so both legs withdraw from one credential, and one
+     * withdraw-0 serves both (lib/fluidtokens/oracle.ak's retrieve_oracle_data resolves each leg's feed by
+     * that credential and checks the feed's token per leg; here both legs need STRIKE). Nothing in
+     * validators/ forbids principal == collateral. Each datum is decoded as production decodes it, three
+     * fields (loan) or one field (bond) are replaced, and it is re-encoded; every other field is the
+     * recorded one.
+     */
+
+    /** The synthetic same-token loan's principal: 2,300,000,000 STRIKE. */
+    static final BigInteger SAME_TOKEN_PRINCIPAL = BigInteger.valueOf(2_300_000_000L);
+
+    /**
+     * Loan #0's datum with {@code principalAmount} {@link #SAME_TOKEN_PRINCIPAL}, {@code principalAsset}
+     * {@link #STRIKE} and {@code principalOracleAsset} the collateral's own oracle NFT ({@link #STRIKE_ORACLE_NFT}).
+     * Synthetic, derived from the recorded datum.
+     */
+    static String sameTokenLoanDatumHex() {
+        ConstrPlutusData recorded = constrOf(loanDatumHex(0));
+        List<PlutusData> fields = new ArrayList<>(recorded.getData().getPlutusDataList());
+        fields.set(1, BigIntPlutusData.of(SAME_TOKEN_PRINCIPAL));
+        fields.set(6, assetData(STRIKE));
+        fields.set(7, assetData(STRIKE_ORACLE_NFT));
+        return reencoded(recorded, fields);
+    }
+
+    /** Bond #9's datum with its principal asset {@link #STRIKE}. Synthetic, derived from the recorded datum. */
+    static String sameTokenBondDatumHex() {
+        ConstrPlutusData recorded = constrOf(bondDatumHex(0));
+        List<PlutusData> fields = new ArrayList<>(recorded.getData().getPlutusDataList());
+        fields.set(5, assetData(STRIKE));
+        return reencoded(recorded, fields);
+    }
+
+    /**
+     * A SYNTHETIC loan, derived from the recorded loan #0 to pin a shape the validators accept and that no
+     * recorded mainnet loan has today: STRIKE principal against STRIKE collateral, both legs priced by one
+     * oracle entry. Loan #0's coordinates and value, carrying {@link #sameTokenLoanDatumHex()}.
+     */
+    static Loan sameTokenLoan() {
+        return new Loan(LOAN_TX, LOAN_INDEXES.get(0), LOAN_ADDRESS, LOAN_IDS.get(0),
+                BigInteger.valueOf(COLLATERAL_AMOUNTS.get(0)), BigInteger.valueOf(LOAN_LOVELACE),
+                new LoanDatumConverter().deserialize(sameTokenLoanDatumHex()));
+    }
+
+    static Utxo sameTokenLoanUtxo() {
+        return LoanFixtures.utxo(LOAN_TX, LOAN_INDEXES.get(0), LOAN_ADDRESS, List.of(
+                        Amount.lovelace(BigInteger.valueOf(LOAN_LOVELACE)),
+                        Amount.asset(REGISTRY.getLoanPolicyId() + LOAN_IDS.get(0), BigInteger.ONE),
+                        Amount.asset(STRIKE.toUnit(), BigInteger.valueOf(COLLATERAL_AMOUNTS.get(0)))),
+                sameTokenLoanDatumHex());
+    }
+
+    /** Bond #9, coordinates and value as recorded, carrying {@link #sameTokenBondDatumHex()}. Synthetic. */
+    static LenderBond sameTokenBond() {
+        return new LenderBond(BOND_TX, BOND_INDEXES.get(0), BOND_ADDRESSES.get(0), LOAN_IDS.get(0),
+                sameTokenBondDatumHex(), new LenderManagerDatumConverter().deserialize(sameTokenBondDatumHex()));
+    }
+
+    static Utxo sameTokenBondUtxo() {
+        return LoanFixtures.utxo(BOND_TX, BOND_INDEXES.get(0), BOND_ADDRESSES.get(0), List.of(
+                        Amount.lovelace(BigInteger.valueOf(BOND_LOVELACE)),
+                        Amount.asset(REGISTRY.getLenderBondPolicyId() + LOAN_IDS.get(0), BigInteger.ONE)),
+                sameTokenBondDatumHex());
+    }
+
+    /**
+     * ONE STRIKE rig leg serving as BOTH legs: the collateral leg's own entry is also the principal oracle,
+     * so the two legs share its credential and its token.
+     */
+    static Legs sameTokenLegs(TestOracleRig.Feed feed) {
+        TestOracleRig rig = TestOracleRig.of(TestOracleRig.controlHashed("d97da4f3", AQUARIUM_SC), 3);
+        TestOracleRig.Leg leg = rig.leg(REGISTRY_PAYLOAD, collateralOracleNft(), feed,
+                List.of(new TestOracleRig.Signer(0, false)), NETWORK);
+        return new Legs(rig, rig, leg, leg);
+    }
+
+    /** As {@link #universe(int, Legs, List)}, with the same-token loan and bond in place of loan #0's. */
+    static List<Utxo> sameTokenUniverse(Legs legs, List<Utxo> wallet) {
+        return universe(sameTokenLoanUtxo(), sameTokenBondUtxo(), legs, wallet);
+    }
+
+    /**
+     * As {@link #request(int, Legs, Utxo, Utxo, String, long, long)}, for the same-token loan: the one entry
+     * of {@link #sameTokenLegs} is both {@code oracle} and {@code principalOracle}.
+     */
+    static LiquidatePayInAdvanceTransactionBuilder.Request sameTokenRequest(Legs legs, Utxo wallet, Utxo collateral,
+                                                                            String changeAddress,
+                                                                            long validFromMillis,
+                                                                            long validToMillis) {
+        return request(sameTokenLoan(), sameTokenLoanUtxo(), sameTokenBond(), sameTokenBondUtxo(), legs, wallet,
+                collateral, changeAddress, validFromMillis, validToMillis);
+    }
+
+    private static ConstrPlutusData constrOf(String hex) {
+        try {
+            return ConstrPlutusData.deserialize(CborSerializationUtil.deserialize(HexUtil.decodeHexString(hex)));
+        } catch (Exception e) {
+            throw new AssertionError("cannot decode a recorded datum", e);
+        }
+    }
+
+    /** {@code Asset { policyId, assetName }}, constructor 0. */
+    private static PlutusData assetData(AssetType asset) {
+        return ConstrPlutusData.builder().alternative(0).data(ListPlutusData.of(
+                BytesPlutusData.of(asset.getPlutusDataPolicyId()),
+                BytesPlutusData.of(asset.getPlutusDataAssetName()))).build();
+    }
+
+    private static String reencoded(ConstrPlutusData recorded, List<PlutusData> fields) {
+        return ConstrPlutusData.builder().alternative(recorded.getAlternative())
+                .data(ListPlutusData.of(fields.toArray(PlutusData[]::new))).build().serializeToHex();
     }
 
     /** The mainnet slot of a whole-second instant. */

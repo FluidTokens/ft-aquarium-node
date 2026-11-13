@@ -740,28 +740,44 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
 
     /**
      * FAB-225 — refuses, as {@code IllegalStateException("ORACLE_LEGS_SHARE_ONE_CREDENTIAL: …")}, a collateral
-     * and a principal oracle leg that withdraw from one credential. Each leg needs its own withdraw-0: one
-     * redeemer carries one feed, and {@code retrieve_oracle_data} resolves a leg's feed by
-     * {@code Withdraw(<that leg's reference input's payment credential>)} and requires the feed's token to be
-     * the leg's, so a single withdrawal cannot price two legs. Before FAB-225 the second withdraw-0 was
-     * silently dropped and the body was refused at evaluation instead. Refused here by name, before anything
-     * is priced or probed.
+     * and a principal oracle leg that withdraw from one credential AND price different tokens. One withdraw-0
+     * redeemer carries one feed, and these two legs need feeds for two different tokens:
+     * {@code retrieve_oracle_data} resolves a leg's feed by
+     * {@code Withdraw(<that leg's reference input's payment credential>)} and then requires the feed's token to
+     * be the leg's, so the one feed that credential can carry fails one of the two legs. A same-token pair on
+     * one credential is NOT refused: one withdrawal's feed is the right token for both legs, and
+     * {@link #assemble} emits that withdrawal once ({@link #sharesOneOracleCredential}). Before FAB-225 the
+     * second withdraw-0 was silently dropped and a different-token pair was refused at evaluation instead.
+     * Refused here by name, before anything is priced or probed.
      */
     private static void refuseSharedOracleCredential(OracleEntry collateral, OracleEntry principal) {
+        if (sharesOneOracleCredential(collateral, principal) && !Objects.equals(collateral.token(), principal.token())) {
+            String shared = collateral.withdrawCredentialHash() != null
+                    && collateral.withdrawCredentialHash().equalsIgnoreCase(principal.withdrawCredentialHash())
+                    ? collateral.withdrawCredentialHash() : collateral.rewardAddress();
+            throw new IllegalStateException(("ORACLE_LEGS_SHARE_ONE_CREDENTIAL: the collateral oracle %s (pricing %s) "
+                    + "and the principal oracle %s (pricing %s) both withdraw from %s; one withdraw-0 redeemer "
+                    + "carries one feed, and these two legs need feeds for two different tokens").formatted(
+                    collateral.oracleToken() != null ? collateral.oracleToken().toUnit() : "(no oracle NFT)",
+                    collateral.token() != null ? collateral.token().toUnit() : "(no token)",
+                    principal.oracleToken() != null ? principal.oracleToken().toUnit() : "(no oracle NFT)",
+                    principal.token() != null ? principal.token().toUnit() : "(no token)",
+                    shared));
+        }
+    }
+
+    /**
+     * FAB-225 — whether the two oracle legs withdraw from one credential: the same withdrawal credential
+     * (ignoring case) or the same reward address. The one detection both sites use: {@link #build} refuses
+     * such a pair when its tokens differ, and {@link #assemble} emits a single withdraw-0 for it when they
+     * do not.
+     */
+    private static boolean sharesOneOracleCredential(OracleEntry collateral, OracleEntry principal) {
         boolean sameCredential = collateral.withdrawCredentialHash() != null
                 && collateral.withdrawCredentialHash().equalsIgnoreCase(principal.withdrawCredentialHash());
         boolean sameRewardAddress = collateral.rewardAddress() != null
                 && collateral.rewardAddress().equals(principal.rewardAddress());
-        if (sameCredential || sameRewardAddress) {
-            String shared = sameCredential ? collateral.withdrawCredentialHash() : collateral.rewardAddress();
-            throw new IllegalStateException(("ORACLE_LEGS_SHARE_ONE_CREDENTIAL: the collateral oracle %s and the "
-                    + "principal oracle %s both withdraw from %s; one withdraw-0 redeemer carries one feed and "
-                    + "retrieve_oracle_data resolves a leg's feed by its reference input's credential, so one "
-                    + "withdrawal cannot price two legs").formatted(
-                    collateral.oracleToken() != null ? collateral.oracleToken().toUnit() : "(no oracle NFT)",
-                    principal.oracleToken() != null ? principal.oracleToken().toUnit() : "(no oracle NFT)",
-                    shared));
-        }
+        return sameCredential || sameRewardAddress;
     }
 
     // ---- assembly ---------------------------------------------------------------------------------
@@ -870,10 +886,13 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
         // pairs.get_first(self.redeemers, Withdraw(oraclePaymentCredential)) — one redeemer PER
         // CREDENTIAL, and a token principal's oracle is deployed separately from the collateral's
         // (its own verification keys / charlie_specs / oracle-asset parameters), so it carries its own
-        // reward address. Emitted whenever there is a principal oracle: two legs on one credential never
-        // get this far, because build() refuses them as ORACLE_LEGS_SHARE_ONE_CREDENTIAL — one withdraw-0
-        // redeemer carries one feed, so one withdrawal cannot price both legs.
-        if (request.principalOracle() != null) {
+        // reward address. So one withdraw-0 per DISTINCT credential. A same-token pair on one credential is
+        // served by the collateral's withdrawal above: get_first resolves that one redeemer for both legs and
+        // its feed is the right token for both (and the ledger permits one withdrawal per reward address). A
+        // different-token pair on one credential never gets here: build() refuses it as
+        // ORACLE_LEGS_SHARE_ONE_CREDENTIAL, because one withdraw-0 redeemer carries one feed.
+        if (request.principalOracle() != null
+                && !sharesOneOracleCredential(request.oracle(), request.principalOracle())) {
             tx.withdraw(request.principalOracle().rewardAddress(), BigInteger.ZERO,
                     oracleRedeemer(request.principalOracle(), principalProviderRefIndex),
                     request.changeAddress());
