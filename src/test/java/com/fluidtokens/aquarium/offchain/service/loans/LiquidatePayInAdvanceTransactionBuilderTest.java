@@ -70,8 +70,8 @@ class LiquidatePayInAdvanceTransactionBuilderTest {
 
     /**
      * A second priced asset with its own oracle deployment, so the principal leg gets a
-     * <b>distinct</b> withdrawal credential from the collateral leg's. The builder only emits a
-     * second withdraw-0 when the two credentials differ — the ledger permits one withdrawal per
+     * <b>distinct</b> withdrawal credential from the collateral leg's. The builder refuses two legs
+     * that share one credential (ORACLE_LEGS_SHARE_ONE_CREDENTIAL) — the ledger permits one withdrawal per
      * reward address, and {@code retrieve_oracle_data} resolves its feed with
      * {@code pairs.get_first(self.redeemers, Withdraw(oraclePaymentCredential))}, one redeemer per
      * credential.
@@ -141,8 +141,8 @@ class LiquidatePayInAdvanceTransactionBuilderTest {
 
         // Two DISTINCT oracle withdrawals — one per credential.
         assertFalse(charli3Collateral.rewardAddress().equals(multisigPrincipal.rewardAddress()),
-                "the two legs must not share a credential, or the second withdraw-0 is skipped and "
-                        + "this test proves nothing about it");
+                "the two legs must not share a credential, or the builder refuses the request "
+                        + "(ORACLE_LEGS_SHARE_ONE_CREDENTIAL) and this test proves nothing about it");
         assertTrue(rewardAddresses(built).contains(charli3Collateral.rewardAddress()),
                 "the collateral oracle withdraw-0 is missing");
         assertTrue(rewardAddresses(built).contains(multisigPrincipal.rewardAddress()),

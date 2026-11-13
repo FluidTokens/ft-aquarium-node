@@ -384,12 +384,16 @@ jobs:
       # with runtime test keys, liquidates the d832b78e convert offline; wrong-key, threshold and window controls)
       # re-measured cold keyless on feat/fab-211-213-214-seams, 2026-11-12: 246 files / 2835 tests / 0 failures /
       # 0 errors / 51 skipped, 0 orphans. Floor 246.
+      # FAB-225-1 (PayInAdvanceStrikeUsdmDryEvalTest + PayInAdvanceAdaPrincipalByteIdentityTest: a STRIKE→USDM
+      # pay-in-advance evaluates offline through two rig oracles, a shared oracle credential is refused by name, and
+      # the token→ADA build is pinned byte-identical) re-measured cold keyless on feat/fab-211-213-214-seams,
+      # 2026-11-13: 248 files / 2847 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 248.
       #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '246'
+          RESULT_FILE_FLOOR: '248'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET

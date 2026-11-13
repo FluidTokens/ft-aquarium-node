@@ -544,6 +544,7 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
         refuseUnmodelledVariant(request.oracle(), "collateral");
         if (request.principalOracle() != null) {
             refuseUnmodelledVariant(request.principalOracle(), "principal");
+            refuseSharedOracleCredential(request.oracle(), request.principalOracle());
         }
         // ⛔ FAB-185 — C is pinned as the only collateral input and never spent, so it must exist, be pure ada
         // with no datum and no script (the one ada-only predicate), and be a different output from the
@@ -737,6 +738,32 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
         }
     }
 
+    /**
+     * FAB-225 — refuses, as {@code IllegalStateException("ORACLE_LEGS_SHARE_ONE_CREDENTIAL: …")}, a collateral
+     * and a principal oracle leg that withdraw from one credential. Each leg needs its own withdraw-0: one
+     * redeemer carries one feed, and {@code retrieve_oracle_data} resolves a leg's feed by
+     * {@code Withdraw(<that leg's reference input's payment credential>)} and requires the feed's token to be
+     * the leg's, so a single withdrawal cannot price two legs. Before FAB-225 the second withdraw-0 was
+     * silently dropped and the body was refused at evaluation instead. Refused here by name, before anything
+     * is priced or probed.
+     */
+    private static void refuseSharedOracleCredential(OracleEntry collateral, OracleEntry principal) {
+        boolean sameCredential = collateral.withdrawCredentialHash() != null
+                && collateral.withdrawCredentialHash().equalsIgnoreCase(principal.withdrawCredentialHash());
+        boolean sameRewardAddress = collateral.rewardAddress() != null
+                && collateral.rewardAddress().equals(principal.rewardAddress());
+        if (sameCredential || sameRewardAddress) {
+            String shared = sameCredential ? collateral.withdrawCredentialHash() : collateral.rewardAddress();
+            throw new IllegalStateException(("ORACLE_LEGS_SHARE_ONE_CREDENTIAL: the collateral oracle %s and the "
+                    + "principal oracle %s both withdraw from %s; one withdraw-0 redeemer carries one feed and "
+                    + "retrieve_oracle_data resolves a leg's feed by its reference input's credential, so one "
+                    + "withdrawal cannot price two legs").formatted(
+                    collateral.oracleToken() != null ? collateral.oracleToken().toUnit() : "(no oracle NFT)",
+                    principal.oracleToken() != null ? principal.oracleToken().toUnit() : "(no oracle NFT)",
+                    shared));
+        }
+    }
+
     // ---- assembly ---------------------------------------------------------------------------------
 
     private ScriptTx assemble(Request request, Numbers numbers, int configRefIndex, int lmConfigRefIndex,
@@ -843,11 +870,10 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
         // pairs.get_first(self.redeemers, Withdraw(oraclePaymentCredential)) — one redeemer PER
         // CREDENTIAL, and a token principal's oracle is deployed separately from the collateral's
         // (its own verification keys / charlie_specs / oracle-asset parameters), so it carries its own
-        // reward address. Skipped when the two legs happen to share one credential (the same priced
-        // asset on both legs), because the ledger permits only one withdrawal per reward address and
-        // get_first would already resolve the collateral leg's own entry for it.
-        if (request.principalOracle() != null
-                && !request.principalOracle().rewardAddress().equals(request.oracle().rewardAddress())) {
+        // reward address. Emitted whenever there is a principal oracle: two legs on one credential never
+        // get this far, because build() refuses them as ORACLE_LEGS_SHARE_ONE_CREDENTIAL — one withdraw-0
+        // redeemer carries one feed, so one withdrawal cannot price both legs.
+        if (request.principalOracle() != null) {
             tx.withdraw(request.principalOracle().rewardAddress(), BigInteger.ZERO,
                     oracleRedeemer(request.principalOracle(), principalProviderRefIndex),
                     request.changeAddress());
