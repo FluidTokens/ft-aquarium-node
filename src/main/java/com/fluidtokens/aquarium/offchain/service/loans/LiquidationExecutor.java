@@ -3053,10 +3053,11 @@ public class LiquidationExecutor {
      * {@code MARKET_DISABLED} refusal. A {@code CONVERT_BEFORE_ANTICIPATE} market builds either route, so the
      * action no longer says which one a candidate was built on.
      *
-     * <p>⚠ <b>The convert route funds ada the rider deliberately does NOT count</b> — the Minswap
-     * order carries ~2.8 ADA to the asset manager and does not come back to the bot. Whether that
-     * belongs in the profitability floor is an ECONOMICS decision and is not made here: adding it
-     * would be a new cost term, not a correction of a miscount. Recorded in findings §57 as open.
+     * <p>⚠ <b>The convert route's order output is counted, though not as the rider</b> — since FAB-224
+     * {@link #minAdaFunded} adds the Minswap order output (its 4,000,000 overhead,
+     * {@link ConvertEconomics#MINSWAP_ORDER_OVERHEAD}) to what the bot funds, so the executor's floor
+     * charges it, as {@link ConvertEconomics} already did. The S-15 rider still applies to the
+     * pay-in-advance route alone.
      */
     private String plannedRoute(LiquidationAssessment assessment, CandidatePass pass) {
         if (!assessment.bond().datum().shouldLiquidationConvertToPrincipal()) {

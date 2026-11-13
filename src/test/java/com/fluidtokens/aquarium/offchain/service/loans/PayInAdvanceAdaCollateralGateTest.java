@@ -120,7 +120,6 @@ class PayInAdvanceAdaCollateralGateTest {
     /** The lender output's min-ADA on the recorded loan: Σ coin(asset-manager outputs) − equity. */
     private static final BigInteger LENDER_MIN_ADA = BigInteger.valueOf(1_663_660L);
 
-
     private static final BigInteger PLACEHOLDER = BigInteger.valueOf(10_000L);
 
     /** The token output: {@code e1…e1#0} at {@code address}. */

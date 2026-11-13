@@ -164,7 +164,9 @@ class ConvertLiquidationRouterTest {
      * exception cannot be arriving for another reason.
      *
      * <p>Mutant M12 (neuter the executor's catch) is killed by the executor-side pair of this test;
-     * removing this throw and passing {@code null} through is killed HERE.
+     * removing this throw and passing {@code null} through is killed HERE. Since FAB-227 it also pins
+     * the token branch's literal, {@code (the order overhead; the collateral is a token)}, and
+     * mutation R1 is its control.
      */
     @Test
     void aWalletWithNoSufficientUtxoIsRefusedByNameAndSaysWhatTheOrderNeeded() {
@@ -177,6 +179,9 @@ class ConvertLiquidationRouterTest {
         assertTrue(e.getMessage().contains("4000000"),
                 "the operator must be told WHAT the order needed — the Minswap order overhead for a "
                         + "token collateral: " + e.getMessage());
+        assertTrue(e.getMessage().contains("4000000 lovelace (the order overhead; the collateral is a token)"),
+                "the token branch's own words: no other test reads the router's text, so this is what "
+                        + "keeps it from drifting: " + e.getMessage());
         assertTrue(e.getMessage().contains("no nominable wallet utxo"),
                 "and that the shortfall is the wallet's, not the candidate's: " + e.getMessage());
         assertTrue(e.getMessage().contains("reference script"),
