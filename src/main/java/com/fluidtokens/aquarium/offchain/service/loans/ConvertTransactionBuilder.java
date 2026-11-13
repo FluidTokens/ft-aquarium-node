@@ -1,5 +1,6 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
+import com.bloxbean.cardano.client.api.MinAdaCalculator;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
 import com.bloxbean.cardano.client.api.ScriptSupplier;
 import com.bloxbean.cardano.client.api.TransactionEvaluator;
@@ -63,10 +64,11 @@ import java.util.stream.Stream;
  * <b>by their datum bytes</b> rather than by arithmetic, and the whole thing is assembled again with
  * the observed values. {@link #assertStructure} then re-derives them from the finished body.
  *
- * <h2>⚠ Trap 17 is unavoidable on this path</h2>
- * The bot's income is the liquidation fee <b>in the collateral token</b>, so every convert produces a
- * change output carrying native assets. A subsequent build that spends it must cope with a
- * multi-asset wallet UTxO; that is a property of the path, not a defect to design away.
+ * <h2>⚠ Trap 17 is unavoidable on this path — for a TOKEN collateral</h2>
+ * The bot's income is the liquidation fee <b>in the collateral token</b>, so every convert of a token
+ * collateral produces a change output carrying native assets. A subsequent build that spends it must cope
+ * with a multi-asset wallet UTxO; that is a property of the path, not a defect to design away. An ADA
+ * collateral's fee is lovelace, and its change is ada-only (FAB-224).
  *
  * <h2>Collateral and the wallet: C is pinned, U is the only wallet input — on BOTH passes (FAB-185)</h2>
  * <ul>
@@ -83,6 +85,14 @@ import java.util.stream.Stream;
  *       holds U and nothing else (CCL trap 9b: guard every seam, not one). The layout probe sees the same
  *       view as the strict pass, so it lays out the body that is evaluated. <b>A U too small for the build
  *       refuses; it never pulls a second wallet output.</b></li>
+ *   <li><b>Or no wallet input at all</b> (FAB-224): a request whose wallet utxo is {@code null} spends nothing
+ *       from the wallet. Neither pass collects a wallet input, and every supplier either pass hands
+ *       cardano-client-lib is a {@link DesignatedInputUtxoSupplier#withoutWalletInput} view, in which the
+ *       wallet's payment credential holds nothing, so the body balances from its own script inputs or not at
+ *       all. That is the ADA-collateral shape: the loan's own lovelace funds the order, the equity, the carriers
+ *       and the fee. C stays the only collateral, checked as above. <b>This builder never decides between the
+ *       two shapes; its caller, the router, does</b>, and a body the loan cannot fund fails in
+ *       cardano-client-lib's balancing rather than reaching into the wallet.</li>
  * </ul>
  *
  * <h2>⛔ Oracle legs: one per TOKEN, collateral and principal (FAB-223)</h2>
@@ -102,8 +112,12 @@ import java.util.stream.Stream;
  * {@link Refusal#ORACLE_LEG_CREDENTIAL_MISMATCH} — the last checked by {@link #assertOracleLegs} on the layout
  * probe's body, before any evaluator is asked, and again on the finished body.
  * <p>
- * ⚠ The collateral leg is "token required": an ada collateral is still refused here as
- * {@link Refusal#COLLATERAL_ORACLE_MISSING}, pending its own slice (FAB-224).
+ * <p>
+ * FAB-224 — an ADA collateral is an ada leg like an ada principal: it carries no oracle entry, and so no
+ * reference input, no probe entry and no withdrawal, and its claim index is 0. An ada collateral handed an
+ * entry is refused {@link Refusal#COLLATERAL_ORACLE_MISSING}: {@code retrieve_oracle_data} never reads an
+ * oracle for an ada leg. Its equity output is ada only, and its fee to the bot is checked in lovelace
+ * ({@link #assertStructure}).
  */
 @Slf4j
 public class ConvertTransactionBuilder {
@@ -123,6 +137,9 @@ public class ConvertTransactionBuilder {
         REPAYMENT_RECEIPTS_NOT_MODELLED,
         /**
          * The equity output is absent, short, or carries something the validator's DoS guard forbids.
+         * FAB-224 — for an ADA collateral: it holds anything but ada (the DoS guard's {@code
+         * length(flatten(value)) == 1}), or its coin is not exactly {@code max(equity, min-ada of that output)}:
+         * below the equity, or topped up by more than the ledger minimum demands.
          */
         EQUITY_OUTPUT_MISMATCH,
         /** The lender bond's datum did not survive a decode→re-encode, so it cannot be echoed. */
@@ -131,7 +148,12 @@ public class ConvertTransactionBuilder {
         ORDER_OUTPUT_MISMATCH,
         /** A carrier output's inline datum does not hash to the value the order datum embeds. */
         CARRIER_DATUM_MISMATCH,
-        /** The bot's collateral-token fee is absent from the built body. */
+        /**
+         * The bot's collateral-token fee is absent from the built body. FAB-224 — for an ADA collateral the fee
+         * is lovelace and mixes with the bot's own, so what is checked is the net: the bot's outputs, less what
+         * its wallet input brought, plus the transaction fee, must reach the liquidation fee less the order's
+         * 4 ADA overhead and the equity output's min-ada top-up.
+         */
         FEE_NOT_PAID_TO_BOT,
         /** An index the redeemer claims does not point at what it claims, on the finished body. */
         INDEX_MISMATCH,
@@ -140,6 +162,10 @@ public class ConvertTransactionBuilder {
          * least one leg is a token and {@code loan_claim_action} requires an oracle withdrawal for it.
          * Building without one produces a transaction that assembles, serialises and passes every
          * structural check here — and fails on chain.
+         * <p>
+         * FAB-224 — an ADA collateral needs no oracle and must be handed none: an ada collateral carrying an
+         * entry is refused by this name too, because {@code retrieve_oracle_data} never reads an oracle for an
+         * ada leg and this builder would reference and withdraw for nothing.
          */
         COLLATERAL_ORACLE_MISSING,
         /**
@@ -203,10 +229,10 @@ public class ConvertTransactionBuilder {
      * @param poolRefUtxo the authentic Minswap pool UTxO from {@link MinswapPoolResolver}'s per-cycle
      *                    index snapshot — never a pinned coordinate, because a pool is respent on
      *                    every swap
-     * @param collateralOracle the oracle entry for the COLLATERAL leg. ⛔ Never {@code null} on this path:
-     *                    the collateral leg is "token required" here (an ada collateral is refused as
-     *                    {@link Refusal#COLLATERAL_ORACLE_MISSING}), and {@code retrieve_oracle_data} demands
-     *                    an oracle withdrawal for a token leg
+     * @param collateralOracle the oracle entry for the COLLATERAL leg, {@code null} iff the collateral is ada
+     *                    (FAB-224). A token collateral's leg needs one, because {@code retrieve_oracle_data}
+     *                    demands an oracle withdrawal for a token leg; an ada collateral's leg must have none.
+     *                    {@link #build} refuses anything else as {@link Refusal#COLLATERAL_ORACLE_MISSING}
      * @param orderAddress {@code Address(Script(minswapOrderSpendScriptHash), lenderStakeCredential)}
      *                     — the validator checks this exactly, including the LENDER's stake part
      * @param claim       the loan-claim redeemer's per-input data; its {@code lenderBondOutputIndex}
@@ -215,7 +241,9 @@ public class ConvertTransactionBuilder {
      *                    output which this builder does not mint, so it is a named refusal
      * @param walletUtxo  ⛔ FAB-185 — U, the ONE wallet output this build may spend. It alone funds the order's
      *                    lovelace, the equity output, the two carriers' min-ada, the fee and the change's
-     *                    min-ada: no other wallet output is visible to either pass
+     *                    min-ada: no other wallet output is visible to either pass. FAB-224 — may be
+     *                    {@code null}: then nothing from the wallet is spent, and the loan's own inputs fund
+     *                    the build (the ADA-collateral shape; the router decides which shape it asks for)
      * @param collateralUtxo ⛔ FAB-185 — wallet role C, pinned as the transaction's ONLY collateral input on
      *                    both passes and never spent. Ada-only with no datum and no script
      *                    ({@code WalletInputSelection.nominable}), and a different output from
@@ -510,13 +538,22 @@ public class ConvertTransactionBuilder {
     }
 
     /**
-     * The collateral leg, "token required": an ada (or absent) collateral, a missing entry, one not
-     * {@code usableForLiquidation()} or one pricing another token is {@link Refusal#COLLATERAL_ORACLE_MISSING}.
-     * Ada collateral stays refused here pending its own slice (FAB-224).
+     * The collateral leg, "ada or token" (FAB-224): an ada collateral carries no entry, and is an ada leg; a token
+     * collateral one that is {@code usableForLiquidation()} and prices exactly that token. An absent collateral,
+     * an ada collateral handed an entry, or a token collateral with a missing, unusable or mismatched entry is
+     * {@link Refusal#COLLATERAL_ORACLE_MISSING}.
      */
     private static OracleLeg collateralLeg(Request request) {
         var entry = request.collateralOracle();
-        if (request.collateral() == null || request.collateral().isAda()
+        if (request.collateral() != null && request.collateral().isAda()) {
+            if (entry != null) {
+                throw refuse(Refusal.COLLATERAL_ORACLE_MISSING, "the collateral is ada, but the request hands it "
+                        + "the oracle " + unitOf(entry.oracleToken()) + "; retrieve_oracle_data never reads an "
+                        + "oracle for an ada leg");
+            }
+            return new OracleLeg("collateral", request.collateral(), null);
+        }
+        if (request.collateral() == null
                 || entry == null || !entry.usableForLiquidation()
                 // the collateral oracle must price the loan's collateral token (is_feed_token_correct)
                 || !request.collateral().equals(entry.token())) {
@@ -708,7 +745,12 @@ public class ConvertTransactionBuilder {
 
         tx.collectFrom(request.loanUtxo(), GENERAL_SPEND_REDEEMER);
         tx.collectFrom(request.bondUtxo(), GENERAL_SPEND_REDEEMER);
-        tx.collectFrom(request.walletUtxo());
+        // FAB-224 — U only when the request hands one. With none, nothing from the wallet is collected here, and
+        // complete() hands cardano-client-lib a view in which the wallet holds nothing, so balancing cannot add
+        // one either: the loan's own inputs fund the build.
+        if (request.walletUtxo() != null) {
+            tx.collectFrom(request.walletUtxo());
+        }
 
         // 1. The Minswap order. Its value is the validator's, not a min-ada estimate: an ADA
         //    collateral's order holds exactly the swappable amount, a token collateral's holds the
@@ -730,11 +772,19 @@ public class ConvertTransactionBuilder {
         //    hold ada and the equity token and NOTHING ELSE. One stray asset — a change adjustment,
         //    a merged output — fails it on chain (CCL trap 17 territory, which this path already
         //    fights because the bot's fee is a native token).
+        //
+        //    FAB-224 — for an ADA collateral the equity IS ada, and the DoS guard is
+        //    `length(flatten(value)) == 1`: the output holds the equity's lovelace and nothing else.
+        //    cardano-client-lib raises it to the ledger minimum when the equity is smaller (CCL trap 6), out
+        //    of the bot's change; assertStructure checks that top-up is exactly the minimum and charges it to
+        //    the bot's fee check.
         BigInteger equity = request.claim().equity();
         if (equity.signum() > 0) {
             tx.payToContract(assetManagerAddress(),
-                    List.of(Amount.lovelace(EQUITY_OUTPUT_LOVELACE),
-                            Amount.asset(request.collateral().toUnit(), equity)),
+                    request.collateral().isAda()
+                            ? List.of(Amount.lovelace(equity))
+                            : List.of(Amount.lovelace(EQUITY_OUTPUT_LOVELACE),
+                                    Amount.asset(request.collateral().toUnit(), equity)),
                     LiquidationTxEncoder.assetManagerDatumWithToken(
                             new com.fluidtokens.aquarium.offchain.model.loans.AssetManagerDatumWithToken(
                                     request.loanUtxo().getTxHash(),
@@ -852,8 +902,11 @@ public class ConvertTransactionBuilder {
         // to be chosen — so a U too small for the build refuses rather than pulling a second output. Out-refs
         // (C, the loan, the bond, the pool, every reference input) still resolve through it unchanged.
         // Mirrors LiquidateTransactionBuilder.complete (FAB-185-2) and the pay-in-advance builder (FAB-185-3).
-        UtxoSupplier walletView = DesignatedInputUtxoSupplier.of(utxoSupplier, request.changeAddress(),
-                request.walletUtxo());
+        // FAB-224 — a request with no wallet utxo gets the view in which the wallet holds NOTHING, built here for
+        // the same reason: both passes balance from the loan's own inputs, or neither does.
+        UtxoSupplier walletView = request.walletUtxo() == null
+                ? DesignatedInputUtxoSupplier.withoutWalletInput(utxoSupplier, request.changeAddress())
+                : DesignatedInputUtxoSupplier.of(utxoSupplier, request.changeAddress(), request.walletUtxo());
         // Production: the injected utxo supplier (the local index first) seen through that view, the
         // per-epoch protocol params, and a SCRIPT SUPPLIER serving the bytes of every validator travelling as
         // a reference script — without which cardano-client-lib prices that script's fee as zero (CCL trap 9).
@@ -994,6 +1047,9 @@ public class ConvertTransactionBuilder {
         // ⛔ The equity output, when one was owed. Checked on the FINISHED body, because the exact-value
         // guard is about what survives balancing rather than what we intended to emit.
         BigInteger equity = request.claim().equity();
+        // FAB-224 — the lovelace the library added to an ADA equity output to reach the ledger minimum: paid out
+        // of the bot's change, so the bot's fee check below is owed that much less.
+        BigInteger equityTopUp = BigInteger.ZERO;
         if (equity.signum() > 0) {
             String amAddress = assetManagerAddress();
             TransactionOutput equityOut = outs.stream()
@@ -1002,7 +1058,21 @@ public class ConvertTransactionBuilder {
                     .orElseThrow(() -> refuse(Refusal.EQUITY_OUTPUT_MISMATCH,
                             "the borrower is owed " + equity + " of equity and no output reaches the "
                                     + "asset-manager credential"));
-            if (quantityOf(equityOut, request.collateral()).compareTo(equity) < 0) {
+            if (request.collateral().isAda()) {
+                // ⛔ FAB-224 — an ADA equity: its coin is the equity, raised to the ledger minimum only when the
+                // equity is smaller, and never by more. A coin below the equity fails containsCorrectAmount on
+                // chain; one above max(equity, min-ada) is bot money handed to the borrower (CCL trap 6).
+                BigInteger coin = equityOut.getValue().getCoin();
+                BigInteger exact = equity.max(new MinAdaCalculator(protocolParamsSupplier.getProtocolParams())
+                        .calculateMinAda(equityOut));
+                if (coin.compareTo(equity) < 0 || coin.compareTo(exact) != 0) {
+                    throw refuse(Refusal.EQUITY_OUTPUT_MISMATCH,
+                            ("the ada equity output holds %s lovelace; the borrower is owed %s, and the output "
+                                    + "must hold exactly max(equity, its min-ada) = %s").formatted(coin, equity,
+                                    exact));
+                }
+                equityTopUp = coin.subtract(equity);
+            } else if (quantityOf(equityOut, request.collateral()).compareTo(equity) < 0) {
                 throw refuse(Refusal.EQUITY_OUTPUT_MISMATCH,
                         "the equity output holds %s of the collateral, the borrower is owed %s"
                                 .formatted(quantityOf(equityOut, request.collateral()), equity));
@@ -1030,7 +1100,15 @@ public class ConvertTransactionBuilder {
             // token and NOTHING else. A change adjustment or a merged output adds an entry here and
             // the validator refuses — on chain, after the fee is spent.
             int entries = flattenedLength(equityOut);
-            if (entries != 2) {
+            if (request.collateral().isAda()) {
+                // FAB-224 — for an ADA equity the guard is `length(flatten(value)) == 1`: ada and nothing else.
+                if (entries != 1) {
+                    throw refuse(Refusal.EQUITY_OUTPUT_MISMATCH,
+                            ("the equity output carries %d distinct assets; equity_sent_to_borrower's DoS guard "
+                                    + "demands exactly 1 (ada only) for an ada collateral when repaymentReceipts "
+                                    + "is false").formatted(entries));
+                }
+            } else if (entries != 2) {
                 throw refuse(Refusal.EQUITY_OUTPUT_MISMATCH,
                         ("the equity output carries %d distinct assets; equity_sent_to_borrower's DoS "
                                 + "guard demands exactly 2 (ada and the equity token) when "
@@ -1069,7 +1147,38 @@ public class ConvertTransactionBuilder {
                         "the bot's outputs carry %s of the collateral but the fee it earned is %s"
                                 .formatted(toBot, request.plan().liquidationFee()));
             }
+        } else {
+            // ⛔ FAB-224 — an ADA collateral's fee is lovelace, the same unit as everything else the bot holds, so
+            // it is checked NET: what the bot's outputs hold, less what its wallet input brought, plus the
+            // transaction fee it paid, must reach the liquidation fee less the order's overhead (which the order
+            // carries on the bot's behalf) and less the equity output's min-ada top-up (which balancing took from
+            // the bot's change). A builder that left the fee in the order or paid it elsewhere fails here.
+            BigInteger toBot = outs.stream()
+                    .filter(o -> request.changeAddress().equals(o.getAddress()))
+                    .map(o -> o.getValue().getCoin())
+                    .reduce(BigInteger.ZERO, BigInteger::add);
+            BigInteger brought = request.walletUtxo() == null ? BigInteger.ZERO : lovelaceOf(request.walletUtxo());
+            BigInteger received = toBot.subtract(brought).add(txn.getBody().getFee());
+            BigInteger owed = request.plan().liquidationFee()
+                    .subtract(ConvertEconomics.MINSWAP_ORDER_OVERHEAD)
+                    .subtract(equityTopUp);
+            if (received.compareTo(owed) < 0) {
+                throw refuse(Refusal.FEE_NOT_PAID_TO_BOT,
+                        ("the bot received %s lovelace net (its outputs %s, less its wallet input's %s, plus the "
+                                + "fee %s) but is owed %s (the liquidation fee %s, less the order overhead %s and "
+                                + "the equity top-up %s)").formatted(received, toBot, brought,
+                                txn.getBody().getFee(), owed, request.plan().liquidationFee(),
+                                ConvertEconomics.MINSWAP_ORDER_OVERHEAD, equityTopUp));
+            }
         }
+    }
+
+    /** The lovelace a utxo holds. */
+    private static BigInteger lovelaceOf(Utxo utxo) {
+        return utxo.getAmount().stream()
+                .filter(a -> "lovelace".equals(a.getUnit()))
+                .map(Amount::getQuantity)
+                .reduce(BigInteger.ZERO, BigInteger::add);
     }
 
     private void assertCarrier(List<TransactionOutput> outs, long index, PlutusData datum,
@@ -1094,9 +1203,10 @@ public class ConvertTransactionBuilder {
     // ---- plumbing ---------------------------------------------------------------------------------
 
     /**
-     * The ada this builder puts in the equity output. Comfortably over min-ada for an
+     * The ada this builder puts in a TOKEN collateral's equity output. Comfortably over min-ada for an
      * ada-plus-one-token output, and fixed rather than computed so the DoS guard's exact-value
-     * requirement is not at the mercy of a min-ada calculation that could round differently.
+     * requirement is not at the mercy of a min-ada calculation that could round differently. An ADA
+     * collateral's equity output holds the equity itself and nothing else (FAB-224), so it is not used there.
      *
      * <p>⚠ Counted as the bot's outlay by the same conservative rule §30 applies to the order's
      * 2.8 ada: the loan input carries ada of its own and it is not yet measured how much of it

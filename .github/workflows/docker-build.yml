@@ -400,12 +400,16 @@ jobs:
       # offline through one rig oracle, the seized ADA comes back ADA-only, and a collateral oracle that does not
       # match the collateral is refused by name) re-measured cold keyless on feat/fab-211-213-214-seams, 2026-11-13:
       # 251 files / 2882 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 251.
+      # FAB-224-1 (ConvertAdaCollateralRigTest: an ADA→USDM convert evaluates offline paid from the collateral with
+      # no wallet input, a small equity is topped up exactly to the ledger minimum, and one handed wallet utxo is the
+      # only one spent) re-measured cold keyless on feat/fab-211-213-214-seams, 2026-11-13:
+      # 252 files / 2895 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 252.
       #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '251'
+          RESULT_FILE_FLOOR: '252'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET

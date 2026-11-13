@@ -834,6 +834,80 @@ class ConvertProductionWiringTest {
                 mock(OracleReferenceInputProbe.class));
     }
 
+    /**
+     * (m) ⛔ FAB-224, H2 for the ADA collateral: the zero-wallet ADA→USDM convert ({@link ConvertAdaCollateralFixture})
+     * built through {@code YaciConfig}'s bean method — the Spring-wired shape — with the script supplier serving the
+     * registry scripts and the rig oracle and NOTHING declared. It spends no wallet input, pledges exactly C, carries
+     * real budgets on all eight redeemers, and its fee covers the reference-script fee of every referenced script —
+     * the rig oracle's included, which no declared list could name (CCL trap 9).
+     */
+    @Test
+    void theAdaCollateralConvertThroughTheSpringBeanSpendsNoWalletInputAndPricesItsOracleScript() throws Exception {
+        ConvertAdaCollateralFixture a = ConvertAdaCollateralFixture.spec().build();
+        ConvertTokenToTokenFixture.Recording evaluator = new ConvertTokenToTokenFixture.Recording(a.aiken());
+        Transaction priced = Transaction.deserialize(bean(a, a.hashCheckedScripts(), evaluator)
+                .build(a.request).serialize());
+        assertEquals(1, evaluator.calls.get(), "exactly one evaluation: pass 2's (CCL trap 23)");
+
+        List<Redeemer> redeemers = priced.getWitnessSet().getRedeemers();
+        assertEquals(8, redeemers.size(), "two spends, one burn, five withdrawals (the USDM oracle included)");
+        for (Redeemer redeemer : redeemers) {
+            String key = redeemer.getTag() + "#" + redeemer.getIndex();
+            EvaluationResult costing = evaluator.last.get().stream()
+                    .filter(r -> r.getRedeemerTag() == redeemer.getTag()
+                            && r.getIndex() == redeemer.getIndex().intValue())
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError("no evaluation for " + key));
+            assertEquals(costing.getExUnits().getMem(), redeemer.getExUnits().getMem(), "declared mem for " + key);
+            assertEquals(costing.getExUnits().getSteps(), redeemer.getExUnits().getSteps(), "declared steps for " + key);
+            assertTrue(redeemer.getExUnits().getMem().compareTo(PLACEHOLDER_MEM) > 0,
+                    key + " carries CCL's 10000-mem placeholder: the evaluator was not load-bearing");
+        }
+        Set<String> referenced = new HashSet<>();
+        for (TransactionInput input : priced.getBody().getReferenceInputs()) {
+            Utxo utxo = a.utxoAt(input);
+            if (utxo.getReferenceScriptHash() != null) {
+                referenced.add(utxo.getReferenceScriptHash());
+            }
+        }
+        assertEquals(7, referenced.size(), "the six loans-v4 slots and the rig oracle, all by reference: " + referenced);
+        assertTrue(referenced.contains(a.rig.scriptHash()), "the rig oracle script travels by reference");
+        Set<String> witnessed = witnessedScriptHashes(priced.getWitnessSet());
+        witnessed.retainAll(referenced);
+        assertTrue(witnessed.isEmpty(), "scripts both witnessed and referenced: " + witnessed);
+
+        assertEquals(Set.of(new TransactionInput(ConvertAdaCollateralFixture.LOAN_TX, ConvertAdaCollateralFixture.LOAN_IX),
+                        new TransactionInput(ConvertAdaCollateralFixture.LOAN_TX, ConvertAdaCollateralFixture.BOND_IX)),
+                Set.copyOf(priced.getBody().getInputs()), "the loan and the bond: no wallet input");
+        assertEquals(2, priced.getBody().getInputs().size(), "two inputs");
+        Utxo c = ConvertTokenToTokenFixture.COLLATERAL_UTXO;
+        assertEquals(List.of(new TransactionInput(c.getTxHash(), c.getOutputIndex())), priced.getBody().getCollateral(),
+                "the collateral is exactly C");
+
+        long total = ConvertTokenToTokenFixture.registryScriptBytes() + a.rig.script().scriptRefBytes().length;
+        // The comparison build serves raw: HashCheckedScriptSupplier refuses to answer empty, by design.
+        ScriptSupplier servesNothing = hash -> Optional.empty();
+        Transaction unpriced = Transaction.deserialize(bean(a, servesNothing,
+                new ConvertTokenToTokenFixture.Recording(a.aiken())).build(a.request).serialize());
+        BigInteger delta = priced.getBody().getFee().subtract(unpriced.getBody().getFee());
+        log.info("FAB-224 ADA-collateral convert ref-script fee: priced {} unpriced {} delta {} | {} B referenced, "
+                        + "Conway fee {}", priced.getBody().getFee(), unpriced.getBody().getFee(), delta, total,
+                refScriptFee(total));
+        assertTrue(delta.compareTo(refScriptFee(total).subtract(tolerance())) >= 0,
+                "the reference-script fee charged (" + delta + ") is below the Conway fee for all seven referenced "
+                        + "scripts (" + refScriptFee(total) + ")");
+    }
+
+    /** {@code YaciConfig}'s convert builder bean method, as the container calls it, on the ADA-collateral fixture. */
+    private static ConvertTransactionBuilder bean(ConvertAdaCollateralFixture a, ScriptSupplier scripts,
+                                                  TransactionEvaluator evaluator) {
+        AppConfig.Network mainnet = new AppConfig.Network();
+        mainnet.setNetworkForTest("mainnet");
+        return new YaciConfig().convertTransactionBuilder(ConvertTokenToTokenFixture.REGISTRY, mainnet,
+                LoanFixtures.utxoSupplier(a.universe), EvalFixtures.protocolParams(), scripts, evaluator,
+                mock(OracleReferenceInputProbe.class));
+    }
+
     // ======================================================================================
     // The rig's leaves
     // ======================================================================================
