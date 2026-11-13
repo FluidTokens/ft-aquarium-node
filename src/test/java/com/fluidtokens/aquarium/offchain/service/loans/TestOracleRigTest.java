@@ -660,7 +660,7 @@ class TestOracleRigTest {
                 bond.lenderStakeCredential(), LOAN_ID, NETWORK);
         var request = new ConvertTransactionBuilder.Request(loanUtxo, bondUtxo, poolUtxo, entry, configUtxo,
                 lmConfigUtxo, WALLET_UTXO, referenceScripts, plan, claim, FLDT, lenderBond, loan.repaymentReceipts(),
-                orderAddress, BOT_ADDRESS, validFromSlot, validToSlot, COLLATERAL_UTXO);
+                orderAddress, BOT_ADDRESS, validFromSlot, validToSlot, COLLATERAL_UTXO, AssetType.ada(), null);
         return new Convert(universe, request, loan, remainingDebt, equity, leg);
     }
 

@@ -388,12 +388,16 @@ jobs:
       # pay-in-advance evaluates offline through two rig oracles, a shared oracle credential is refused by name, and
       # the token→ADA build is pinned byte-identical) re-measured cold keyless on feat/fab-211-213-214-seams,
       # 2026-11-13: 248 files / 2847 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 248.
+      # FAB-223-1 (ConvertTokenToTokenRigTest: a NIGHT→USDM convert evaluates offline through two rig oracles, one
+      # oracle leg per token, with the shared-credential and leg-credential refusals by name and the token→ADA
+      # convert pinned byte-identical) re-measured cold keyless on feat/fab-211-213-214-seams, 2026-11-13:
+      # 249 files / 2867 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 249.
       #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '248'
+          RESULT_FILE_FLOOR: '249'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET

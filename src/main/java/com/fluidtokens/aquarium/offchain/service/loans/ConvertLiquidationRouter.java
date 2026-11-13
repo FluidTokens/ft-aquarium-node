@@ -245,14 +245,18 @@ public class ConvertLiquidationRouter {
         return time.toInstant(ZoneOffset.UTC).toEpochMilli();
     }
 
-    /** The feed for a non-ada leg, refused by name rather than defaulted when it is absent. */
-    private static OraclePriceFeed feedOf(Map<String, OracleEntry> oracles, AssetType asset, AssetType oracleToken) {
+    /**
+     * The oracle entry for a non-ada leg, refused by name rather than defaulted when it is absent. FAB-223: the
+     * ENTRY, not only its feed — the builder needs a token principal's reference input, withdrawal and
+     * signatures as well as its price.
+     */
+    private static OracleEntry entryOf(Map<String, OracleEntry> oracles, AssetType asset, AssetType oracleToken) {
         OracleEntry entry = OracleEntry.namedForLeg(oracles, asset, oracleToken);
         if (entry == null) {
             throw new IllegalStateException("no oracle feed for " + oracleToken.toUnit() + " pricing "
                     + asset.toUnit() + "; the loan's figures cannot be derived at the body's validFrom");
         }
-        return entry.feed();
+        return entry;
     }
 
     /** {@code feed.usableOver(from, to)}, or a {@link FeedWindowException} naming the leg and both windows. */
@@ -483,10 +487,12 @@ public class ConvertLiquidationRouter {
         long figuresAtMillis = millisOf(converters.slot().slotToTime(slots[0]));
         BigInteger remainingDebt = LoanFinance.remainingDebt(loan, figuresAtMillis);
         // The principal leg: ada is the synthesised 1:1 feed (retrieve_oracle_data's
-        // `expectedTokenPolicyId == ""` branch), any other principal needs its own feed.
-        OraclePriceFeed principalFeed = loan.principalAsset().isAda()
-                ? OraclePriceFeed.unit()
-                : feedOf(oraclesByOracleTokenUnit, loan.principalAsset(), loan.principalOracleAsset());
+        // `expectedTokenPolicyId == ""` branch) and has no oracle entry; any other principal needs its own
+        // entry, which the builder also needs (FAB-223) for the leg's reference input and withdrawal.
+        OracleEntry principalOracle = loan.principalAsset().isAda()
+                ? null
+                : entryOf(oraclesByOracleTokenUnit, loan.principalAsset(), loan.principalOracleAsset());
+        OraclePriceFeed principalFeed = principalOracle == null ? OraclePriceFeed.unit() : principalOracle.feed();
 
         // ⛔ FAB-183 — THE WINDOW GUARD THE OTHER TWO ROUTES ALREADY HAVE. The plain builder (V3) and the
         // pay-in-advance builder both require usableOver for each feed; this route checked only
@@ -558,7 +564,8 @@ public class ConvertLiquidationRouter {
         Transaction transaction = builder.build(new ConvertTransactionBuilder.Request(
                 loanUtxo, bondUtxo, pool.utxo(), collateralOracle, configUtxo, lmConfigUtxo, walletUtxo,
                 referenceScripts(), plan, claim, collateral, lenderBond, loan.repaymentReceipts(),
-                orderAddress(assessment.bond()), changeAddress, slots[0], slots[1], collateralUtxo));
+                orderAddress(assessment.bond()), changeAddress, slots[0], slots[1], collateralUtxo,
+                loan.principalAsset(), principalOracle));
 
         BigInteger txFee = transaction.getBody().getFee();
         ConvertAssessment verdict = economics.assess(

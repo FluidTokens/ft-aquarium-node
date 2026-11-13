@@ -23,8 +23,11 @@ import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
 import com.bloxbean.cardano.client.transaction.spec.TransactionWitnessSet;
+import com.bloxbean.cardano.client.transaction.util.TransactionUtil;
 import com.bloxbean.cardano.client.util.HexUtil;
+import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.config.HashCheckedScriptSupplier;
+import com.fluidtokens.aquarium.offchain.config.YaciConfig;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.ClaimData;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderManagerDatum;
@@ -65,6 +68,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
 
 /**
  * ⛔ FAB-134 B3b-3: one convert built through {@link ConvertTransactionBuilder}'s <b>PRODUCTION
@@ -251,6 +255,7 @@ class ConvertProductionWiringTest {
     void theReferenceScriptFeeIsChargedForEveryReferencedScriptIncludingTheOracles() throws Exception {
         Fixture f = fixture(WALLET_UTXO, null);
         Transaction priced = buildProduction(f, new HashCheckedScriptSupplier(rigScripts()));
+        // The comparison builds serve raw: HashCheckedScriptSupplier refuses to answer empty, by design.
         ScriptSupplier servesNothing = hash -> Optional.empty();
         Transaction unpriced = buildProduction(f, servesNothing);
 
@@ -338,6 +343,47 @@ class ConvertProductionWiringTest {
         assertTrue(carriesTheEvaluatorsFailure, "the build refused, but not because the evaluator failed — "
                 + "nothing in the cause chain carries the evaluator's error, so an unrelated fault satisfied "
                 + "the refusal: " + refused);
+    }
+
+    /**
+     * (k) ⛔ FAB-223: the token→ADA d832b78e convert builds the SAME transaction bytes it built before the
+     * builder learnt to carry an oracle leg per token. An ada principal contributes no reference input, no
+     * withdrawal and no probe entry, and its claim index stays 0 — so every byte of this body is unchanged.
+     * The goldens were measured at the commit before that change, through three shapes: the production
+     * constructor (two wallets) and the offline one.
+     */
+    @Test
+    void aTokenToAdaConvertBuildsTheBodyItBuiltBeforeTheTwoOracleChange() throws Exception {
+        Fixture f = fixture(WALLET_UTXO, null);
+        Transaction production = Transaction.deserialize(production(f.universe,
+                new HashCheckedScriptSupplier(rigScripts()), new Recording(aiken(f.universe))).build(f.request)
+                .serialize());
+        Transaction offline = Transaction.deserialize(new ConvertTransactionBuilder(REGISTRY, NETWORK,
+                LoanFixtures.utxoSupplier(f.universe), EvalFixtures.protocolParams(), aiken(f.universe))
+                .build(f.request).serialize());
+        Fixture large = fixture(LARGE_U, null);
+        Transaction productionLargeU = Transaction.deserialize(production(large.universe,
+                new HashCheckedScriptSupplier(rigScripts()), new Recording(aiken(large.universe)))
+                .build(large.request).serialize());
+        log.info("FAB-223 token→ADA goldens: production {} fee {} | offline {} fee {} | production large U {} fee {}",
+                TransactionUtil.getTxHash(production), production.getBody().getFee(),
+                TransactionUtil.getTxHash(offline), offline.getBody().getFee(),
+                TransactionUtil.getTxHash(productionLargeU), productionLargeU.getBody().getFee());
+
+        assertEquals("14f7ef11c0b81c8589df488463010dd66dca64caf97d136292681e2efbeb0763",
+                TransactionUtil.getTxHash(production), "the production token→ADA body moved");
+        assertEquals("10a13f151c19a60a3f23f683d1bc0332a9c1fdef1dc51e0640c2c76e7a338ae2",
+                sha256(production.serialize()), "the production token→ADA transaction bytes moved");
+        assertEquals("f2c6bcc500cf74d40104ff17f5a611fafcc076cb7a5090ac4d87aaac2c9679ab",
+                TransactionUtil.getTxHash(offline), "the offline token→ADA body moved");
+        assertEquals("94fda8e9a290a8eceac387203b85a06c92bf8d6e7bf31c505ffd20e78596c157",
+                sha256(offline.serialize()), "the offline token→ADA transaction bytes moved");
+        assertEquals("7ca30c6ca0c3419006266449b44eee9be06df9ee10ea3aada6c4bbf00f8c6244",
+                TransactionUtil.getTxHash(productionLargeU), "the production token→ADA body (large U) moved");
+    }
+
+    private static String sha256(byte[] bytes) throws Exception {
+        return HexUtil.encodeHexString(java.security.MessageDigest.getInstance("SHA-256").digest(bytes));
     }
 
     /**
@@ -698,6 +744,96 @@ class ConvertProductionWiringTest {
                 "the refusal must say why: " + npe.getMessage());
     }
 
+    /**
+     * (l) ⛔ FAB-223, H2: the TWO-oracle NIGHT→USDM convert ({@link ConvertTokenToTokenFixture}) built through
+     * {@code YaciConfig}'s bean method — the Spring-wired shape — with the script supplier serving both rig
+     * oracle scripts and NOTHING declared. Its referenced bytes cross the first 25,600-byte tier, where a flat
+     * per-byte rate would under-state the ledger's fee; the fee must cover the TIERED reference-script fee for
+     * every referenced script, and the principal oracle's MARGINAL share of it on its own (CCL trap 9: a
+     * partial declaration prices only what it declares).
+     */
+    @Test
+    void theTwoOracleConvertThroughTheSpringBeanPricesBothOracleScriptsAtTheTieredFee() throws Exception {
+        ConvertTokenToTokenFixture t = ConvertTokenToTokenFixture.spec().build();
+        ConvertTokenToTokenFixture.Recording evaluator = new ConvertTokenToTokenFixture.Recording(t.aiken());
+        Transaction priced = Transaction.deserialize(bean(t, new HashCheckedScriptSupplier(t.scripts()), evaluator)
+                .build(t.request).serialize());
+        assertEquals(1, evaluator.calls.get(), "exactly one evaluation: pass 2's (CCL trap 23)");
+
+        List<Redeemer> redeemers = priced.getWitnessSet().getRedeemers();
+        assertEquals(9, redeemers.size(), "two spends, one burn, six withdrawals (both oracles included)");
+        for (Redeemer redeemer : redeemers) {
+            String key = redeemer.getTag() + "#" + redeemer.getIndex();
+            EvaluationResult costing = evaluator.last.get().stream()
+                    .filter(r -> r.getRedeemerTag() == redeemer.getTag()
+                            && r.getIndex() == redeemer.getIndex().intValue())
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError("no evaluation for " + key));
+            assertEquals(costing.getExUnits().getMem(), redeemer.getExUnits().getMem(), "declared mem for " + key);
+            assertEquals(costing.getExUnits().getSteps(), redeemer.getExUnits().getSteps(), "declared steps for " + key);
+            assertTrue(redeemer.getExUnits().getMem().compareTo(PLACEHOLDER_MEM) > 0,
+                    key + " carries CCL's 10000-mem placeholder: the evaluator was not load-bearing");
+        }
+        Set<String> referenced = new HashSet<>();
+        for (TransactionInput input : priced.getBody().getReferenceInputs()) {
+            Utxo utxo = t.utxoAt(input);
+            if (utxo.getReferenceScriptHash() != null) {
+                referenced.add(utxo.getReferenceScriptHash());
+            }
+        }
+        assertEquals(8, referenced.size(), "the six loans-v4 slots and both rig oracles, all by reference: " + referenced);
+        assertTrue(referenced.contains(t.collateralRig.scriptHash()) && referenced.contains(t.principalRig.scriptHash()),
+                "both rig oracle scripts travel by reference");
+        Set<String> witnessed = witnessedScriptHashes(priced.getWitnessSet());
+        witnessed.retainAll(referenced);
+        assertTrue(witnessed.isEmpty(), "scripts both witnessed and referenced: " + witnessed);
+
+        long regBytes = ConvertTokenToTokenFixture.registryScriptBytes();
+        long a = t.collateralRig.script().scriptRefBytes().length;
+        long b = t.principalRig.script().scriptRefBytes().length;
+        long total = regBytes + a + b;
+        BigInteger flat = perByte().multiply(BigDecimal.valueOf(total)).setScale(0, RoundingMode.FLOOR)
+                .toBigIntegerExact();
+        assertTrue(total > 25_600, "the referenced bytes (" + total + ") must cross the first tier");
+        assertTrue(refScriptFee(total).subtract(flat).compareTo(tolerance()) > 0,
+                "the tier must be visible above the tolerance: tiered " + refScriptFee(total) + ", flat " + flat);
+
+        // The comparison builds serve raw: HashCheckedScriptSupplier refuses to answer empty, by design.
+        ScriptSupplier servesNothing = hash -> Optional.empty();
+        Transaction unpriced = Transaction.deserialize(bean(t, servesNothing,
+                new ConvertTokenToTokenFixture.Recording(t.aiken())).build(t.request).serialize());
+        ScriptSupplier every = t.scripts();
+        String principalRig = t.principalRig.scriptHash();
+        ScriptSupplier allButThePrincipalRig = hash -> principalRig.equals(hash) ? Optional.empty() : every.getScript(hash);
+        Transaction withoutPrincipal = Transaction.deserialize(bean(t, allButThePrincipalRig,
+                new ConvertTokenToTokenFixture.Recording(t.aiken())).build(t.request).serialize());
+
+        BigInteger all = priced.getBody().getFee();
+        BigInteger allDelta = all.subtract(unpriced.getBody().getFee());
+        BigInteger principalDelta = all.subtract(withoutPrincipal.getBody().getFee());
+        BigInteger principalShare = refScriptFee(total).subtract(refScriptFee(regBytes + a));
+        log.info("FAB-223 two-oracle convert ref-script fee: priced {} unpriced {} without-principal {} | registry {} B "
+                        + "+ oracles {} B + {} B = {} B, tiered {} flat {}, principal share {}",
+                all, unpriced.getBody().getFee(), withoutPrincipal.getBody().getFee(), regBytes, a, b, total,
+                refScriptFee(total), flat, principalShare);
+        assertTrue(allDelta.compareTo(refScriptFee(total).subtract(tolerance())) >= 0,
+                "the reference-script fee charged (" + allDelta + ") is below the TIERED Conway fee for all eight "
+                        + "referenced scripts (" + refScriptFee(total) + ")");
+        assertTrue(principalDelta.compareTo(principalShare.subtract(tolerance())) >= 0,
+                "the principal oracle's script was not priced: the fee moved by " + principalDelta
+                        + " when the supplier stopped serving its " + b + " bytes, against a share of " + principalShare);
+    }
+
+    /** {@code YaciConfig}'s convert builder bean method, as the container calls it, on the token→token fixture. */
+    private static ConvertTransactionBuilder bean(ConvertTokenToTokenFixture t, ScriptSupplier scripts,
+                                                  TransactionEvaluator evaluator) {
+        AppConfig.Network mainnet = new AppConfig.Network();
+        mainnet.setNetworkForTest("mainnet");
+        return new YaciConfig().convertTransactionBuilder(ConvertTokenToTokenFixture.REGISTRY, mainnet,
+                LoanFixtures.utxoSupplier(t.universe), EvalFixtures.protocolParams(), scripts, evaluator,
+                mock(OracleReferenceInputProbe.class));
+    }
+
     // ======================================================================================
     // The rig's leaves
     // ======================================================================================
@@ -894,7 +1030,7 @@ class ConvertProductionWiringTest {
                 bond.lenderStakeCredential(), LOAN_ID, NETWORK);
         var request = new ConvertTransactionBuilder.Request(loanUtxo, bondUtxo, poolUtxo, entry, configUtxo,
                 lmConfigUtxo, wallet, referenceScripts, plan, claim, FLDT, lenderBond, loan.repaymentReceipts(),
-                orderAddress, BOT_ADDRESS, validFromSlot, validToSlot, collateral);
+                orderAddress, BOT_ADDRESS, validFromSlot, validToSlot, collateral, AssetType.ada(), null);
         return new Fixture(universe, request);
     }
 
