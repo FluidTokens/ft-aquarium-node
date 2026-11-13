@@ -2,13 +2,16 @@ package com.fluidtokens.aquarium.offchain.service.loans;
 
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.MinswapPoolDatum;
+import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
 import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -148,5 +151,21 @@ class AnticipateAndSellTest {
         AnticipateAndSell hybrid = estimate(BigInteger.valueOf(900_000L), List.of());
         assertFalse(hybrid.known());
         assertNull(hybrid.netInPrincipal(), "a missing pool must never be reported as a zero net");
+    }
+
+    /**
+     * The order's 4 ADA in the units the estimate's net is in: lovelace for an ada principal, and for a token
+     * principal through its feed, rounded up, because a cost may err high but never low.
+     */
+    @Test
+    void theOrderCostIsPricedInThePrincipalsUnits() {
+        assertEquals(BigInteger.valueOf(4_000_000L), AnticipateAndSell.orderCostInPrincipal(ADA, null));
+        assertEquals(BigInteger.valueOf(2_000_000L), AnticipateAndSell.orderCostInPrincipal(TOKEN,
+                OraclePriceFeed.aggregated(TOKEN, BigInteger.TWO, BigInteger.ONE, 0L, 1L)));
+        assertEquals(BigInteger.valueOf(1_333_334L), AnticipateAndSell.orderCostInPrincipal(TOKEN,
+                OraclePriceFeed.aggregated(TOKEN, BigInteger.valueOf(3L), BigInteger.ONE, 0L, 1L)));
+        IllegalArgumentException refused = assertThrows(IllegalArgumentException.class,
+                () -> AnticipateAndSell.orderCostInPrincipal(TOKEN, null));
+        assertTrue(refused.getMessage().contains(TOKEN.toUnit()), refused.getMessage());
     }
 }

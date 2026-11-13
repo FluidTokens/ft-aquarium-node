@@ -29,6 +29,7 @@ import com.fluidtokens.aquarium.offchain.service.loans.MarketGate;
 import com.fluidtokens.aquarium.offchain.service.loans.MinswapPoolResolver;
 import com.fluidtokens.aquarium.offchain.service.loans.PoolUsability;
 import com.fluidtokens.aquarium.offchain.service.loans.TokenMetadataService;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletRoles;
 import com.fluidtokens.aquarium.offchain.util.LedgerCeilings;
 import com.fluidtokens.aquarium.offchain.util.WalletInputSelection;
 import lombok.extern.slf4j.Slf4j;
@@ -1099,11 +1100,34 @@ public class LiquidationReadinessController {
      */
     static FundsCheck fundsCheck(WalletBalance wallet, AssetType principal, Optional<BigInteger> feeCeiling,
                                  BigInteger advance, Function<BigInteger, String> amount) {
+        return fundsCheck(wallet, principal, feeCeiling, null, advance, amount);
+    }
+
+    /**
+     * ⛔ FAB-226's per-shape rule: the floor the token is split at depends on the loan's collateral. For a
+     * token collateral it is {@link WalletInputSelection#tokenPrincipalRequiredAda} (the fee ceiling plus the
+     * 2 ADA min-ada rider). For an ada collateral the seized ada pays the transaction's ada needs, so the token
+     * output carries only the shortfall, floored at the 2 ADA min-ada ceiling:
+     * {@link WalletRoles#adaCollateralTokenOutputRequiredAda}. The executor's market gate and selector split at
+     * exactly that floor, so the page does too — a 3-ADA token output the bot funds must never read
+     * {@code consolidate} here.
+     *
+     * @param adaCollateralSeized the ada an ada collateral's liquidation seizes (collateral − equity), or null for
+     *                            a token collateral or unknown figures, which keeps the token-collateral floor
+     * @param amount              renders a quantity of the principal, unit included — the page's scaled amounts
+     */
+    static FundsCheck fundsCheck(WalletBalance wallet, AssetType principal, Optional<BigInteger> feeCeiling,
+                                 BigInteger adaCollateralSeized, BigInteger advance,
+                                 Function<BigInteger, String> amount) {
         if (principal.isAda() || !wallet.known()) {
             return new FundsCheck(wallet.of(principal.toUnit()), null, null);
         }
+        BigInteger requiredAda = adaCollateralSeized == null
+                ? WalletInputSelection.tokenPrincipalRequiredAda(feeCeiling)
+                : WalletRoles.adaCollateralTokenOutputRequiredAda(feeCeiling.orElse(BigInteger.ZERO),
+                        adaCollateralSeized);
         WalletInputSelection.TokenHolding holding = WalletInputSelection.tokenHolding(wallet.utxos(), principal,
-                WalletInputSelection.tokenPrincipalRequiredAda(feeCeiling));
+                requiredAda);
         if (advance == null) {
             return new FundsCheck(holding.spendable(), null, null);
         }
@@ -1114,6 +1138,26 @@ public class LiquidationReadinessController {
         String label = holding.spendable().add(holding.belowAdaFloor()).compareTo(advance) >= 0
                 ? "consolidate" : "funds";
         return new FundsCheck(holding.spendable(), label, note);
+    }
+
+    /**
+     * The ada an ada collateral's pay-in-advance seizes — the {@code seized} of
+     * {@link WalletRoles#adaCollateralTokenOutputRequiredAda} — or null when that floor does not apply. The
+     * executor's is {@code collateralAmount − assessment.equity()}; the page uses its own figures at render time,
+     * because the scan's equity exists only for a buildable assessment and the page asks the forward question
+     * (could the bot handle this loan if it crossed the threshold?). A null keeps the token-collateral floor, as
+     * the executor's null equity does.
+     *
+     * @return {@code collateralAmount − figures.equity()} for an ada collateral against a token principal with
+     *         known figures, else null
+     */
+    static BigInteger adaCollateralSeized(com.fluidtokens.aquarium.offchain.model.loans.LoanDatum datum,
+                                          BigInteger collateralAmount,
+                                          LiquidatePayInAdvanceTransactionBuilder.Numbers figures) {
+        if (datum.collateral().isAda() && !datum.principalAsset().isAda() && figures != null) {
+            return collateralAmount.subtract(figures.equity());
+        }
+        return null;
     }
 
     /**
@@ -1198,6 +1242,11 @@ public class LiquidationReadinessController {
             }
         }
 
+        // The loan's figures, once: the anticipate estimate and the funds floor read the same ones. A plain or
+        // bond-less row computes none.
+        LiquidatePayInAdvanceTransactionBuilder.Numbers figures = bondRoute == BondRoute.CONVERT
+                ? numbersFor(loan, bond, now) : null;
+
         // ---- the route, and the capital an advance would need -------------------------------------
         String route;
         String routeDetail;
@@ -1264,14 +1313,20 @@ public class LiquidationReadinessController {
             // ⛔ SHOWN ON EVERY CONVERTIBLE ROW, not only where CONVERT was refused. The operator's
             // question is "which route pays better here", and that cannot be answered by a number
             // that only appears once the other route has already failed.
-            var numbers = numbersFor(loan, bond, now);
+            var numbers = figures;
             anticipate = numbers == null
                     ? AnticipateAndSell.unknown("this loan's figures could not be priced, so the "
                             + "estimate is not known")
                     : AnticipateAndSell.estimate(collateralAsset, datum.principalAsset(),
                             numbers.collateralLenderShouldReceive(), numbers.liquidationFee(),
                             numbers.convertedLoanCollateralToPrincipalAmount(),
-                            null, fetched.datums());
+                            // FAB-227: the order's 4 ADA in the principal's units, through the entry numbersFor
+                            // priced the loan with. Figures for a token principal imply that entry exists.
+                            AnticipateAndSell.orderCostInPrincipal(datum.principalAsset(),
+                                    datum.principalAsset().isAda() ? null
+                                            : principalOracleEntry(client, datum).map(OracleEntry::feed)
+                                                    .orElse(null)),
+                            fetched.datums());
         }
 
         // ⛔ COMPUTED FROM THE EFFECTIVE STATE, never the configured one: the node mode is a ceiling,
@@ -1282,7 +1337,9 @@ public class LiquidationReadinessController {
         // FAB-128: a token principal is counted as the bot counts it, and a shortfall caused by the ada
         // floor says so — in the page's own scaled amounts.
         String principalUnit = datum.principalAsset().toUnit();
-        FundsCheck funds = fundsCheck(wallet, datum.principalAsset(), feeCeiling, advance,
+        // FAB-226: an ada collateral's token principal is counted at that shape's floor, as the executor counts it.
+        FundsCheck funds = fundsCheck(wallet, datum.principalAsset(), feeCeiling,
+                adaCollateralSeized(datum, loan.collateralAmount(), figures), advance,
                 noteAmounts(q -> display(principalUnit, q, metadataMemo)));
         ProcessingBlocker blocker = ProcessingBlocker.of(
                 gate.effectiveMode(datum.principalAsset()), gate.actionFor(datum.principalAsset()),
@@ -1774,8 +1831,10 @@ public class LiquidationReadinessController {
         // ⛔ FAB-227: an ada collateral has no collateral oracle leg and none is looked up. Both routes build an
         // ada collateral against a token principal (convert since FAB-224, pay-in-advance since FAB-226) and price
         // it 1:1, as retrieve_oracle_data does for the empty policy id; numbers() applies that unit feed for an
-        // ada collateral whatever entry it is handed, so null is passed, exactly as the builder documents. The
-        // ADA/ADA row never reaches a pool verdict or an advance: its route and usabilityFor stop it first.
+        // ada collateral whatever entry it is handed, so null is passed, exactly as the builder documents. An
+        // ADA/ADA row shows the pool fetch's own verdict when the fetch is unavailable (NO_POOL, NOT_CONFIGURED or
+        // CHECK_FAILED, returned before any figures are used); were a pool ever fetched, usabilityFor's ADA/ADA
+        // guard returns UNKNOWN with ADA_AGAINST_ADA_NOT_LIQUIDATED before computing a verdict.
         boolean adaCollateral = loan.datum().collateral().isAda();
         Optional<OracleEntry> oracle = adaCollateral ? Optional.empty()
                 : client.findEntryByOracleToken(loan.datum().collateral().oracleTokenAsset())
@@ -1786,8 +1845,7 @@ public class LiquidationReadinessController {
         AssetType principalAsset = loan.datum().principalAsset();
         OracleEntry principalOracle = null;
         if (!principalAsset.isAda()) {
-            Optional<OracleEntry> principalEntry = client.findEntryByOracleToken(loan.datum().principalOracleAsset())
-                    .filter(e -> e.token().equals(principalAsset));
+            Optional<OracleEntry> principalEntry = principalOracleEntry(client, loan.datum());
             if (principalEntry.isEmpty()) {
                 return null;
             }
@@ -1802,5 +1860,16 @@ public class LiquidationReadinessController {
             log.debug("could not compute this loan's figures for {}: {}", loan.utxoRef(), e.toString());
             return null;
         }
+    }
+
+    /**
+     * The principal's oracle entry, by the NFT the datum names and only if it prices the principal — the one
+     * lookup {@link #numbersFor} prices the loan with and the anticipate estimate's order cost is converted
+     * through, so the two cannot diverge. Empty when no entry is indexed or it prices another asset.
+     */
+    private static Optional<OracleEntry> principalOracleEntry(
+            FluidOracleClient client, com.fluidtokens.aquarium.offchain.model.loans.LoanDatum datum) {
+        return client.findEntryByOracleToken(datum.principalOracleAsset())
+                .filter(e -> e.token().equals(datum.principalAsset()));
     }
 }

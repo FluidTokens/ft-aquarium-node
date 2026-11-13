@@ -2162,6 +2162,94 @@ class LiquidationReadinessControllerTest {
     }
 
     /**
+     * FAB-227: the render loan on an ANTICIPATE market over a wallet whose token output carries 3 ADA. The bot's
+     * market gate and selector count the token at this shape's floor
+     * ({@code WalletRoles.adaCollateralTokenOutputRequiredAda}): the seized 210,000,000 (collateral − equity)
+     * covers every ada need, so the floor is the 2 ADA min-ada ceiling and the row is clean. One lovelace under
+     * it the token sits behind the floor, and the row says consolidate.
+     */
+    @Test
+    void anAdaCollateralAnticipateRowCountsATwoAdaTokenOutputAsTheBotDoes() {
+        LiquidationReadinessController.Row row = renderAdaCollateralTokenPrincipalAnticipateRow(3_000_000L);
+
+        assertEquals("CAPITAL IN ADVANCE", row.route(), row.routeDetail());
+        assertEquals(BigInteger.valueOf(97_500_000L), row.advancePrincipalAmount());
+        assertFalse(row.blocker().blocked(), row.blocker().toString());
+
+        LiquidationReadinessController.Row thin = renderAdaCollateralTokenPrincipalAnticipateRow(1_999_999L);
+
+        assertEquals("consolidate", thin.blocker().label(), thin.blocker().toString());
+        assertTrue(thin.blocker().detail().contains("less than 2000000 lovelace"), thin.blocker().detail());
+    }
+
+    /**
+     * FAB-227: the anticipate estimate's order cost is the order's 4 ADA in the principal's own units. A token
+     * principal priced at 2 lovelace per unit pays 2,000,000 of it; an ada principal pays 4,000,000 lovelace.
+     */
+    @Test
+    void aTokenPrincipalRowPricesTheAnticipateOrderCostInThePrincipal() {
+        LiquidationReadinessController.Row tokenPrincipal = renderAdaCollateralTokenPrincipalRow(liveConfiguration(),
+                PoolIndex.of(adaPrincipalTokenPool("10000000000000")).resolver());
+
+        String tokenDetail = tokenPrincipal.anticipateAndSell().detail();
+        assertTrue(tokenDetail.contains(" paid to the lender and 2000000 of order cost"), tokenDetail);
+        assertFalse(tokenDetail.contains(" and 4000000 of order cost"), tokenDetail);
+
+        LiquidationReadinessController.Row adaPrincipal = renderTokenConvertRow(liveConfiguration(),
+                PoolIndex.of(deepRenderPool()).resolver(), true);
+
+        String adaDetail = adaPrincipal.anticipateAndSell().detail();
+        assertTrue(adaDetail.contains(" paid to the lender and 4000000 of order cost"), adaDetail);
+    }
+
+    /**
+     * FAB-227 (A1): {@code numbersFor} returns figures for an ada collateral, so for ada against ada only
+     * {@code usabilityFor}'s own guard keeps a pool verdict from being computed. Handed a pool, the verdict is
+     * UNKNOWN with the ada-against-ada reason.
+     */
+    @Test
+    void anAdaAgainstAdaLoanHandedAPoolGetsNoPoolVerdict() {
+        LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(50_000_000L),
+                BigInteger.ZERO, LoanFixtures.adaCollateral(), 0L,
+                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+        Loan loan = new Loan("f0".repeat(32), 0, "addr_test1_placeholder", "loanid00",
+                BigInteger.valueOf(300_000_000L), BigInteger.valueOf(3_000_000L), datum);
+        LenderBond bond = new LenderBond("f0".repeat(32), 1, "addr_test1_placeholder", "loanid00", "",
+                LoanFixtures.bondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(), AssetType.ada()));
+        LiquidationReadinessController controller = controllerWith(new FakeOracleClient(), LoanFixtures.registry());
+        var pool = new com.fluidtokens.aquarium.offchain.model.loans.MinswapPoolDatum(AssetType.ada(),
+                COLLATERAL_TOKEN, BigInteger.TEN, new BigInteger("10000000000000"),
+                new BigInteger("10000000000000"), BigInteger.valueOf(30L), BigInteger.valueOf(30L), false);
+
+        var usability = controller.usabilityFor(new LiquidationReadinessController.PoolFetch(List.of(pool), null),
+                loan, bond, AssetType.ada(), AssetType.ada(), 1_000L);
+
+        assertEquals(PoolUsability.Verdict.UNKNOWN, usability.verdict(), usability.detail());
+        assertEquals(LiquidationReadinessController.ADA_AGAINST_ADA_NOT_LIQUIDATED, usability.detail());
+    }
+
+    /**
+     * FAB-227: the render loan of {@link #renderAdaCollateralTokenPrincipalRow} on an ANTICIPATE market, against a
+     * known wallet (50 ADA ada-only, and 150,000,000 {@link #PRINCIPAL_TOKEN} beside {@code tokenOutputLovelace})
+     * and {@code LoanFixtures.protocolParams()}'s fee ceiling.
+     */
+    private static LiquidationReadinessController.Row renderAdaCollateralTokenPrincipalAnticipateRow(
+            long tokenOutputLovelace) {
+        var configuration = liveConfiguration();
+        configuration.setMarkets(List.of(anticipateMarket(PRINCIPAL_TOKEN.toUnit(), 1_000_000_000_000L)));
+        var utxos = org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.service.AppUtxoService.class);
+        org.mockito.Mockito.when(utxos.listWalletUtxo()).thenReturn(List.of(walletUtxo(50_000_000L),
+                tokenUtxo("ab", tokenOutputLovelace, PRINCIPAL_TOKEN, 150_000_000L)));
+        return renderLiquidatable(
+                LoanFixtures.convertToPrincipalBondDatum(BigInteger.valueOf(50),
+                        LoanFixtures.noStakeCredential(), PRINCIPAL_TOKEN),
+                LoanFixtures.adaCollateral(), configuration, null,
+                new com.fluidtokens.aquarium.offchain.service.LendingConfigGate(), true,
+                new FakeOracleClient(principalMultisigOracle()), null,
+                PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_NFT, utxos, LoanFixtures.protocolParams()).row();
+    }
+
+    /**
      * The collateral predicate at the call site, through readiness(): a liquidatable TOKEN-collateral loan on a
      * CONVERT bond must never be told "ada collateral". (Round-2 audit: both render rows above are ada, so the
      * call site's {@code isAda()} could be replaced by {@code true} and survive.)
@@ -3090,7 +3178,7 @@ class LiquidationReadinessControllerTest {
         assertEquals("consolidate", check.label(), check.toString());
         assertTrue(check.detail().contains("less than 2000000 lovelace (2 ADA) each"), check.detail());
         assertTrue(check.detail().contains("the fee ceiling was unavailable this cycle, so this floor leaves "
-                + "it out and the real one is higher"), check.detail());
+                + "it out and the real one may be higher"), check.detail());
     }
 
     /** An unpriced advance has nothing to compare against: the spendable count, no override. */
@@ -3101,6 +3189,78 @@ class LiquidationReadinessControllerTest {
 
         assertEquals(BigInteger.ZERO, check.balance());
         assertNull(check.label(), check.toString());
+    }
+
+    /**
+     * ⛔ FAB-226's per-shape rule: for an ada collateral the bot counts the token at
+     * {@code WalletRoles.adaCollateralTokenOutputRequiredAda(fee ceiling, seized)}, so the page does too. Seized
+     * 210,000,000 covers every ada need and the floor is 2 ADA; seized 1,000,000 leaves 6,905,077; no seized
+     * figure keeps the token-collateral floor, 4,405,077.
+     */
+    @Test
+    void fundsCheckForAnAdaCollateralCountsTheTokenAtThatShapesFloor() {
+        BigInteger seized = BigInteger.valueOf(210_000_000L);
+        LiquidationReadinessController.FundsCheck atFloor = LiquidationReadinessController.fundsCheck(
+                adaCollateralWallet(2_000_000L), NIGHT, FEE_CEILING, seized, MEASURED_ADVANCE,
+                LiquidationReadinessControllerTest::night);
+        assertEquals(BigInteger.valueOf(15_000_000_000L), atFloor.balance(), atFloor.toString());
+        assertNull(atFloor.label(), atFloor.toString());
+
+        LiquidationReadinessController.FundsCheck under = LiquidationReadinessController.fundsCheck(
+                adaCollateralWallet(1_999_999L), NIGHT, FEE_CEILING, seized, MEASURED_ADVANCE,
+                LiquidationReadinessControllerTest::night);
+        assertEquals(BigInteger.ZERO, under.balance(), under.toString());
+        assertEquals("consolidate", under.label(), under.toString());
+        assertTrue(under.detail().contains("carrying less than 2000000 lovelace (2 ADA) each"), under.detail());
+        assertTrue(under.detail().contains("when it is ada, whatever of the fee ceiling"), under.detail());
+
+        BigInteger small = BigInteger.valueOf(1_000_000L);
+        assertEquals(BigInteger.valueOf(15_000_000_000L), LiquidationReadinessController.fundsCheck(
+                adaCollateralWallet(6_905_077L), NIGHT, FEE_CEILING, small, MEASURED_ADVANCE,
+                LiquidationReadinessControllerTest::night).balance());
+        assertEquals(BigInteger.ZERO, LiquidationReadinessController.fundsCheck(
+                adaCollateralWallet(6_905_076L), NIGHT, FEE_CEILING, small, MEASURED_ADVANCE,
+                LiquidationReadinessControllerTest::night).balance());
+
+        assertEquals(BigInteger.ZERO, LiquidationReadinessController.fundsCheck(
+                adaCollateralWallet(2_000_000L), NIGHT, FEE_CEILING, null, MEASURED_ADVANCE,
+                LiquidationReadinessControllerTest::night).balance(),
+                "no seized figure keeps the token-collateral floor, 4,405,077");
+    }
+
+    /** 50 ADA ada-only, and 15,000 NIGHT beside {@code lovelace}. */
+    private static WalletBalance adaCollateralWallet(long lovelace) {
+        return WalletBalance.of(List.of(walletUtxo(50_000_000L), tokenUtxo("ab", lovelace, NIGHT,
+                15_000_000_000L)), T0);
+    }
+
+    /**
+     * The seized ada is the collateral less the equity, exactly as the executor computes it, and only for the
+     * shape whose floor it sets: an ada collateral against a token principal. Anything else, or no figures, is
+     * null, which keeps the token-collateral floor.
+     */
+    @Test
+    void theSeizedAdaIsTheCollateralLessTheEquityOnlyForAnAdaCollateralAgainstATokenPrincipal() {
+        var figures = new LiquidatePayInAdvanceTransactionBuilder.Numbers(BigInteger.ONE,
+                BigInteger.valueOf(90_000_000L), BigInteger.valueOf(15_000_000L), BigInteger.valueOf(195_000_000L),
+                BigInteger.valueOf(97_500_000L));
+        BigInteger collateral = BigInteger.valueOf(300_000_000L);
+        LoanDatum adaAgainstToken = LoanFixtures.loanDatum(PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_NFT,
+                BigInteger.valueOf(100_000_000L), BigInteger.ZERO, LoanFixtures.adaCollateral(), 0L,
+                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+        LoanDatum tokenAgainstToken = LoanFixtures.loanDatum(PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_NFT,
+                BigInteger.valueOf(100_000_000L), BigInteger.ZERO,
+                LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT), 0L,
+                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+        LoanDatum adaAgainstAda = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(100_000_000L),
+                BigInteger.ZERO, LoanFixtures.adaCollateral(), 0L,
+                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+
+        assertEquals(BigInteger.valueOf(210_000_000L),
+                LiquidationReadinessController.adaCollateralSeized(adaAgainstToken, collateral, figures));
+        assertNull(LiquidationReadinessController.adaCollateralSeized(tokenAgainstToken, collateral, figures));
+        assertNull(LiquidationReadinessController.adaCollateralSeized(adaAgainstAda, collateral, figures));
+        assertNull(LiquidationReadinessController.adaCollateralSeized(adaAgainstToken, collateral, null));
     }
 
     /** What the ROW renders the note's amounts with: the call site's own formatter, over the NIGHT display. */
