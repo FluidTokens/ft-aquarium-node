@@ -21,6 +21,8 @@ import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
 import com.bloxbean.cardano.client.transaction.spec.Withdrawal;
 import com.bloxbean.cardano.client.util.HexUtil;
+import com.bloxbean.cardano.yaci.store.common.domain.Amt;
+import com.bloxbean.cardano.yaci.store.utxo.storage.impl.model.AddressUtxoEntity;
 import com.fluidtokens.aquarium.offchain.config.HashCheckedScriptSupplier;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.ClaimData;
@@ -586,5 +588,97 @@ final class ConvertTokenToTokenFixture {
             last.set(result.getValue());
             return result;
         }
+    }
+
+    // ======================================================================================
+    // FAB-223-2: what a real executor cycle needs beyond the builder's leaves
+    // ======================================================================================
+
+    /**
+     * The recorded USDM/STRIKE Minswap V2 pool (PROVENANCE, "STRIKE/USDM (POOL_TOO_THIN)"): asset_a USDM, asset_b
+     * STRIKE, at the NIGHT/USDM pool's address.
+     */
+    static final TransactionInput USDM_STRIKE_POOL_REF = new TransactionInput(
+            "8a25925a77299042c98aa91f7e061dfd395d9d1dfe01b8b4d38a7add2230ed90", 1);
+    static final String USDM_STRIKE_POOL_LP_ASSET_NAME =
+            "a0b3b8315e895f4fd22b780c24e2c87e3345e67f7fa99b408274ed8f6a4aa20d";
+    /** The pool's recorded value, in full: lovelace, USDM, STRIKE, the pool NFT and the LP tokens. */
+    static final List<Amount> USDM_STRIKE_POOL_VALUE = List.of(
+            Amount.lovelace(BigInteger.valueOf(4_500_000L)),
+            Amount.asset(USDM.toUnit(), BigInteger.valueOf(7_606_291L)),
+            Amount.asset(StrikeUsdmFixture.STRIKE.toUnit(), BigInteger.valueOf(6_471_257L)),
+            Amount.asset(MS_POOL_POLICY + ConvertTxEncoder.POOL_NFT_ASSET_NAME, BigInteger.ONE),
+            Amount.asset(MS_POOL_POLICY + USDM_STRIKE_POOL_LP_ASSET_NAME, new BigInteger("9223372036854775807")));
+
+    /** The recorded NIGHT/USDM pool UTxO: recorded coordinate, address, full value and datum. */
+    static Utxo nightUsdmPoolUtxo() {
+        return LoanFixtures.utxo(POOL_REF.getTransactionId(), POOL_REF.getIndex(), POOL_ADDRESS, POOL_VALUE,
+                LoanFixtures.fixture("mainnet-minswap-pool-night-usdm.hex"));
+    }
+
+    /** The recorded USDM/STRIKE pool UTxO: recorded coordinate, address, full value and datum. */
+    static Utxo usdmStrikePoolUtxo() {
+        return LoanFixtures.utxo(USDM_STRIKE_POOL_REF.getTransactionId(), USDM_STRIKE_POOL_REF.getIndex(),
+                POOL_ADDRESS, USDM_STRIKE_POOL_VALUE, LoanFixtures.fixture("mainnet-minswap-pool-usdm-strike.hex"));
+    }
+
+    /** A pool UTxO as the index row {@link MinswapPoolResolver} reads: its coordinate, address, datum and value. */
+    static AddressUtxoEntity poolIndexRow(Utxo pool) {
+        var row = new AddressUtxoEntity();
+        row.setTxHash(pool.getTxHash());
+        row.setOutputIndex(pool.getOutputIndex());
+        row.setOwnerAddr(pool.getAddress());
+        row.setOwnerPaymentCredential(MS_POOL_SPEND);
+        row.setInlineDatum(pool.getInlineDatum());
+        List<Amt> amounts = new ArrayList<>();
+        for (Amount amount : pool.getAmount()) {
+            var amt = new Amt();
+            amt.setUnit(amount.getUnit());
+            amt.setQuantity(amount.getQuantity());
+            amounts.add(amt);
+        }
+        row.setAmounts(amounts);
+        return row;
+    }
+
+    /** The six registry reference-script UTxOs at the synthetic {@code a1…}–{@code a6…}, as the universe holds them. */
+    static List<Utxo> referenceScriptUtxos() {
+        List<Utxo> utxos = new ArrayList<>();
+        for (int i = 0; i < REGISTRY_SCRIPTS.size(); i++) {
+            String hash = hashOf(REGISTRY_SCRIPTS.get(i));
+            TransactionInput at = new TransactionInput(String.format("a%d", i + 1).repeat(32), 0);
+            utxos.add(Utxo.builder().txHash(at.getTransactionId()).outputIndex(at.getIndex())
+                    .address(entAddress(hash))
+                    .amount(List.of(Amount.lovelace(BigInteger.valueOf(20_000_000L))))
+                    .referenceScriptHash(hash).build());
+        }
+        return utxos;
+    }
+
+    /** The same six coordinates in the {@code loans.liquidation.reference-scripts.*} slots, convert action included. */
+    static LiquidateTransactionBuilder.ReferenceScripts referenceScriptSlots() {
+        Map<String, TransactionInput> at = new LinkedHashMap<>();
+        for (Utxo utxo : referenceScriptUtxos()) {
+            at.put(utxo.getReferenceScriptHash(), new TransactionInput(utxo.getTxHash(), utxo.getOutputIndex()));
+        }
+        return new LiquidateTransactionBuilder.ReferenceScripts(at.get(REGISTRY.getLoanPolicyId()),
+                at.get(REGISTRY.getLoanSpendScriptHash()), at.get(REGISTRY.getLenderManagerWithdrawScriptHash()),
+                at.get(REGISTRY.getLenderManagerSpendScriptHash()), at.get(REGISTRY.getLoanClaimActionScriptHash()),
+                null, null, null, at.get(REGISTRY.getLmLiquidateAndConvertActionScriptHash()));
+    }
+
+    /**
+     * This universe with its synthetic bot wallet ({@link #WALLET_UTXO}, {@link #COLLATERAL_UTXO}) replaced by
+     * {@code wallet}: an executor lists its own wallet, whose role C sits at the same {@code c5…#0} out-ref.
+     */
+    List<Utxo> universeWith(List<Utxo> wallet) {
+        List<Utxo> all = new ArrayList<>();
+        for (Utxo utxo : universe) {
+            if (utxo != WALLET_UTXO && utxo != COLLATERAL_UTXO) {
+                all.add(utxo);
+            }
+        }
+        all.addAll(wallet);
+        return List.copyOf(all);
     }
 }

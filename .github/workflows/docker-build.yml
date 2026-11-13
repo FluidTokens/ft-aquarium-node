@@ -392,12 +392,16 @@ jobs:
       # oracle leg per token, with the shared-credential and leg-credential refusals by name and the token→ADA
       # convert pinned byte-identical) re-measured cold keyless on feat/fab-211-213-214-seams, 2026-11-13:
       # 249 files / 2867 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 249.
+      # FAB-223-2 (ConvertTokenToTokenExecutorTest: the token→token convert through a real executor cycle, both
+      # profitability gates pinned, and the empty STRIKE/USDM pool refused POOL_TOO_THIN before any build)
+      # re-measured cold keyless on feat/fab-211-213-214-seams, 2026-11-13:
+      # 250 files / 2870 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 250.
       #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '249'
+          RESULT_FILE_FLOOR: '250'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET
