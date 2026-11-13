@@ -443,6 +443,61 @@ class ConvertEconomicsTest {
      * yaml"; the margin instead ensures nothing but the yaml can ever supply it, so a bare
      * construction fails loudly at {@code init()} rather than defaulting quietly).
      */
+    // ---- FAB-224: the equity top-up -----------------------------------------------------------
+
+    /** The 6-argument form is the 7-argument form with a zero top-up: every token shape is unchanged. */
+    @Test
+    void theSixArgumentFormIsTheSevenArgumentFormWithAZeroTopUp() {
+        ConvertEconomics e = economics(true, 0, 5_000_000L);
+
+        assertEquals(e.assess(true, BigInteger.valueOf(8_100_000_000L), 40L, true, OraclePriceFeed.unit(), ADA),
+                e.assess(true, BigInteger.valueOf(8_100_000_000L), 40L, true, OraclePriceFeed.unit(), ADA,
+                        BigInteger.ZERO));
+        assertEquals(e.assess(true, BigInteger.valueOf(1_000_000_000L), 50L, false, feed(2, 1),
+                        BigInteger.valueOf(300_000L)),
+                e.assess(true, BigInteger.valueOf(1_000_000_000L), 50L, false, feed(2, 1),
+                        BigInteger.valueOf(300_000L), BigInteger.ZERO));
+        assertEquals(e.assess(false, BigInteger.valueOf(1_000_000_000L), 50L, false, feed(2, 1), ADA),
+                e.assess(false, BigInteger.valueOf(1_000_000_000L), 50L, false, feed(2, 1), ADA, BigInteger.ZERO));
+    }
+
+    /**
+     * An ADA equity raised to the ledger minimum costs the bot the top-up, inside the measured outlay: 8,100 ADA at
+     * 40‰ priced with the unit feed, a fee of 1 ADA and a top-up of 468,368.
+     */
+    @Test
+    void theEquityTopUpIsChargedInsideTheMeasuredOutlay() {
+        ConvertAssessment a = economics(true, 0, 5_000_000L).assess(true, BigInteger.valueOf(8_100_000_000L), 40L,
+                true, OraclePriceFeed.unit(), ADA, BigInteger.valueOf(468_368L));
+
+        assertTrue(a.approved(), a.toString());
+        assertEquals(BigInteger.valueOf(324_000_000L), a.feeValueLovelace(), "ada at the unit feed");
+        assertEquals(BigInteger.valueOf(5_468_368L), a.measuredOutlay(), "fee + order cost + top-up");
+        assertEquals(BigInteger.valueOf(5_468_368L), a.outlay(), "above the dex floor, so the measured outlay");
+        assertEquals(BigInteger.valueOf(318_531_632L), a.net(), "324,000,000 − 5,468,368");
+    }
+
+    /** A top-up is part of the measured outlay, so the dex floor still binds over the sum. */
+    @Test
+    void aTopUpUnderTheDexFloorLeavesTheFloorBinding() {
+        ConvertAssessment a = economics(true, 0, 5_000_000L).assess(true, BigInteger.valueOf(8_100_000_000L), 40L,
+                true, OraclePriceFeed.unit(), BigInteger.valueOf(500_000L), BigInteger.valueOf(400_000L));
+
+        assertEquals(BigInteger.valueOf(4_900_000L), a.measuredOutlay(), "500,000 + 4,000,000 + 400,000");
+        assertEquals(BigInteger.valueOf(5_000_000L), a.outlay(), "the dex floor binds");
+    }
+
+    /** A negative or absent top-up is a caller's error, refused rather than credited to the bot. */
+    @Test
+    void aNegativeOrNullTopUpIsRefused() {
+        ConvertEconomics e = economics(true, 0, 5_000_000L);
+
+        assertThrows(IllegalArgumentException.class, () -> e.assess(true, BigInteger.valueOf(8_100_000_000L), 40L,
+                true, OraclePriceFeed.unit(), ADA, BigInteger.valueOf(-1L)));
+        assertThrows(IllegalArgumentException.class, () -> e.assess(true, BigInteger.valueOf(8_100_000_000L), 40L,
+                true, OraclePriceFeed.unit(), ADA, null));
+    }
+
     @Test
     void everyConvertFieldDefaultMatchesTheYaml_ExceptTheSharedMarginWhichHasDeliberatelyNone() {
         var fresh = new AppConfig.ConvertConfiguration();

@@ -11,6 +11,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.LiquidationMode;
 import com.fluidtokens.aquarium.offchain.model.loans.LoanDatum;
 import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletRoles;
 import lombok.extern.slf4j.Slf4j;
 
 import java.math.BigInteger;
@@ -42,6 +43,14 @@ import java.util.function.Function;
  * ({@code ConvertOrderPlan.Refusal.POOL_TOO_THIN}), or convert switched off ({@link #convertEnabled()}).
  * <b>An unlisted market converts</b> — Giovanni's ruling, and the safe default because this path
  * fronts no capital and holds nothing.
+ *
+ * <h2>An ada collateral is routed (FAB-224)</h2>
+ * It has no collateral oracle: its equity and its economics are priced with the 1:1 unit feed, and only the
+ * principal feed's window is checked. It is paid from the collateral — Giovanni's ruling of 2026-11-12: its
+ * liquidation fee is lovelace and funds the order overhead, the bot's own outputs and the transaction fee, so
+ * the build spends NO wallet input when that fee covers them ({@link #adaCollateralWalletShortfall}), and
+ * otherwise one wallet utxo sized to the shortfall alone, never to the swapped amount. A min-ada top-up of a
+ * small equity output is measured off the built body and charged to {@link ConvertEconomics}.
  *
  * <h2>⚠ Refusals are named, and each says which KIND of thing went wrong</h2>
  * "We will not", "we cannot yet" and "the chain says no" are three different statements, and an
@@ -385,8 +394,10 @@ public class ConvertLiquidationRouter {
     /**
      * Assembles and builds the convert liquidation for one already-resolved candidate, or refuses it.
      *
-     * @param walletSelector  asked for U with the lovelace the order actually costs; the one wallet output the
-     *                        build may spend (FAB-185)
+     * @param walletSelector  asked for U, the one wallet output the build may spend (FAB-185): for a token
+     *                        collateral with the order's lovelace; for an ada collateral (FAB-224) only with the
+     *                        shortfall its liquidation fee leaves, and not at all when the fee covers everything —
+     *                        the build then spends no wallet input
      * @param collateralUtxo  ⛔ FAB-185 — the executor's wallet role C, handed to the builder UNCHANGED as the
      *                        transaction's only collateral. This router never chooses, substitutes or
      *                        inspects it; the builder refuses an invalid one by name
@@ -404,16 +415,8 @@ public class ConvertLiquidationRouter {
                                                long validFromMillis,
                                                long validToMillis) {
         LoanDatum loan = assessment.loan().datum();
-        // ⛔ Ada collateral is refused by name FIRST (FAB-117): convert needs a collateral oracle leg and ada
-        // has none (it used to die as an NPE inside redeemerEquity). First, so it is never answered with the
-        // no-pool branches' "set this market to action: CONVERT_BEFORE_ANTICIPATE" advice -- pay-in-advance
-        // refuses it too, so neither ANTICIPATE nor a CONVERT_BEFORE_ANTICIPATE fallback would serve it, and
-        // CONVERT never could.
-        // A machinery failure (ERROR, every cycle); the PLAIN route (a bond that forbids conversion) is
-        // unaffected and does liquidate it.
-        if (loan.collateral().isAda()) {
-            throw new IllegalStateException("ada collateral: this node builds no convert liquidation for it");
-        }
+        // FAB-224 — an ada collateral is an ada leg: no oracle, the 1:1 unit feed, and the convert paid from the
+        // collateral's own liquidation fee, with a wallet utxo only for what that fee leaves short.
         AssetType collateral = loan.collateral().assetType();
 
         // ⛔ NO POOL ADDRESS CONFIGURED = NO MINSWAP ON THIS NETWORK. Checked BEFORE the pool snapshot is
@@ -457,15 +460,19 @@ public class ConvertLiquidationRouter {
         // working ones do" — not a search for something novel.
         long[] slots = validitySlots(validFromMillis, validToMillis);
 
-        OracleEntry collateralOracle = OracleEntry.namedForLeg(oraclesByOracleTokenUnit,
-                loan.collateral().assetType(), loan.collateral().oracleTokenAsset());
+        // An ada collateral has no oracle and none is looked up: retrieve_oracle_data synthesises the 1:1 unit
+        // feed for an empty policy id, and that is the feed its equity and its economics are priced with.
+        OracleEntry collateralOracle = loan.collateral().isAda() ? null
+                : OracleEntry.namedForLeg(oraclesByOracleTokenUnit,
+                        loan.collateral().assetType(), loan.collateral().oracleTokenAsset());
         // A token collateral needs the oracle its datum names, pricing that token; refused by name here
         // rather than as an NPE inside redeemerEquity (which requires the collateral feed).
-        if (collateralOracle == null) {
+        if (!loan.collateral().isAda() && collateralOracle == null) {
             throw new IllegalStateException("no oracle feed for " + loan.collateral().oracleTokenAsset().toUnit()
                     + " pricing " + loan.collateral().assetType().toUnit()
                     + "; the loan's figures cannot be derived at the body's validFrom");
         }
+        OraclePriceFeed collateralFeed = loan.collateral().isAda() ? OraclePriceFeed.unit() : collateralOracle.feed();
 
         // ⛔ THE FIGURES ARE THE LOAN'S AT THE BODY'S OWN validFrom — NOT the assessment's.
         //
@@ -501,7 +508,10 @@ public class ConvertLiquidationRouter {
         // selector, so nothing is nominated for a transaction the validator would refuse.
         long slotFromMillis = figuresAtMillis;
         long slotToMillis = millisOf(converters.slot().slotToTime(slots[1]));
-        requireFeedCovers("collateral", collateralOracle.feed(), slotFromMillis, slotToMillis);
+        // An ada collateral's unit feed has no window the oracle validator reads, so only a token one is checked.
+        if (!loan.collateral().isAda()) {
+            requireFeedCovers("collateral", collateralFeed, slotFromMillis, slotToMillis);
+        }
         if (!loan.principalAsset().isAda()) {
             requireFeedCovers("principal", principalFeed, slotFromMillis, slotToMillis);
         }
@@ -510,7 +520,7 @@ public class ConvertLiquidationRouter {
                 Rational.fromInt(assessment.loan().collateralAmount()),
                 Rational.fromInt(remainingDebt),
                 principalFeed,
-                collateralOracle == null ? null : collateralOracle.feed());
+                collateralFeed);
 
         // 2. Everything the validator dictates, computed against that pool.
         AssetType lenderBond = new AssetType(registry.getLenderBondPolicyId(), assessment.loan().loanId());
@@ -544,16 +554,34 @@ public class ConvertLiquidationRouter {
         // validator's own rule, and a second derivation here could disagree with the one the order is
         // actually built from — the figures on this path are taken at the BODY's validFrom, not the
         // assessment's, which is precisely how such a pair drifts apart.
-        Utxo walletUtxo = walletSelector.apply(plan.orderLovelace())
-                .orElseThrow(() -> new WalletInputTooSmallException(
-                        ("no nominable wallet utxo can fund this convert: the Minswap order carries %s "
-                                + "lovelace (%s), and no single ada-only utxo with no datum and no "
-                                + "reference script covers that plus the fee ceiling. Fund the wallet "
-                                + "with one such utxo of at least that amount plus fee headroom.")
-                                .formatted(plan.orderLovelace(),
-                                        collateral.isAda()
-                                                ? "the swappable ada plus the order overhead"
-                                                : "the order overhead; the collateral is a token")));
+        //
+        // FAB-224 — an ADA collateral is paid from the collateral: its liquidation fee is lovelace and leaves the
+        // loan input with the swap, so the wallet is asked only for what that fee leaves short, and not at all
+        // when it covers everything (the Request then carries no wallet utxo). Never for the swapped amount.
+        Utxo walletUtxo;
+        if (loan.collateral().isAda()) {
+            Optional<BigInteger> shortfall = adaCollateralWalletShortfall(plan.liquidationFee(), equity,
+                    builder.feeCeiling());
+            walletUtxo = shortfall.isEmpty() ? null : walletSelector.apply(shortfall.get())
+                    .orElseThrow(() -> new WalletInputTooSmallException(
+                            ("no nominable wallet utxo can fund this convert: its ada collateral's liquidation fee "
+                                    + "leaves it %s lovelace short of the Minswap order overhead, the min-ada of the "
+                                    + "bot's own outputs and any equity top-up, and no single ada-only utxo with no "
+                                    + "datum and no reference script covers that plus the fee ceiling. Fund the "
+                                    + "wallet with one such utxo of at least that amount plus fee headroom.")
+                                    .formatted(shortfall.get())));
+        } else {
+            walletUtxo = walletSelector.apply(plan.orderLovelace())
+                    .orElseThrow(() -> new WalletInputTooSmallException(
+                            ("no nominable wallet utxo can fund this convert: the Minswap order carries %s "
+                                    + "lovelace (%s), and no single ada-only utxo with no datum and no "
+                                    + "reference script covers that plus the fee ceiling. Fund the wallet "
+                                    + "with one such utxo of at least that amount plus fee headroom.")
+                                    .formatted(plan.orderLovelace(),
+                                            collateral.isAda()
+                                                    ? "the swappable ada plus the order overhead"
+                                                    : "the order overhead; the collateral is a token")));
+        }
 
         ClaimData claim = new ClaimData((LiquidationMode.Liquidation) loan.liquidationMode(),
                 BigInteger.ZERO, BigInteger.ZERO, BigInteger.ZERO,
@@ -568,13 +596,32 @@ public class ConvertLiquidationRouter {
                 loan.principalAsset(), principalOracle));
 
         BigInteger txFee = transaction.getBody().getFee();
+        // FAB-224 — an ADA equity smaller than the ledger minimum is raised to it out of the bot's change (CCL trap
+        // 6), so the top-up is the bot's spend: measured off the built body, never predicted. A token collateral's
+        // equity output is not affected, and it is charged nothing here.
+        BigInteger equityTopUp = BigInteger.ZERO;
+        if (loan.collateral().isAda() && equity.signum() > 0) {
+            String assetManager = com.bloxbean.cardano.client.address.AddressProvider.getEntAddress(
+                    com.bloxbean.cardano.client.address.Credential.fromScript(
+                            com.bloxbean.cardano.client.util.HexUtil.decodeHexString(
+                                    registry.getAssetManagerSpendScriptHash())), network).getAddress();
+            com.bloxbean.cardano.client.transaction.spec.TransactionOutput equityOut =
+                    transaction.getBody().getOutputs().stream()
+                            .filter(o -> assetManager.equals(o.getAddress()))
+                            .findFirst()
+                            .orElseThrow(() -> new IllegalStateException("the built convert owes the borrower "
+                                    + equity + " lovelace of equity and has no output at the asset-manager address "
+                                    + assetManager));
+            equityTopUp = equityOut.getValue().getCoin().subtract(equity);
+        }
         ConvertAssessment verdict = economics.assess(
                 assessment.bond().datum().shouldLiquidationConvertToPrincipal(),
                 assessment.loan().collateralAmount(),
                 assessment.bond().datum().liquidationFeePerMille().longValueExact(),
                 collateral.isAda(),
-                collateralOracle == null ? null : collateralOracle.feed(),
-                txFee);
+                collateralFeed,
+                txFee,
+                equityTopUp);
 
         if (!verdict.approved()) {
             throw new UnprofitableException(verdict,
@@ -591,5 +638,38 @@ public class ConvertLiquidationRouter {
                 assessment.loan().utxoRef(), plan.swappableCollateralAmount(), collateral.toUnit(),
                 plan.minimumReceive(), verdict.liquidationFee(), verdict.net(), verdict.outlay());
         return transaction;
+    }
+
+    /**
+     * FAB-224 — how much an ADA-collateral convert must take from the wallet: nothing (empty) when the collateral's
+     * liquidation fee pays for everything the bot's side of the body needs, otherwise the shortfall it leaves.
+     * <pre>
+     *   botOutputsCeiling = 4 × CHANGE_MIN_ADA_CEILING          # the withdrawal dummy, the two carriers, the change
+     *   topUpCeiling      = equity &gt; 0 ? max(0, CHANGE_MIN_ADA_CEILING − equity) : 0
+     *   slack             = liquidationFee − MINSWAP_ORDER_OVERHEAD − topUpCeiling − botOutputsCeiling
+     *   slack ≥ feeCeiling  →  empty (no wallet input)
+     *   otherwise           →  max(0, −slack)
+     * </pre>
+     * ⚠ Every term is a pre-build CEILING, not a prediction, and the built body is the judge (CCL trap 16): an
+     * underestimate fails loudly in cardano-client-lib's balancing, never on chain. The selector adds the fee
+     * ceiling to the amount it is asked ({@code WalletRoles.convertRequired}), so it is not added here; the
+     * no-wallet decision compares with the same {@code LedgerCeilings.maxPossibleFee} the executor sizes the wallet
+     * utxo with, so the two sides agree. The swapped amount is never part of it: the order's swap leaves the loan
+     * input, not the wallet.
+     */
+    static Optional<BigInteger> adaCollateralWalletShortfall(BigInteger liquidationFee, BigInteger equity,
+                                                             BigInteger feeCeiling) {
+        BigInteger botOutputsCeiling = WalletRoles.CHANGE_MIN_ADA_CEILING.multiply(BigInteger.valueOf(4L));
+        BigInteger topUpCeiling = equity.signum() > 0
+                ? WalletRoles.CHANGE_MIN_ADA_CEILING.subtract(equity).max(BigInteger.ZERO)
+                : BigInteger.ZERO;
+        BigInteger slack = liquidationFee
+                .subtract(ConvertEconomics.MINSWAP_ORDER_OVERHEAD)
+                .subtract(topUpCeiling)
+                .subtract(botOutputsCeiling);
+        if (slack.compareTo(feeCeiling) >= 0) {
+            return Optional.empty();
+        }
+        return Optional.of(slack.negate().max(BigInteger.ZERO));
     }
 }

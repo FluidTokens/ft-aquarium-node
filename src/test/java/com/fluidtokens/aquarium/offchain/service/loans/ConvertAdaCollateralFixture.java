@@ -13,11 +13,15 @@ import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
 import com.bloxbean.cardano.client.transaction.spec.Withdrawal;
 import com.bloxbean.cardano.client.util.HexUtil;
+import com.bloxbean.cardano.yaci.store.common.domain.Amt;
+import com.bloxbean.cardano.yaci.store.utxo.storage.impl.model.AddressUtxoEntity;
 import com.fluidtokens.aquarium.offchain.config.HashCheckedScriptSupplier;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.ClaimData;
+import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderManagerDatum;
 import com.fluidtokens.aquarium.offchain.model.loans.LiquidationMode;
+import com.fluidtokens.aquarium.offchain.model.loans.Loan;
 import com.fluidtokens.aquarium.offchain.model.loans.LoanDatum;
 import com.fluidtokens.aquarium.offchain.model.loans.MinswapPoolDatum;
 import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
@@ -49,6 +53,7 @@ import static com.fluidtokens.aquarium.offchain.service.loans.ConvertTokenToToke
 import static com.fluidtokens.aquarium.offchain.service.loans.ConvertTokenToTokenFixture.LM_CONFIG_REF;
 import static com.fluidtokens.aquarium.offchain.service.loans.ConvertTokenToTokenFixture.MS_ORDER_SPEND;
 import static com.fluidtokens.aquarium.offchain.service.loans.ConvertTokenToTokenFixture.MS_POOL_POLICY;
+import static com.fluidtokens.aquarium.offchain.service.loans.ConvertTokenToTokenFixture.MS_POOL_SPEND;
 import static com.fluidtokens.aquarium.offchain.service.loans.ConvertTokenToTokenFixture.NETWORK;
 import static com.fluidtokens.aquarium.offchain.service.loans.ConvertTokenToTokenFixture.POOL_ADDRESS;
 import static com.fluidtokens.aquarium.offchain.service.loans.ConvertTokenToTokenFixture.REGISTRY;
@@ -367,6 +372,35 @@ final class ConvertAdaCollateralFixture {
     ConvertTransactionBuilder production(TransactionEvaluator evaluator, OracleReferenceInputProbe probe) {
         return new ConvertTransactionBuilder(REGISTRY, NETWORK, LoanFixtures.utxoSupplier(universe),
                 EvalFixtures.protocolParams(), hashCheckedScripts(), evaluator, probe);
+    }
+
+    /** FAB-224-2 — the recorded loan as the scanner hands it to the router: 8,100 ADA of collateral, all its lovelace. */
+    Loan loan() {
+        return new Loan(LOAN_TX, LOAN_IX, LOAN_ADDRESS, LOAN_ID, COLLATERAL_AMOUNT, COLLATERAL_AMOUNT, loan);
+    }
+
+    /** FAB-224-2 — the lender bond as the router reads it, over this fixture's (possibly SYNTHETIC) bond hex. */
+    LenderBond bond() {
+        return new LenderBond(LOAN_TX, BOND_IX, BOND_ADDRESS, LOAN_ID, bondUtxo.getInlineDatum(), bond);
+    }
+
+    /** FAB-224-2 — the recorded ADA/USDM pool as the index row the resolver reads: recorded coordinate and full value. */
+    static AddressUtxoEntity poolRow() {
+        var row = new AddressUtxoEntity();
+        row.setTxHash(POOL_REF.getTransactionId());
+        row.setOutputIndex(POOL_REF.getIndex());
+        row.setOwnerAddr(POOL_ADDRESS);
+        row.setOwnerPaymentCredential(MS_POOL_SPEND);
+        row.setInlineDatum(LoanFixtures.fixture("mainnet-minswap-pool-ada-usdm.hex"));
+        List<Amt> amounts = new ArrayList<>();
+        for (var amount : POOL_VALUE) {
+            var amt = new Amt();
+            amt.setUnit(amount.getUnit());
+            amt.setQuantity(amount.getQuantity());
+            amounts.add(amt);
+        }
+        row.setAmounts(amounts);
+        return row;
     }
 
     Utxo utxoAt(TransactionInput input) {

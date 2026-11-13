@@ -396,6 +396,16 @@ public class ConvertTransactionBuilder {
         this.oracleReferenceInputProbe = oracleReferenceInputProbe;
     }
 
+    /**
+     * {@code LedgerCeilings.maxPossibleFee} over this builder's protocol parameters — the same ceiling the executor
+     * sizes the wallet utxo with. {@code ConvertLiquidationRouter}'s no-wallet decision for an ada collateral
+     * (FAB-224) uses it, so the router and the executor agree on whether a wallet input is needed at all.
+     */
+    BigInteger feeCeiling() {
+        return com.fluidtokens.aquarium.offchain.util.LedgerCeilings.maxPossibleFee(
+                protocolParamsSupplier.getProtocolParams());
+    }
+
     // ---- the one entry point --------------------------------------------------------------------
 
     public Transaction build(Request request) {

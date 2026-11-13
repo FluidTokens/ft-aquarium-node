@@ -26,8 +26,12 @@ import java.math.BigInteger;
  * <h2>⛔ What the bot actually spends — measured, then floored</h2>
  * <pre>
  *   measuredOutlay = txFee + loans.liquidation.convert.minswap-order-cost-lovelace   # default 4_000_000
+ *                          + equityTopUp
  *   outlay         = max(measuredOutlay, loans.liquidation.convert.dex-cost-floor-lovelace)
  * </pre>
+ * {@code equityTopUp} (FAB-224) is the lovelace an ADA equity output smaller than the ledger minimum is raised by.
+ * Balancing fronts it out of the collateral's fee, which is the bot's, so it is the bot's spend. The router measures
+ * it off the built body for an ada collateral and passes 0 for a token one, whose equity output it never applies to.
  * ⚑ <b>The order ada is an explicit, configurable FIXED EXPENSE since 2026-09-09</b>, and that is
  * what makes a stated margin of {@code 0} mean something on this path: <b>a convert must cover the
  * order cost before it counts as break-even.</b> The configured figure is what the bot <em>spends</em>;
@@ -283,7 +287,8 @@ public class ConvertEconomics {
      *                             validator's first conjunct, and the lender's choice, not ours
      * @param collateralAmount     {@code loanCollateralAmount}: the collateral the loan input holds
      * @param feePerMille          {@code liquidationFeePerMille} from the live {@code LenderManagerDatum}
-     * @param collateralIsAda      whether the collateral asset is ada, which decides the 2.8 ada term
+     * @param collateralIsAda      whether the collateral asset is ada; an ada collateral is priced by the 1:1 unit
+     *                             feed the caller passes as {@code collateralFeed}, like any other
      * @param collateralFeed       the oracle feed for the collateral asset, or {@code null} when there
      *                             is no usable one — the fee cannot be valued without it
      * @param txFee                the measured fee of the built transaction, in lovelace
@@ -294,6 +299,28 @@ public class ConvertEconomics {
                                     boolean collateralIsAda,
                                     OraclePriceFeed collateralFeed,
                                     BigInteger txFee) {
+        return assess(bondAllowsConversion, collateralAmount, feePerMille, collateralIsAda, collateralFeed, txFee,
+                BigInteger.ZERO);
+    }
+
+    /**
+     * {@link #assess(boolean, BigInteger, long, boolean, OraclePriceFeed, BigInteger)} with the equity top-up charged
+     * inside the measured outlay (FAB-224).
+     *
+     * @param equityTopUp the lovelace balancing raised an ADA equity output by to reach the ledger minimum, read off
+     *                    the built body; 0 for a token collateral or no equity. Never null or negative.
+     */
+    public ConvertAssessment assess(boolean bondAllowsConversion,
+                                    BigInteger collateralAmount,
+                                    long feePerMille,
+                                    boolean collateralIsAda,
+                                    OraclePriceFeed collateralFeed,
+                                    BigInteger txFee,
+                                    BigInteger equityTopUp) {
+        if (equityTopUp == null || equityTopUp.signum() < 0) {
+            throw new IllegalArgumentException("equityTopUp is " + equityTopUp
+                    + "; it is lovelace the bot spent raising the equity output, never null or negative");
+        }
         // The GLOBAL switch, first of everything THIS gate checks: `loans.liquidation.convert.enabled`
         // false means no convert anywhere. Per-market control is `markets[]` and is applied EARLIER
         // still, by MarketGate in LiquidationExecutor — so a market routed to ANTICIPATE never gets
@@ -330,7 +357,7 @@ public class ConvertEconomics {
         // must CARRY (the validator's `>=`); this is what the bot SPENDS, and the operator may state a
         // larger figure. announceAndGuard refuses a smaller one, so this can never be optimistic.
         BigInteger orderAda = configuration.getMinswapOrderCostLovelace();
-        BigInteger measuredOutlay = txFee.add(orderAda);
+        BigInteger measuredOutlay = txFee.add(orderAda).add(equityTopUp);
         BigInteger dexCostFloor = configuration.getDexCostFloorLovelace();
         // max(), never sum: the floor already covers the batcher fee, so adding it would double-count.
         BigInteger outlay = measuredOutlay.max(dexCostFloor);

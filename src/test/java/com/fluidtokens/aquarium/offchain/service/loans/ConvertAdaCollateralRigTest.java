@@ -390,6 +390,45 @@ class ConvertAdaCollateralRigTest {
         assertEquals(0, evaluator.calls.get(), "nothing may be evaluated");
     }
 
+    /**
+     * (j) FAB-224-2 — the fee check on the ONE-WALLET body, which the router now builds in production: the bot's
+     * outputs include its own wallet utxo U back, so the check nets U's lovelace out. On (e)'s deserialised body the
+     * bot is owed exactly what it receives; moving 1 lovelace, or 1,000,000, from the change to an address that is not
+     * the bot's is refused {@code FEE_NOT_PAID_TO_BOT}. Without the netting, a leak of up to U's 50 ADA would pass.
+     */
+    @Test
+    void aLovelaceLeakOnTheOneWalletBodyIsRefusedFeeNotPaidToBot() throws Exception {
+        ConvertAdaCollateralFixture f = spec().bondFeePerMille(1).walletUtxo(WALLET_UTXO).build();
+        ConvertTransactionBuilder builder = f.production(new Recording(f.aiken()));
+        Transaction reread = Transaction.deserialize(builder.build(f.request).serialize());
+        assertTrue(Set.copyOf(reread.getBody().getInputs()).contains(
+                        new TransactionInput(WALLET_UTXO.getTxHash(), WALLET_UTXO.getOutputIndex())),
+                "the one-wallet body spends U");
+        byte[] bytes = reread.serialize();
+        List<TransactionOutput> outs = reread.getBody().getOutputs();
+        long success = indexOfDatum(outs, f.plan.successDatum().serializeToHex());
+        long refund = indexOfDatum(outs, f.plan.refundDatum().serializeToHex());
+        long bondEcho = indexOfDatum(outs, f.bondUtxo.getInlineDatum());
+        builder.assertStructure(reread, f.request, success, refund, bondEcho);
+
+        String elsewhere = entAddress("77".repeat(28));
+        assertNotEquals(BOT_ADDRESS, elsewhere);
+        for (long moved : new long[]{1L, 1_000_000L}) {
+            Transaction leaked = Transaction.deserialize(bytes);
+            List<TransactionOutput> leakedOuts = leaked.getBody().getOutputs();
+            TransactionOutput change = leakedOuts.get(leakedOuts.size() - 1);
+            assertEquals(BOT_ADDRESS, change.getAddress(), "the change is the last output, at the bot");
+            assertNull(change.getInlineDatum(), "the change carries no datum");
+            change.getValue().setCoin(change.getValue().getCoin().subtract(BigInteger.valueOf(moved)));
+            leakedOuts.add(new TransactionOutput(elsewhere, Value.builder().coin(BigInteger.valueOf(moved)).build()));
+            ConvertTransactionBuilder.RefusedException refused = assertThrows(
+                    ConvertTransactionBuilder.RefusedException.class,
+                    () -> builder.assertStructure(leaked, f.request, success, refund, bondEcho));
+            assertEquals(ConvertTransactionBuilder.Refusal.FEE_NOT_PAID_TO_BOT, refused.reason(),
+                    moved + " lovelace leaked: " + refused.getMessage());
+        }
+    }
+
     // ======================================================================================
     // The leaves
     // ======================================================================================

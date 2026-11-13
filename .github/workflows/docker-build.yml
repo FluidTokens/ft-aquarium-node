@@ -404,12 +404,17 @@ jobs:
       # no wallet input, a small equity is topped up exactly to the ledger minimum, and one handed wallet utxo is the
       # only one spent) re-measured cold keyless on feat/fab-211-213-214-seams, 2026-11-13:
       # 252 files / 2895 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 252.
+      # FAB-224-2 (ConvertAdaCollateralRouterTest: the convert router builds an ADA collateral with no wallet input
+      # when its liquidation fee pays for the order, the bot's outputs and the fee ceiling, otherwise with one wallet
+      # utxo sized to the shortfall, and charges a small equity's min-ada top-up to ConvertEconomics) re-measured
+      # cold keyless on feat/fab-211-213-214-seams, 2026-11-13:
+      # 253 files / 2908 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 253.
       #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '252'
+          RESULT_FILE_FLOOR: '253'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET
