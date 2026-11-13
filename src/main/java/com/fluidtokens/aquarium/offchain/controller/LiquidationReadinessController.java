@@ -1243,9 +1243,15 @@ public class LiquidationReadinessController {
         }
 
         // The loan's figures, once: the anticipate estimate and the funds floor read the same ones. A plain or
-        // bond-less row computes none.
+        // bond-less row computes none and looks no principal entry up.
+        // ⛔ FAB-227: the principal's oracle entry is looked up ONCE per row and handed to both the figures and the
+        // anticipate order cost. The cache can drop an entry between two lookups, so a second lookup could miss
+        // the entry the figures were priced with.
+        OracleEntry principalEntry = bondRoute != BondRoute.CONVERT || client == null
+                || datum.principalAsset().isAda() ? null
+                : principalOracleEntry(client, datum).orElse(null);
         LiquidatePayInAdvanceTransactionBuilder.Numbers figures = bondRoute == BondRoute.CONVERT
-                ? numbersFor(loan, bond, now) : null;
+                ? numbersFor(loan, bond, principalEntry, now) : null;
 
         // ---- the route, and the capital an advance would need -------------------------------------
         String route;
@@ -1320,12 +1326,11 @@ public class LiquidationReadinessController {
                     : AnticipateAndSell.estimate(collateralAsset, datum.principalAsset(),
                             numbers.collateralLenderShouldReceive(), numbers.liquidationFee(),
                             numbers.convertedLoanCollateralToPrincipalAmount(),
-                            // FAB-227: the order's 4 ADA in the principal's units, through the entry numbersFor
-                            // priced the loan with. Figures for a token principal imply that entry exists.
+                            // FAB-227: the order's 4 ADA in the principal's units, through the one entry this row
+                            // resolved for its figures — never a second lookup, because the cache can drop the entry
+                            // between two, and a token principal's figures are non-null only when that entry is.
                             AnticipateAndSell.orderCostInPrincipal(datum.principalAsset(),
-                                    datum.principalAsset().isAda() ? null
-                                            : principalOracleEntry(client, datum).map(OracleEntry::feed)
-                                                    .orElse(null)),
+                                    principalEntry == null ? null : principalEntry.feed()),
                             fetched.datums());
         }
 
@@ -1820,6 +1825,29 @@ public class LiquidationReadinessController {
      */
     LiquidatePayInAdvanceTransactionBuilder.Numbers numbersFor(Loan loan, LenderBond bond, long now) {
         FluidOracleClient client = oracleClient.getIfAvailable();
+        if (client == null) {
+            return null;
+        }
+        OracleEntry principalOracle = null;
+        if (!loan.datum().principalAsset().isAda()) {
+            Optional<OracleEntry> principalEntry = principalOracleEntry(client, loan.datum());
+            if (principalEntry.isEmpty()) {
+                return null;
+            }
+            principalOracle = principalEntry.get();
+        }
+        return numbersFor(loan, bond, principalOracle, now);
+    }
+
+    /**
+     * {@link #numbersFor(Loan, LenderBond, long)}'s core, priced with a principal entry the caller has already
+     * resolved: null for an ada principal, and for a token principal null means it could not be priced. It never
+     * looks the principal up itself, so a caller that resolved the entry once prices everything else it shows
+     * through that same entry.
+     */
+    private LiquidatePayInAdvanceTransactionBuilder.Numbers numbersFor(Loan loan, LenderBond bond,
+                                                                       OracleEntry principalOracle, long now) {
+        FluidOracleClient client = oracleClient.getIfAvailable();
         LoansContractRegistry reg = registry.getIfAvailable();
         if (client == null || reg == null) {
             return null;
@@ -1842,14 +1870,8 @@ public class LiquidationReadinessController {
         if (!adaCollateral && oracle.isEmpty()) {
             return null;
         }
-        AssetType principalAsset = loan.datum().principalAsset();
-        OracleEntry principalOracle = null;
-        if (!principalAsset.isAda()) {
-            Optional<OracleEntry> principalEntry = principalOracleEntry(client, loan.datum());
-            if (principalEntry.isEmpty()) {
-                return null;
-            }
-            principalOracle = principalEntry.get();
+        if (!loan.datum().principalAsset().isAda() && principalOracle == null) {
+            return null;
         }
         try {
             return new LiquidatePayInAdvanceTransactionBuilder(reg, network.getCardanoNetwork(),
@@ -1863,9 +1885,10 @@ public class LiquidationReadinessController {
     }
 
     /**
-     * The principal's oracle entry, by the NFT the datum names and only if it prices the principal — the one
-     * lookup {@link #numbersFor} prices the loan with and the anticipate estimate's order cost is converted
-     * through, so the two cannot diverge. Empty when no entry is indexed or it prices another asset.
+     * The principal's oracle entry, by the NFT the datum names and only if it prices the principal — the
+     * lookup {@link #numbersFor} prices the loan with. {@code row()} calls it once per row and hands the result to
+     * both its figures and the anticipate estimate's order cost. Empty when no entry is indexed or it prices
+     * another asset.
      */
     private static Optional<OracleEntry> principalOracleEntry(
             FluidOracleClient client, com.fluidtokens.aquarium.offchain.model.loans.LoanDatum datum) {

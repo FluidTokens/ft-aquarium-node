@@ -2133,12 +2133,20 @@ class LiquidationReadinessControllerTest {
      */
     private static LiquidationReadinessController.Row renderAdaCollateralTokenPrincipalRow(
             AppConfig.LiquidationConfiguration configuration, MinswapPoolResolver resolver) {
+        return renderAdaCollateralTokenPrincipalRow(configuration, resolver,
+                new FakeOracleClient(principalMultisigOracle()));
+    }
+
+    /** As above, priced through {@code oracleClient}. */
+    private static LiquidationReadinessController.Row renderAdaCollateralTokenPrincipalRow(
+            AppConfig.LiquidationConfiguration configuration, MinswapPoolResolver resolver,
+            FluidOracleClient oracleClient) {
         return renderLiquidatable(
                 LoanFixtures.convertToPrincipalBondDatum(BigInteger.valueOf(50),
                         LoanFixtures.noStakeCredential(), PRINCIPAL_TOKEN),
                 LoanFixtures.adaCollateral(), configuration, null,
                 new com.fluidtokens.aquarium.offchain.service.LendingConfigGate(), true,
-                new FakeOracleClient(principalMultisigOracle()), resolver,
+                oracleClient, resolver,
                 PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_NFT, null, null).row();
     }
 
@@ -2200,6 +2208,57 @@ class LiquidationReadinessControllerTest {
 
         String adaDetail = adaPrincipal.anticipateAndSell().detail();
         assertTrue(adaDetail.contains(" paid to the lender and 4000000 of order cost"), adaDetail);
+    }
+
+    /**
+     * FAB-227: the principal's oracle entry can leave the cache between two lookups —
+     * {@code FluidOracleClient.findEntryByOracleToken} reads the snapshot afresh on every call, an API load drops the
+     * NFTs it no longer lists and a stream disconnect drops the stream-only ones. A row that looked the entry up once
+     * for its figures and again for the anticipate order cost could find it the first time and not the second, and
+     * {@code AnticipateAndSell.orderCostInPrincipal} then threw for the null feed, failing the whole page: the
+     * Auditor measured it with a client that answers the principal NFT for the first k lookups and nothing after,
+     * which threw at k = 1 and k = 2. The row now looks the entry up once and prices both the figures and the order
+     * cost through that one entry, so non-null figures mean the order cost has the same non-null entry.
+     *
+     * <p>Every k renders. k = 0 has no entry for the row's one lookup and shows the unknown estimate; from k = 1 the
+     * row's lookup, the first of the render, finds it and the whole row is priced from it, however many later
+     * lookups go empty. Controls: Y1 (the estimate looks the entry up again) throws at k = 1 and k = 2; Y2 (the
+     * figures look the principal up again instead of using the row's entry) leaves k = 1 unpriced.
+     */
+    @Test
+    void aPrincipalEntryLeavingTheCacheMidRenderNeverFailsThePage() {
+        for (int k = 0; k <= 6; k++) {
+            int answered = k;
+            FakeOracleClient leaving = new FakeOracleClient(principalMultisigOracle()) {
+                private int principalLookups;
+
+                @Override
+                public Optional<OracleEntry> findEntryByOracleToken(AssetType oracleToken) {
+                    if (PRINCIPAL_ORACLE_NFT.equals(oracleToken) && principalLookups++ >= answered) {
+                        return Optional.empty();
+                    }
+                    return super.findEntryByOracleToken(oracleToken);
+                }
+            };
+
+            LiquidationReadinessController.Row row;
+            try {
+                row = renderAdaCollateralTokenPrincipalRow(liveConfiguration(),
+                        PoolIndex.of(adaPrincipalTokenPool("10000000000000")).resolver(), leaving);
+            } catch (RuntimeException e) {
+                throw new AssertionError("k = " + k + ": the page failed: " + e, e);
+            }
+
+            String detail = row.anticipateAndSell().detail();
+            boolean unknown = detail.contains("this loan's figures could not be priced");
+            boolean priced = detail.contains(" paid to the lender and 2000000 of order cost");
+            assertTrue(unknown != priced, "k = " + k + ": " + detail);
+            if (k == 0) {
+                assertTrue(unknown, "k = 0: " + detail);
+            } else {
+                assertTrue(priced, "k = " + k + ": " + detail);
+            }
+        }
     }
 
     /**
