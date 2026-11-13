@@ -29,10 +29,12 @@ import java.util.List;
  *                        for a given loan.
  * @param referenceInput  the UTxO holding {@link #oracleToken}, included as a reference input
  * @param referenceScript the UTxO the oracle script is published at
- * @param verificationKeys the keys {@link OracleSignature#keyPosition()} indexes into. For each
- *                        deployed mainnet oracle in the recorded registry payload, the published
- *                        list equals the validator's applied {@code verification_keys} parameter,
- *                        in order ({@code TestOracleRigTest} (a), FAB-222).
+ * @param verificationKeys the keys {@link OracleSignature#keyPosition()} indexes into.
+ *                        {@code TestOracleRigTest} (a) proves, for three deployed mainnet oracles
+ *                        (a0bb657d, 756897fd, d81a8bea: the NIGHT and FLDT entries of the recorded
+ *                        registry payload), that the published list equals the validator's applied
+ *                        {@code verification_keys} parameter, in order (FAB-222). No other entry's
+ *                        key order is proven.
  * @param threshold       how many valid signatures the validator requires. Taken from the entry
  *                        level; the registry sometimes reports a different number alongside the
  *                        feed, which is why {@link #signatures()} carries every published
