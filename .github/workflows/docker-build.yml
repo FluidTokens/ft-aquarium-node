@@ -396,12 +396,16 @@ jobs:
       # profitability gates pinned, and the empty STRIKE/USDM pool refused POOL_TOO_THIN before any build)
       # re-measured cold keyless on feat/fab-211-213-214-seams, 2026-11-13:
       # 250 files / 2870 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 250.
+      # FAB-226-1 (PayInAdvanceAdaCollateralDryEvalTest: an ADA-collateral, USDM-principal pay-in-advance evaluates
+      # offline through one rig oracle, the seized ADA comes back ADA-only, and a collateral oracle that does not
+      # match the collateral is refused by name) re-measured cold keyless on feat/fab-211-213-214-seams, 2026-11-13:
+      # 251 files / 2882 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 251.
       #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '250'
+          RESULT_FILE_FLOOR: '251'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET
