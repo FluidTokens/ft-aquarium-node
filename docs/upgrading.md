@@ -960,7 +960,8 @@ not.
 ### Every collateral and principal pair is liquidated (FAB-215)
 
 This release makes the bot build liquidations it used to refuse or ignore: a token collateral against a token
-principal, and an ADA collateral against a token principal. Nothing to set, and the database is untouched.
+principal by convert (pay-in-advance already built that pair), and an ADA collateral against a token
+principal by either route. Nothing to set, and the database is untouched.
 The route, funding and cost of every pair is one table, in
 [deploying.md §9](deploying.md#which-pairs-are-liquidated-and-what-each-costs); it is not repeated here.
 
@@ -989,9 +990,12 @@ The route, funding and cost of every pair is one table, in
   `ANTICIPATE` or `CONVERT_BEFORE_ANTICIPATE` with a `cap`, which applies to every USDM-principal loan. The node
   ships no market change for it; that is your decision.
 - **Still refused.** A Charli3 (`PRICE_DATA_CHARLIE`) oracle leg on the convert route is refused as
-  `ORACLE_VARIANT_NOT_MODELLED`, logged at ERROR every cycle, and a `CONVERT_BEFORE_ANTICIPATE` market does not
-  pay it in advance instead (FAB-228). Repayment receipts, and an ADA collateral against an ADA principal, are
-  refused as before.
+  `ORACLE_VARIANT_NOT_MODELLED` once the convert reaches the builder (Minswap configured, a pool that can fill
+  the debt, feeds covering the window). In that case a `CONVERT_BEFORE_ANTICIPATE` market does not pay it in
+  advance instead (FAB-228). A Charli3 loan with no pool, a thin pool or convert switched off falls back and
+  is paid in advance like any other; on preview, whose pool address ships blank, that is every such loan. See
+  [deploying.md §9](deploying.md#which-pairs-are-liquidated-and-what-each-costs). Repayment receipts, and an
+  ADA collateral against an ADA principal, are refused as before.
 
 ### Yaci Store 2.0.7 (FAB-203)
 

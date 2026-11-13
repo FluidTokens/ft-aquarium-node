@@ -690,15 +690,22 @@ decision, because it puts your capital at risk up to the `cap`.
 
 **Still refused:**
 
-- **A Charli3 oracle leg on the convert route.** A loan whose collateral or principal is priced by a
-  `PRICE_DATA_CHARLIE` feed is refused by the convert builder as `ORACLE_VARIANT_NOT_MODELLED`. It is not one
-  of the three fallback causes, so a `CONVERT_BEFORE_ANTICIPATE` market does **not** pay such a loan in
-  advance instead. It reaches the liquidations endpoint as a `REFUSED` row whose reason is
+- **A Charli3 oracle leg on the convert route, once the convert reaches the builder.** A loan whose collateral
+  or principal is priced by a `PRICE_DATA_CHARLIE` feed is refused by the convert builder as
+  `ORACLE_VARIANT_NOT_MODELLED`, but only after the earlier convert checks pass: Minswap is configured, a pool
+  for the pair is indexed and can fill the debt, and the feeds cover the validity window. That refusal is not
+  one of the three fallback causes, so in that case a `CONVERT_BEFORE_ANTICIPATE` market does **not** pay the
+  loan in advance instead. It reaches the liquidations endpoint as a `REFUSED` row whose reason is
   `RefusedException` and whose detail starts `RefusedException: ORACLE_VARIANT_NOT_MODELLED: the principal
-  oracle … publishes a PRICE_DATA_CHARLIE feed …` (or `the collateral oracle`), and the node logs it at
-  ERROR on every cycle: `building the convert liquidation of <loan> via convert failed: …`. A pay-in-advance
-  (an `ANTICIPATE` market) does handle Charli3 legs. Preview's live feeds are Charli3; no live mainnet convert
-  loan has such a leg. Tracked as FAB-228.
+  oracle … publishes a PRICE_DATA_CHARLIE feed …` (or `the collateral oracle`), and the node logs it at ERROR
+  on each cycle in which the convert reaches the builder: `building the convert liquidation of <loan> via
+  convert failed: …`. On a cycle whose feeds do not cover the window the row is `CONVERT_FEED_WINDOW` instead,
+  at INFO. A Charli3 loan whose convert stops earlier, with no pool (`NO_MINSWAP_POOL`), a thin pool
+  (`POOL_TOO_THIN`) or convert switched off (`CONVERT_DISABLED`), falls back on a `CONVERT_BEFORE_ANTICIPATE`
+  market and is paid in advance like any other, because pay-in-advance handles Charli3 legs. Preview ships
+  `loans.minswap.pool-address` blank, so on preview a `CONVERT` market records these loans as
+  `NO_MINSWAP_POOL` and a `CONVERT_BEFORE_ANTICIPATE` market pays them in advance. No live mainnet convert
+  loan has a Charli3 leg. Tracked as FAB-228.
 - **Repayment receipts** (unchanged).
 - **An ADA collateral against an ADA principal**, by either route.
 
