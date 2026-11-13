@@ -27,6 +27,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static com.fluidtokens.aquarium.offchain.service.loans.RouteStageHarness.COLLATERAL_TOKEN;
 import static com.fluidtokens.aquarium.offchain.service.loans.RouteStageHarness.NOW;
 import static com.fluidtokens.aquarium.offchain.service.loans.RouteStageHarness.PRINCIPAL_TOKEN;
 import static com.fluidtokens.aquarium.offchain.service.loans.RouteStageHarness.TOKEN_WALLET_UTXO;
@@ -474,32 +475,82 @@ class UStaysInTheCheckTest {
     }
 
     /**
-     * (i) a failed pay-in-advance build on the token output marks nothing. Why this loan: an ADA-collateral
-     * loan is the only machinery failure the harness can reach on the token route (FAB-117) — the
-     * pay-in-advance router refuses it with an IllegalStateException once the executor has designated the
-     * token output, and it ranks first, so the token-principal candidate behind it is on the same output. The
-     * ERROR assertion keeps this from passing vacuously: if that refusal ever moved before the build, the
-     * candidate would never reach the build-failure path this test defends, and the ERROR line would be gone.
+     * A token-collateral, token-principal loan with a convert-to-principal bond, on index-1 refs, built from
+     * {@link RouteStageHarness#tokenPrincipalConvertBond}'s recipe — except that its datum names a principal
+     * oracle NFT ({@code e1…} + {@code 504f5243}) that {@link RouteStageHarness#oracles()} does not serve. The
+     * candidate is priced from its assessment's own feeds and reaches the router, which refuses it
+     * ({@code no oracle entry for principal oracle asset …}) after the executor has designated the token output.
+     */
+    private static Scenario tokenPrincipalUnservedPrincipalOracleConvertBond() {
+        LoanDatum datum = LoanFixtures.loanDatum(PRINCIPAL_TOKEN, new AssetType("e1".repeat(28), "504f5243"),
+                BigInteger.valueOf(100_000_000), BigInteger.valueOf(1000),
+                LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, new AssetType("b0".repeat(28), "4f52434c")),
+                NOW - 30L * 24 * 3_600_000L, LoanFixtures.liquidation(),
+                new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+        LoanFixtures.LoanUtxo loan = LoanFixtures.loanUtxo("41".repeat(32), 0, "a1b2c3d4e5f60001", datum,
+                2_000_000L, List.of(LoanFixtures.token(COLLATERAL_TOKEN, 1_000_000L)));
+        LoanFixtures.BondUtxo bond = LoanFixtures.bondUtxo("61".repeat(32), 0, "a1b2c3d4e5f60001",
+                LoanFixtures.convertToPrincipalBondDatum(BigInteger.valueOf(500),
+                        LoanFixtures.inlineKeyStakeCredential("3".repeat(56)), PRINCIPAL_TOKEN),
+                2_000_000L);
+        return new Scenario(loan, bond, LoanFixtures.assess(bond.bond(), loan.loan(),
+                OraclePriceFeed.priceDataCharlie(PRINCIPAL_TOKEN, BigInteger.ONE, BigInteger.ONE,
+                        NOW - 60_000L, NOW + 600_000L),
+                OraclePriceFeed.priceDataCharlie(COLLATERAL_TOKEN, BigInteger.valueOf(50), BigInteger.ONE,
+                        NOW - 60_000L, NOW + 600_000L),
+                NOW - 30_000L), true);
+    }
+
+    /**
+     * (i) a failed pay-in-advance build on the token output marks nothing. Why this loan: a principal oracle the
+     * executor's oracle snapshot does not serve is the machinery failure the harness can reach on the token route
+     * — since FAB-226 an ADA-collateral loan is built, so it no longer is one. The pay-in-advance router refuses
+     * this loan with an IllegalStateException once the executor has designated the token output, and it ranks
+     * first, so the token-principal candidate behind it is on the same output. The ERROR assertion keeps this from
+     * passing vacuously: if that refusal ever moved before the build, the candidate would never reach the
+     * build-failure path this test defends, and the ERROR line would be gone.
      */
     @Test
     void aFailedPayInAdvanceBuildOnATokenOutputMarksNothingAndTheNextCandidateOnItIsTransmitted() throws Exception {
-        Scenario adaCollateral = tokenPrincipalAdaCollateralConvertBond();
+        Scenario unserved = tokenPrincipalUnservedPrincipalOracleConvertBond();
         Scenario next = tokenPrincipalConvertBond(2);
 
-        Run run = stage(anticipate(Mode.LIVE, PRINCIPAL_TOKEN, null), List.of(adaCollateral, next), null);
+        Run run = stage(anticipate(Mode.LIVE, PRINCIPAL_TOKEN, null), List.of(unserved, next), null);
 
         List<LiquidationDecision> rows = oldestFirst(run);
         assertEquals(List.of(LiquidationDecision.Outcome.REFUSED, LiquidationDecision.Outcome.SUBMITTED),
                 outcomes(run), rows.toString());
-        assertEquals(adaCollateral.loanRef(), rows.getFirst().loanUtxoRef(), rows.toString());
+        assertEquals(unserved.loanRef(), rows.getFirst().loanUtxoRef(), rows.toString());
         List<String> errors = run.messages(Level.ERROR);
         assertEquals(1, errors.size(), errors.toString());
-        assertTrue(errors.getFirst().startsWith("building the pay-in-advance liquidation of " + adaCollateral.loanRef()
+        assertTrue(errors.getFirst().startsWith("building the pay-in-advance liquidation of " + unserved.loanRef()
                 + " via pay-in-advance failed"), errors.getFirst());
         assertEquals(1, run.submitted().size(), "one transmission: " + run.events());
         assertTrue(spends(run.submitted().getFirst(), TOKEN_WALLET_UTXO),
                 inputsOf(run.submitted().getFirst()).toString());
         assertFalse(anyTokenSkip(run), run.events().toString());
+        assertEquals(WorkResult.SUBMITTED, run.result());
+    }
+
+    /**
+     * (i2) FAB-226: an ADA-collateral, token-principal candidate designated the token output is built and
+     * transmitted on it — the loan (i) used to fail on before ADA collateral was wired. The bot acquires the
+     * collateral less the equity (here all 100,000,000 lovelace, the loan being under water), priced 1:1.
+     */
+    @Test
+    void anAdaCollateralTokenPrincipalCandidateOnTheTokenOutputIsBuiltAndTransmitted() throws Exception {
+        Run run = stage(anticipate(Mode.LIVE, PRINCIPAL_TOKEN, null), List.of(tokenPrincipalAdaCollateralConvertBond()),
+                null);
+
+        List<LiquidationDecision> rows = oldestFirst(run);
+        assertEquals(List.of(LiquidationDecision.Outcome.SUBMITTED), outcomes(run), rows.toString());
+        assertEquals(1, run.submitted().size(), "one transmission: " + run.events());
+        assertTrue(spends(run.submitted().getFirst(), TOKEN_WALLET_UTXO),
+                inputsOf(run.submitted().getFirst()).toString());
+        assertFalse(spends(run.submitted().getFirst(), U_UTXO), inputsOf(run.submitted().getFirst()).toString());
+        assertTrue(run.messages(Level.ERROR).isEmpty(), run.messages(Level.ERROR).toString());
+        assertTrue(rows.getFirst().detail().contains("acquired 100000000 lovelace (100000000 lovelace)"),
+                rows.getFirst().detail());
         assertEquals(WorkResult.SUBMITTED, run.result());
     }
 

@@ -1916,6 +1916,14 @@ public class LiquidationExecutor {
         // FAB-128 — the token split behind principalBalance, kept for the market-gate catch below;
         // null on the ada branch, whose count is untouched.
         WalletInputSelection.TokenHolding principalHolding = null;
+        // FAB-226: on an ada collateral the seized ada (collateral − equity) pays this shape's ada needs, so the
+        // token output carries only the shortfall of the token-collateral ceilings, floored at the min-ada
+        // ceiling. A null equity keeps today's requirement: the router refuses it before the selector.
+        BigInteger adaCollateralTokenOutputAda = assessment.loan().datum().collateral().isAda()
+                && assessment.equity() != null
+                ? WalletRoles.adaCollateralTokenOutputRequiredAda(feeCeiling,
+                        assessment.loan().collateralAmount().subtract(assessment.equity()))
+                : null;
         try {
             // Part 3 — the balance MarketGate's decide() checks. ⚠ FAB-185 residue: it still sums the
             // whole wallet as read at the start of this check, so a candidate it allows can still be
@@ -1926,7 +1934,8 @@ public class LiquidationExecutor {
                 // candidate the wallet could never actually fund (M13).
                 principalHolding = WalletInputSelection.tokenHolding(walletCheck.wallet(),
                         payInAdvancePrincipal,
-                        WalletInputSelection.tokenPrincipalRequiredAda(Optional.of(feeCeiling)));
+                        adaCollateralTokenOutputAda != null ? adaCollateralTokenOutputAda
+                                : WalletInputSelection.tokenPrincipalRequiredAda(Optional.of(feeCeiling)));
             }
             BigInteger principalBalance = payInAdvancePrincipal.isAda()
                     ? walletCheck.wallet().stream().filter(WalletInputSelection::nominable)
@@ -1951,7 +1960,8 @@ public class LiquidationExecutor {
                                         WalletRoles.adaAnticipateRequired(lenderPayout, feeCeiling), needed)
                                 : sizedToken(loanUtxoRef, payInAdvanceRole, payInAdvanceFunding,
                                         payInAdvancePrincipal.toUnit(), lenderPayout,
-                                        WalletRoles.tokenOutputRequiredAda(feeCeiling), needed);
+                                        adaCollateralTokenOutputAda != null ? adaCollateralTokenOutputAda
+                                                : WalletRoles.tokenOutputRequiredAda(feeCeiling), needed);
                     },
                     // FAB-185 — role C, pinned by the builder as the only collateral and never spent.
                     walletCheck.roles().c().orElse(null),
@@ -2869,7 +2879,10 @@ public class LiquidationExecutor {
      *       actually flows into the outputs is {@code L − liquidationFee = collateralAmount −
      *       liquidationFee} regardless of how the builder split it between {@code equity} and
      *       {@code collateralPayout}, or between the equity and the swap. Only what the outputs carry
-     *       beyond that is funded.</li>
+     *       beyond that is funded. On the pay-in-advance route the offset is {@code equity} instead (FAB-226):
+     *       the bot acquires {@code collateralAmount − equity}, fee slice included, which {@code record()}'s
+     *       REPLACED bracket prices, so only the equity flows from the collateral into the outputs; the plain
+     *       offset would clamp this shape to 0.</li>
      *   <li><b>token collateral</b> — the outputs carry tokens and no ada of their own, so the whole of
      *       the loan UTxO's ada {@code L} is available to cover their min-ada floor; the offset is that
      *       ada ({@code loan().lovelace()}), and only the min-ada beyond it is funded.</li>
@@ -2886,8 +2899,10 @@ public class LiquidationExecutor {
      * <table>
      *   <caption>What is counted, per route and collateral, and the result on the pinned fixtures</caption>
      *   <tr><th>route × collateral</th><th>counted</th><th>offset</th><th>min-ada on the pinned fixture</th></tr>
-     *   <tr><td>plain or pay-in-advance × either</td><td>asset-manager outputs (+ pay-in-advance's
+     *   <tr><td>plain × either, pay-in-advance × token</td><td>asset-manager outputs (+ pay-in-advance's
      *       collateral rider)</td><td>as above</td><td>unchanged by FAB-224</td></tr>
+     *   <tr><td>pay-in-advance × ada</td><td>asset-manager outputs</td><td>{@code equity}</td><td>2d067dae:
+     *       472,814,657 − 471,150,997 = 1,663,660, the lender output's min-ada (was 0)</td></tr>
      *   <tr><td>convert × ada</td><td>asset-manager outputs + the order output</td>
      *       <td>{@code collateralAmount − liquidationFee}</td><td>2d067dae: 4,000,000, plus the equity
      *       top-up when the equity is below the ledger minimum (was 0)</td></tr>
@@ -2993,6 +3008,14 @@ public class LiquidationExecutor {
                 }
             }
             funded = funded.add(rider);
+        }
+        // FAB-226: pay-in-advance of an ada collateral. The bot acquires collateral − equity (the REPLACED
+        // bracket in record() prices it), so only the equity flows from the collateral into the asset-manager
+        // outputs, and the rest of their coin is the bot's own: the lender output's min-ada. The rider loop above
+        // finds nothing here, because the seized ada comes back ada-only and quantityOf of lovelace is 0. The
+        // plain offset (collateralAmount − liquidationFee) would clamp this shape to 0.
+        if (ROUTE_PAY_IN_ADVANCE.equals(pass.route) && assessment.loan().datum().collateral().isAda()) {
+            funded = outputAda.subtract(assessment.equity());
         }
 
         return funded.signum() > 0 ? funded : BigInteger.ZERO;

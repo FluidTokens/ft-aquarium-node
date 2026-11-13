@@ -413,12 +413,17 @@ jobs:
       # bot fronts, an ADA-collateral convert paid from its collateral names no wallet output, and both gates are
       # pinned through real executor cycles) re-measured cold keyless on feat/fab-211-213-214-seams, 2026-11-13:
       # 254 files / 2919 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 254.
+      # FAB-226-2 (PayInAdvanceAdaCollateralGateTest: an ADA-collateral, token-principal pay-in-advance is built
+      # through a real LIVE executor cycle, its token output needs only 2 ADA because the seized ADA pays the ADA
+      # needs, and both profitability gates are pinned on its floor) re-measured cold keyless on
+      # feat/fab-211-213-214-seams, 2026-11-13:
+      # 255 files / 2927 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 255.
       #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '254'
+          RESULT_FILE_FLOOR: '255'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET
