@@ -244,6 +244,28 @@ class WalletRolesTest {
     }
 
     /**
+     * FAB-226 — an ADA collateral's token output carries the token-collateral ceiling (7,905,077 at this fee) less
+     * the seized ada, floored at the 2 ADA min-ada ceiling. 7,628,849,003 is the recorded 2d067dae loan's seized ada.
+     */
+    @Test
+    void theAdaCollateralTokenOutputCeilingIsTheShortfallFlooredAtTheMinAdaCeiling() {
+        BigInteger fee = BigInteger.valueOf(2_405_077L);
+
+        assertEquals(BigInteger.valueOf(2_000_000L),
+                WalletRoles.adaCollateralTokenOutputRequiredAda(fee, BigInteger.valueOf(7_628_849_003L)));
+        assertEquals(BigInteger.valueOf(6_905_077L),
+                WalletRoles.adaCollateralTokenOutputRequiredAda(fee, BigInteger.valueOf(1_000_000L)));
+        assertEquals(BigInteger.valueOf(2_000_000L),
+                WalletRoles.adaCollateralTokenOutputRequiredAda(fee, BigInteger.valueOf(7_905_077L)));
+        assertEquals(BigInteger.valueOf(2_000_000L),
+                WalletRoles.adaCollateralTokenOutputRequiredAda(fee, BigInteger.valueOf(5_905_077L)));
+        assertEquals(BigInteger.valueOf(2_000_000L),
+                WalletRoles.adaCollateralTokenOutputRequiredAda(fee, BigInteger.valueOf(5_905_078L)));
+        assertEquals(BigInteger.valueOf(2_000_001L),
+                WalletRoles.adaCollateralTokenOutputRequiredAda(fee, BigInteger.valueOf(5_905_076L)));
+    }
+
+    /**
      * (h) A shaped token output — exactly {@link WalletShape#SHAPED_TOKEN_LOVELACE} — must clear the token
      * route's own ceiling, or the rebalancer's shape could never fund the route it exists for.
      */

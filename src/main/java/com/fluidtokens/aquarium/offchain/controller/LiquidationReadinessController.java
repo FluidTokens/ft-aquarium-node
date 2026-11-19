@@ -29,6 +29,7 @@ import com.fluidtokens.aquarium.offchain.service.loans.MarketGate;
 import com.fluidtokens.aquarium.offchain.service.loans.MinswapPoolResolver;
 import com.fluidtokens.aquarium.offchain.service.loans.PoolUsability;
 import com.fluidtokens.aquarium.offchain.service.loans.TokenMetadataService;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletRoles;
 import com.fluidtokens.aquarium.offchain.util.LedgerCeilings;
 import com.fluidtokens.aquarium.offchain.util.WalletInputSelection;
 import lombok.extern.slf4j.Slf4j;
@@ -1099,11 +1100,34 @@ public class LiquidationReadinessController {
      */
     static FundsCheck fundsCheck(WalletBalance wallet, AssetType principal, Optional<BigInteger> feeCeiling,
                                  BigInteger advance, Function<BigInteger, String> amount) {
+        return fundsCheck(wallet, principal, feeCeiling, null, advance, amount);
+    }
+
+    /**
+     * ⛔ FAB-226's per-shape rule: the floor the token is split at depends on the loan's collateral. For a
+     * token collateral it is {@link WalletInputSelection#tokenPrincipalRequiredAda} (the fee ceiling plus the
+     * 2 ADA min-ada rider). For an ada collateral the seized ada pays the transaction's ada needs, so the token
+     * output carries only the shortfall, floored at the 2 ADA min-ada ceiling:
+     * {@link WalletRoles#adaCollateralTokenOutputRequiredAda}. The executor's market gate and selector split at
+     * exactly that floor, so the page does too — a 3-ADA token output the bot funds must never read
+     * {@code consolidate} here.
+     *
+     * @param adaCollateralSeized the ada an ada collateral's liquidation seizes (collateral − equity), or null for
+     *                            a token collateral or unknown figures, which keeps the token-collateral floor
+     * @param amount              renders a quantity of the principal, unit included — the page's scaled amounts
+     */
+    static FundsCheck fundsCheck(WalletBalance wallet, AssetType principal, Optional<BigInteger> feeCeiling,
+                                 BigInteger adaCollateralSeized, BigInteger advance,
+                                 Function<BigInteger, String> amount) {
         if (principal.isAda() || !wallet.known()) {
             return new FundsCheck(wallet.of(principal.toUnit()), null, null);
         }
+        BigInteger requiredAda = adaCollateralSeized == null
+                ? WalletInputSelection.tokenPrincipalRequiredAda(feeCeiling)
+                : WalletRoles.adaCollateralTokenOutputRequiredAda(feeCeiling.orElse(BigInteger.ZERO),
+                        adaCollateralSeized);
         WalletInputSelection.TokenHolding holding = WalletInputSelection.tokenHolding(wallet.utxos(), principal,
-                WalletInputSelection.tokenPrincipalRequiredAda(feeCeiling));
+                requiredAda);
         if (advance == null) {
             return new FundsCheck(holding.spendable(), null, null);
         }
@@ -1114,6 +1138,26 @@ public class LiquidationReadinessController {
         String label = holding.spendable().add(holding.belowAdaFloor()).compareTo(advance) >= 0
                 ? "consolidate" : "funds";
         return new FundsCheck(holding.spendable(), label, note);
+    }
+
+    /**
+     * The ada an ada collateral's pay-in-advance seizes — the {@code seized} of
+     * {@link WalletRoles#adaCollateralTokenOutputRequiredAda} — or null when that floor does not apply. The
+     * executor's is {@code collateralAmount − assessment.equity()}; the page uses its own figures at render time,
+     * because the scan's equity exists only for a buildable assessment and the page asks the forward question
+     * (could the bot handle this loan if it crossed the threshold?). A null keeps the token-collateral floor, as
+     * the executor's null equity does.
+     *
+     * @return {@code collateralAmount − figures.equity()} for an ada collateral against a token principal with
+     *         known figures, else null
+     */
+    static BigInteger adaCollateralSeized(com.fluidtokens.aquarium.offchain.model.loans.LoanDatum datum,
+                                          BigInteger collateralAmount,
+                                          LiquidatePayInAdvanceTransactionBuilder.Numbers figures) {
+        if (datum.collateral().isAda() && !datum.principalAsset().isAda() && figures != null) {
+            return collateralAmount.subtract(figures.equity());
+        }
+        return null;
     }
 
     /**
@@ -1198,6 +1242,17 @@ public class LiquidationReadinessController {
             }
         }
 
+        // The loan's figures, once: the anticipate estimate and the funds floor read the same ones. A plain or
+        // bond-less row computes none and looks no principal entry up.
+        // ⛔ FAB-227: the principal's oracle entry is looked up ONCE per row and handed to both the figures and the
+        // anticipate order cost. The cache can drop an entry between two lookups, so a second lookup could miss
+        // the entry the figures were priced with.
+        OracleEntry principalEntry = bondRoute != BondRoute.CONVERT || client == null
+                || datum.principalAsset().isAda() ? null
+                : principalOracleEntry(client, datum).orElse(null);
+        LiquidatePayInAdvanceTransactionBuilder.Numbers figures = bondRoute == BondRoute.CONVERT
+                ? numbersFor(loan, bond, principalEntry, now) : null;
+
         // ---- the route, and the capital an advance would need -------------------------------------
         String route;
         String routeDetail;
@@ -1228,11 +1283,11 @@ public class LiquidationReadinessController {
             PoolFetch fetched = resolvePool(collateralAsset, datum.principalAsset(), poolMemo, poolSnapshot);
             usability = usabilityFor(fetched, loan, bond, collateralAsset, datum.principalAsset(), now);
 
-            if (datum.collateral().isAda()) {
+            if (datum.collateral().isAda() && datum.principalAsset().isAda()) {
                 route = "NO ROUTE";
-                routeDetail = "ada collateral on a convert bond — neither the convert nor the "
-                        + "pay-in-advance route builds a liquidation for it, and the bond rules out "
-                        + "the plain route";
+                routeDetail = "ada collateral against an ada principal on a convert bond — the convert "
+                        + "route has no Minswap pool to swap ada for ada, the pay-in-advance route refuses "
+                        + "it by name, and the bond rules out the plain route";
             } else {
                 // Exhaustive, no default: a new action does not compile until it names its route here.
                 RouteChoice choice = switch (action) {
@@ -1264,14 +1319,19 @@ public class LiquidationReadinessController {
             // ⛔ SHOWN ON EVERY CONVERTIBLE ROW, not only where CONVERT was refused. The operator's
             // question is "which route pays better here", and that cannot be answered by a number
             // that only appears once the other route has already failed.
-            var numbers = numbersFor(loan, bond, now);
+            var numbers = figures;
             anticipate = numbers == null
                     ? AnticipateAndSell.unknown("this loan's figures could not be priced, so the "
                             + "estimate is not known")
                     : AnticipateAndSell.estimate(collateralAsset, datum.principalAsset(),
                             numbers.collateralLenderShouldReceive(), numbers.liquidationFee(),
                             numbers.convertedLoanCollateralToPrincipalAmount(),
-                            null, fetched.datums());
+                            // FAB-227: the order's 4 ADA in the principal's units, through the one entry this row
+                            // resolved for its figures — never a second lookup, because the cache can drop the entry
+                            // between two, and a token principal's figures are non-null only when that entry is.
+                            AnticipateAndSell.orderCostInPrincipal(datum.principalAsset(),
+                                    principalEntry == null ? null : principalEntry.feed()),
+                            fetched.datums());
         }
 
         // ⛔ COMPUTED FROM THE EFFECTIVE STATE, never the configured one: the node mode is a ceiling,
@@ -1282,7 +1342,9 @@ public class LiquidationReadinessController {
         // FAB-128: a token principal is counted as the bot counts it, and a shortfall caused by the ada
         // floor says so — in the page's own scaled amounts.
         String principalUnit = datum.principalAsset().toUnit();
-        FundsCheck funds = fundsCheck(wallet, datum.principalAsset(), feeCeiling, advance,
+        // FAB-226: an ada collateral's token principal is counted at that shape's floor, as the executor counts it.
+        FundsCheck funds = fundsCheck(wallet, datum.principalAsset(), feeCeiling,
+                adaCollateralSeized(datum, loan.collateralAmount(), figures), advance,
                 noteAmounts(q -> display(principalUnit, q, metadataMemo)));
         ProcessingBlocker blocker = ProcessingBlocker.of(
                 gate.effectiveMode(datum.principalAsset()), gate.actionFor(datum.principalAsset()),
@@ -1292,7 +1354,7 @@ public class LiquidationReadinessController {
 
         ActionNow actionNow = gatedAction(lendingConfigGate,
                 excludedAction(honestAction(health.liquidatable(), datum.collateral().isAda(),
-                                bondRoute == BondRoute.CONVERT,
+                                datum.principalAsset().isAda(), bondRoute == BondRoute.CONVERT,
                                 ActionNow.forRoute(bondRoute, health.liquidatable(),
                                         gate.effectiveMode(datum.principalAsset()),
                                         gate.actionFor(datum.principalAsset()),
@@ -1326,15 +1388,18 @@ public class LiquidationReadinessController {
     }
 
     /**
-     * FAB-117: a liquidatable ADA-collateral loan whose bond asks for CONVERSION gets
-     * {@link ActionNow#adaCollateralNotLiquidated()} whatever the market's action -- {@code computed} would
-     * say ADVANCE (an unknown advance skips the cap check) or CONVERT, and both of those routes refuse it.
-     * A PLAIN bond keeps {@code computed}: the plain route does liquidate ada collateral.
+     * A liquidatable loan with ADA collateral against an ADA principal whose bond asks for CONVERSION gets
+     * {@link ActionNow#adaCollateralAgainstAdaPrincipalNotLiquidated()} whatever the market's action --
+     * {@code computed} would say ADVANCE (an unknown advance skips the cap check) or CONVERT, and neither
+     * route builds that pair: no Minswap pool swaps ada for ada, and pay-in-advance refuses it by name.
+     * FAB-117 overrode every ada collateral; since FAB-224 (convert) and FAB-226 (pay-in-advance) an ada
+     * collateral against a token principal is built by both, so it keeps {@code computed}. A PLAIN bond
+     * keeps {@code computed} too: the plain route does liquidate ada collateral.
      */
-    static ActionNow honestAction(Boolean liquidatable, boolean adaCollateral, boolean convertBond,
-                                  ActionNow computed) {
-        return Boolean.TRUE.equals(liquidatable) && adaCollateral && convertBond
-                ? ActionNow.adaCollateralNotLiquidated() : computed;
+    static ActionNow honestAction(Boolean liquidatable, boolean adaCollateral, boolean adaPrincipal,
+                                  boolean convertBond, ActionNow computed) {
+        return Boolean.TRUE.equals(liquidatable) && adaCollateral && adaPrincipal && convertBond
+                ? ActionNow.adaCollateralAgainstAdaPrincipalNotLiquidated() : computed;
     }
 
     /**
@@ -1354,12 +1419,14 @@ public class LiquidationReadinessController {
     }
 
     /**
-     * Why an ADA-collateral row has no pool verdict: neither the convert nor the pay-in-advance route builds
-     * a liquidation for one. (The PLAIN route does -- this is about the pool, which only convert uses.)
+     * Why a row with ADA collateral against an ADA principal has no pool verdict: no Minswap pool swaps ada
+     * for ada, and the pay-in-advance route refuses that pair by name. An ada collateral against a token
+     * principal gets the ordinary verdict, since both routes build it (FAB-224, FAB-226). (The PLAIN route
+     * liquidates either -- this is about the pool, which only convert uses.)
      */
-    static final String ADA_COLLATERAL_NOT_LIQUIDATED =
-            "ada collateral: neither the convert nor the pay-in-advance route builds a liquidation for it (no "
-                    + "collateral oracle leg), so no pool verdict is given";
+    static final String ADA_AGAINST_ADA_NOT_LIQUIDATED =
+            "ada collateral against an ada principal: no Minswap pool swaps ada for ada and the pay-in-advance "
+                    + "route refuses it by name, so no pool verdict is given";
 
     /**
      * ⛔ FAB-126 slice 2 r2: the route detail of a CONVERT market whose pool verdict is not USABLE, which
@@ -1418,9 +1485,9 @@ public class LiquidationReadinessController {
     record RouteChoice(String route, String detail, boolean computesAdvance) { }
 
     /**
-     * ⛔ FAB-194-4: the route a {@code CONVERT_BEFORE_ANTICIPATE} market's token-collateral row would take,
-     * read from the pool verdict this page computed from the node's own index — the executor's split, never
-     * the ANTICIPATE market's fixed text. Convert switched off, or a verdict saying convert is IMPOSSIBLE
+     * ⛔ FAB-194-4: the route a {@code CONVERT_BEFORE_ANTICIPATE} market's convert-bond row (token or ada
+     * collateral) would take, read from the pool verdict this page computed from the node's own index — the
+     * executor's split, never the ANTICIPATE market's fixed text. Convert switched off, or a verdict saying convert is IMPOSSIBLE
      * ({@code NO_POOL}, {@code TOO_THIN}, {@code NOT_CONFIGURED}), pays in advance; {@code USABLE} converts;
      * {@code WRONG_PAIR} and {@code CANNOT_QUOTE} are refused by the convert route and never fall back; a
      * verdict that could not be reached ({@code CHECK_FAILED}, {@code UNKNOWN}) leaves the route unknown. The
@@ -1470,9 +1537,9 @@ public class LiquidationReadinessController {
         if (fetched.unavailable() != null) {
             return fetched.unavailable();
         }
-        if (loan.datum().collateral().isAda()) {
+        if (loan.datum().collateral().isAda() && loan.datum().principalAsset().isAda()) {
             return new PoolUsability(PoolUsability.Verdict.UNKNOWN,
-                    ADA_COLLATERAL_NOT_LIQUIDATED);
+                    ADA_AGAINST_ADA_NOT_LIQUIDATED);
         }
         var numbers = numbersFor(loan, bond, now);
         if (numbers == null) {
@@ -1714,8 +1781,8 @@ public class LiquidationReadinessController {
 
     /**
      * ⛔ The PRODUCTION figure — {@code convertedLoanCollateralToPrincipalAmount}, taken from the
-     * builder, never {@code remainingDebt}. Null when the collateral (or, for a non-ada principal,
-     * the principal) has no oracle entry, because the amount genuinely cannot be known then.
+     * builder, never {@code remainingDebt}. Null when a token collateral, or a token principal, has no
+     * oracle entry naming it, because the amount genuinely cannot be known then.
      * <p>
      * F5 (round 2) — routed through the REAL {@code numbers()} overload with the loan's own principal
      * oracle, never the deprecated 4-arg one that silently priced every principal as ada. That
@@ -1758,6 +1825,29 @@ public class LiquidationReadinessController {
      */
     LiquidatePayInAdvanceTransactionBuilder.Numbers numbersFor(Loan loan, LenderBond bond, long now) {
         FluidOracleClient client = oracleClient.getIfAvailable();
+        if (client == null) {
+            return null;
+        }
+        OracleEntry principalOracle = null;
+        if (!loan.datum().principalAsset().isAda()) {
+            Optional<OracleEntry> principalEntry = principalOracleEntry(client, loan.datum());
+            if (principalEntry.isEmpty()) {
+                return null;
+            }
+            principalOracle = principalEntry.get();
+        }
+        return numbersFor(loan, bond, principalOracle, now);
+    }
+
+    /**
+     * {@link #numbersFor(Loan, LenderBond, long)}'s core, priced with a principal entry the caller has already
+     * resolved: null for an ada principal, and for a token principal null means it could not be priced. It never
+     * looks the principal up itself, so a caller that resolved the entry once prices everything else it shows
+     * through that same entry.
+     */
+    private LiquidatePayInAdvanceTransactionBuilder.Numbers numbersFor(Loan loan, LenderBond bond,
+                                                                       OracleEntry principalOracle, long now) {
+        FluidOracleClient client = oracleClient.getIfAvailable();
         LoansContractRegistry reg = registry.getIfAvailable();
         if (client == null || reg == null) {
             return null;
@@ -1766,34 +1856,43 @@ public class LiquidationReadinessController {
         // token lookup, tolerated as a "controller-only simplification" while every token had one
         // oracle; since 2026-09-30 a token can have two (v1 Lending v3, v2 Lending v4), and these
         // figures must be the ones the transaction for THIS loan would be built from.
-        // ⚠ ADA collateral gets NO figures, deliberately: its datum names the NONE sentinel, which has no
-        // registry entry, so this returns null. Do not synthesise a 1:1 entry here — these figures feed
-        // only the convert and pay-in-advance routes, and neither builds an ada-collateral loan (both
-        // refuse it by name, FAB-117), so figures would become a pool verdict and a "would act" the bot
-        // cannot honour. (The PLAIN route does liquidate ada collateral, and needs none of these figures.) usabilityFor says why instead (oracle re-slice, round-2 audit finding 1).
-        Optional<OracleEntry> oracle = client.findEntryByOracleToken(loan.datum().collateral().oracleTokenAsset())
-                .filter(e -> e.token().equals(loan.datum().collateral().assetType()));
-        if (oracle.isEmpty()) {
+        // ⛔ FAB-227: an ada collateral has no collateral oracle leg and none is looked up. Both routes build an
+        // ada collateral against a token principal (convert since FAB-224, pay-in-advance since FAB-226) and price
+        // it 1:1, as retrieve_oracle_data does for the empty policy id; numbers() applies that unit feed for an
+        // ada collateral whatever entry it is handed, so null is passed, exactly as the builder documents. An
+        // ADA/ADA row shows the pool fetch's own verdict when the fetch is unavailable (NO_POOL, NOT_CONFIGURED or
+        // CHECK_FAILED, returned before any figures are used); were a pool ever fetched, usabilityFor's ADA/ADA
+        // guard returns UNKNOWN with ADA_AGAINST_ADA_NOT_LIQUIDATED before computing a verdict.
+        boolean adaCollateral = loan.datum().collateral().isAda();
+        Optional<OracleEntry> oracle = adaCollateral ? Optional.empty()
+                : client.findEntryByOracleToken(loan.datum().collateral().oracleTokenAsset())
+                        .filter(e -> e.token().equals(loan.datum().collateral().assetType()));
+        if (!adaCollateral && oracle.isEmpty()) {
             return null;
         }
-        AssetType principalAsset = loan.datum().principalAsset();
-        OracleEntry principalOracle = null;
-        if (!principalAsset.isAda()) {
-            Optional<OracleEntry> principalEntry = client.findEntryByOracleToken(loan.datum().principalOracleAsset())
-                    .filter(e -> e.token().equals(principalAsset));
-            if (principalEntry.isEmpty()) {
-                return null;
-            }
-            principalOracle = principalEntry.get();
+        if (!loan.datum().principalAsset().isAda() && principalOracle == null) {
+            return null;
         }
         try {
             return new LiquidatePayInAdvanceTransactionBuilder(reg, network.getCardanoNetwork(),
                     (com.bloxbean.cardano.client.api.UtxoSupplier) null,
                     (com.bloxbean.cardano.client.api.ProtocolParamsSupplier) null)
-                    .numbers(loan, bond, oracle.get(), principalOracle, now);
+                    .numbers(loan, bond, oracle.orElse(null), principalOracle, now);
         } catch (RuntimeException e) {
             log.debug("could not compute this loan's figures for {}: {}", loan.utxoRef(), e.toString());
             return null;
         }
+    }
+
+    /**
+     * The principal's oracle entry, by the NFT the datum names and only if it prices the principal — the
+     * lookup {@link #numbersFor} prices the loan with. {@code row()} calls it once per row and hands the result to
+     * both its figures and the anticipate estimate's order cost. Empty when no entry is indexed or it prices
+     * another asset.
+     */
+    private static Optional<OracleEntry> principalOracleEntry(
+            FluidOracleClient client, com.fluidtokens.aquarium.offchain.model.loans.LoanDatum datum) {
+        return client.findEntryByOracleToken(datum.principalOracleAsset())
+                .filter(e -> e.token().equals(datum.principalAsset()));
     }
 }

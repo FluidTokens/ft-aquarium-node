@@ -64,6 +64,24 @@ final class DesignatedInputUtxoSupplier implements UtxoSupplier {
         return new DesignatedInputUtxoSupplier(delegate, credential, designated);
     }
 
+    /**
+     * FAB-224 — the view of {@code delegate} in which {@code walletAddress}'s payment credential holds
+     * <b>NOTHING</b>: every page of every address with that payment credential is empty, so a build balanced
+     * through it cannot spend a single wallet output. Every other address and every {@link #getTxOutput} are
+     * delegated unchanged, so the pinned collateral, the loan, the bond and every reference input still resolve
+     * by out-ref. For a build that funds itself from its own script inputs and is handed no wallet input at all.
+     *
+     * @throws IllegalArgumentException when {@code walletAddress} has no payment credential to hide behind,
+     *                                  exactly as {@link #of} refuses it
+     */
+    static UtxoSupplier withoutWalletInput(UtxoSupplier delegate, String walletAddress) {
+        Objects.requireNonNull(delegate, "delegate");
+        Credential credential = paymentCredentialOf(Objects.requireNonNull(walletAddress, "walletAddress"))
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "wallet address " + walletAddress + " has no payment credential to scope a view to"));
+        return new DesignatedInputUtxoSupplier(delegate, credential, null);
+    }
+
     @Override
     public List<Utxo> getPage(String address, Integer nrOfItems, Integer page, OrderEnum order) {
         if (!isWallet(address)) {
@@ -90,9 +108,12 @@ final class DesignatedInputUtxoSupplier implements UtxoSupplier {
         return delegate.isUsedAddress(address);
     }
 
-    /** {@code [designated]} on page 0 of its own address; nothing anywhere else in the wallet. */
+    /**
+     * {@code [designated]} on page 0 of its own address; nothing anywhere else in the wallet — and nothing at all
+     * in a {@link #withoutWalletInput} view, which has no designated input.
+     */
     private List<Utxo> designatedAt(String address, Integer page) {
-        if (page != null && page > 0) {
+        if (designated == null || (page != null && page > 0)) {
             return List.of();
         }
         return designated.getAddress() != null && designated.getAddress().equals(address)

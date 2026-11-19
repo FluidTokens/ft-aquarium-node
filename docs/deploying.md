@@ -70,8 +70,11 @@ arms nothing and spends nothing; a preview node ships in `shadow` (below):
 - **`shadow` or `live`, with the default `CONVERT` markets** and token collateral: **about 11.6
   ADA** — the 5 ADA collateral UTxO C plus about 6.6 ADA in the change UTxO U, which is what a convert
   needs (below) — plus the fee of the self-send that shapes the wallet.
-- **A convert of ADA collateral** needs more: U must also hold the ada being swapped, so the wallet
-  needs about 11.6 ADA **plus that amount**.
+- **A convert of ADA collateral** is paid from the collateral: the loan's liquidation fee funds the 4 ADA
+  Minswap order overhead, the bot's own outputs and the transaction fee. When that fee covers all of them it
+  spends **no wallet output at all** — the wallet needs only C and the shape below. Otherwise U funds the
+  **shortfall only**, never the swapped ada, and must hold that shortfall plus the fee ceiling (§9, "Which
+  pairs are liquidated, and what each costs").
 
 Plus whatever principal you are willing to front *if* you enable `ANTICIPATE` or
 `CONVERT_BEFORE_ANTICIPATE` markets (§9). **The 30,000 FLDT does not live here** —
@@ -111,17 +114,19 @@ for what"):
   its funding UTxO.
 - **U** — the largest other ada-only UTxO (the change, in a shaped wallet). A **plain** liquidation
   needs U to hold the fee ceiling (the most this ledger could charge in fees, about 2.6 ADA). A
-  **convert** needs the Minswap order overhead (4 ADA) plus the fee ceiling — **about 6.6 ADA**, an
-  approximate figure derived from those two constants — when the collateral is a token. When the
-  collateral is **ada**, the order carries the ada being swapped as well, so U must hold that amount
-  plus the 4 ADA plus the fee ceiling. A convert fronts **no capital** — the swapped ada is the loan's
-  collateral, not yours — but U must hold the order amount meanwhile: it is checked before the
-  transaction is built. An **ADA-principal anticipate** needs the
+  **convert** of a **token** collateral needs the Minswap order overhead (4 ADA) plus the fee ceiling —
+  **about 6.6 ADA**, an approximate figure derived from those two constants. A convert of an **ada**
+  collateral needs **nothing from U** when its liquidation fee covers the order overhead, the bot's own
+  outputs and the fee ceiling; otherwise U must hold the **shortfall plus the fee ceiling** — never the
+  swapped ada, which leaves the loan, not the wallet. A convert fronts **no capital**: the swapped
+  collateral is the loan's, not yours. An **ADA-principal anticipate** needs the
   lender payout plus the fee ceiling plus **about 3.5 ADA of riders** (the bot's own collateral
   output and the change's minimum ada).
 - **A token anticipate** is funded from **its own token UTxO**, never from U: the rebalancer gives
   the token of each `ANTICIPATE` or `CONVERT_BEFORE_ANTICIPATE` market one, with **10 ADA** beside the
-  token.
+  token. That output must hold the payout in the token and, beside it, the fee ceiling plus about 5.5 ADA
+  of riders (about 8.1 ADA) for a token collateral. For an **ada** collateral the seized ada pays part of
+  that, so it needs only the larger of 2 ADA and (fee ceiling + 5.5 ADA − the seized ada).
 - **+10 ADA** when the wallet holds any other tokens (the UTxO that bundles them).
 
 **A missing or too-small role is refused, by name.** A liquidation whose role is missing is recorded as
@@ -537,9 +542,9 @@ convert switched off) decides between the convert and the pay-in-advance:
 
 | action | what it does | what it costs you |
 |---|---|---|
-| `CONVERT` | sells the collateral through a Minswap V2 order to repay the lender | **no capital** — a transaction fee and the ~4 ADA the validator makes the order carry. But U must hold the order amount meanwhile: 4 ADA, or for an ada collateral the swapped ada plus 4 ADA, plus the fee ceiling ("Which wallet output pays for what", below) |
+| `CONVERT` | sells the collateral through a Minswap V2 order to repay the lender | **no capital** — a transaction fee and the ~4 ADA the validator makes the order carry. For a token collateral U must hold that 4 ADA plus the fee ceiling meanwhile; an ada collateral is paid from the collateral and spends no wallet output unless its fee is too small ("Which pairs are liquidated, and what each costs" and "Which wallet output pays for what", below) |
 | `ANTICIPATE` | repays the lender **from your own wallet** and keeps the collateral | **your capital**, up to a `cap` you must state |
-| `CONVERT_BEFORE_ANTICIPATE` | converts, as `CONVERT` does; only when a convert is **impossible** for the loan, repays the lender from your own wallet instead, as `ANTICIPATE` does, in the same check (below) | **no capital** when it converts (U must still hold the order amount, as for `CONVERT`); **your capital**, up to a `cap` you must state, when it pays in advance |
+| `CONVERT_BEFORE_ANTICIPATE` | converts, as `CONVERT` does; only when a convert is **impossible** for the loan, repays the lender from your own wallet instead, as `ANTICIPATE` does, in the same check (below) | **no capital** when it converts (U is funded as for `CONVERT`); **your capital**, up to a `cap` you must state, when it pays in advance |
 
 **`action` applies only to loans whose lender allows conversion.** Each loan's lender bond says
 whether its collateral may be converted to the principal. A loan whose lender does not allow it gets a
@@ -631,6 +636,85 @@ shipped start point (mainnet: slot `154984561`, 2025-05-06). It makes visible a 
 started later than the shipped value. It does **not** help a pool idle since **before** 2025-05-06: the
 re-sync replays the same blocks, none of which carries that pool's current output, so it stays
 invisible until it moves, re-sync or not.
+
+### Which pairs are liquidated, and what each costs
+
+A loan whose lender forbids conversion gets the **plain** liquidation whatever its pair (unchanged). For a
+lender that allows conversion, the route the market's `action` picks is built for every pair below except
+one. "Fee ceiling" is the most this ledger could charge in fees, about 2.6 ADA; every ADA figure is
+approximate and moves with the protocol parameters.
+
+| collateral → principal | `CONVERT` builds | funded from | that output must hold | what the bot pays |
+|---|---|---|---|---|
+| token → ADA | yes | **U** | the 4 ADA order overhead plus the fee ceiling: about 6.6 ADA | the transaction fee and the 4 ADA order overhead, recovered from the liquidation fee (paid in the collateral token) |
+| token → token | yes | **U** | the same: about 6.6 ADA | the same; the fee income is the collateral token, valued by its own oracle, and both tokens' oracles are read in the one transaction |
+| ADA → token | yes | **no wallet output** when the loan's fee covers the costs, else **U** for the shortfall | nothing; or the shortfall plus the fee ceiling | the 4 ADA order overhead, the transaction fee and any equity top-up, paid from the collateral's liquidation fee |
+| ADA → ADA | **no** — no ada/ada pool exists | — | — | — |
+
+| collateral → principal | `ANTICIPATE` builds | funded from | that output must hold | what the bot pays |
+|---|---|---|---|---|
+| token → ADA | yes | **U** | the lender payout, the fee ceiling and about 3.5 ADA of riders | the payout, up to your `cap`; you keep the collateral |
+| token → token | yes | **the UTxO holding the most of the principal token** (no datum, no reference script) | the payout in the token and, beside it, the fee ceiling plus 5.5 ADA (2 ADA lender minimum, 1.5 ADA collateral rider, 2 ADA change): about 8.1 ADA | the payout, up to your `cap`; you keep the collateral |
+| ADA → token | yes | **the same token UTxO** | the payout in the token and, beside it, the larger of 2 ADA and (fee ceiling + 5.5 ADA − the seized ada), where seized ada = collateral − equity. A loan seizing more than the fee ceiling plus 3.5 ADA needs only 2 ADA, because the seized ada pays the fee and the outputs' minimum ada | the payout, up to your `cap`; you keep the collateral |
+| ADA → ADA | **no** — refused by name, `ada collateral: with an ada principal …` | — | — | — |
+
+No live loan has an ADA collateral against an ADA principal.
+
+**An ADA collateral is converted without touching the wallet when its fee is large enough.** The loan's
+liquidation fee must cover all of: the 4 ADA Minswap order overhead; 4 × 2 ADA of ceilings for the bot's own
+outputs (the withdrawal dummy, two datum carriers and the change); up to 2 ADA to lift a small equity
+output to the ledger minimum (only when the loan has a small equity); and the fee ceiling. That is about
+14.6 ADA of fee with no equity, and up to about 16.6 ADA with a small one. Below that, U funds only the
+shortfall and must hold the shortfall plus the fee ceiling. On the recorded 8,100-ADA loan, at its 40‰ bond
+(a 324 ADA fee) no wallet output is spent; a synthetic 1‰ bond (an 8.1 ADA fee) asks U for 3.9 ADA. The
+dex-cost floor (`5000000`) and the shared margin apply to this convert as to every convert (§8).
+A convert that spends no wallet output names none: its `SUBMITTED` row carries no "U stays in this check"
+note. On a `CONVERT` market a U must still exist, because it is designated before the router decides; a
+missing one is `WALLET_ROLE_MISSING`. A `CONVERT_BEFORE_ANTICIPATE` market designates U only if the router
+asks for it.
+
+**After an ADA-collateral pay-in-advance the wallet is out of shape.** The seized ada comes back ada-only in
+the change, and any principal tokens left in the funding output come back in their own output at its minimum
+ada. The rebalancer restores the token's 10 ADA output on its next pass that has nothing else to do
+("Wallet rebalancing", below). Until then that output carries only its minimum ada, so a token-collateral
+pay-in-advance on the same market, which needs about 8.1 ADA beside the token, would be refused
+`WALLET_INPUT_TOO_SMALL`.
+
+**A pair no pool can convert.** Markets are keyed by the **principal**. A loan with STRIKE collateral and a
+USDM principal meets a nearly empty Minswap USDM/STRIKE pool, so a convert is refused `POOL_TOO_THIN`
+(the readiness page shows the pool verdict). Such a loan is liquidated only when the USDM market's
+`action` is `ANTICIPATE`, or `CONVERT_BEFORE_ANTICIPATE`, with a `cap`; and that setting applies to **every**
+USDM-principal loan. A `CONVERT_BEFORE_ANTICIPATE` market still converts the USDM loans whose pool can fill
+the debt and pays in advance only for the rest. The node ships no market change for this: it is your
+decision, because it puts your capital at risk up to the `cap`.
+
+**Still refused:**
+
+- **A Charli3 oracle leg on the convert route, once the convert reaches the builder.** A loan whose collateral
+  or principal is priced by a `PRICE_DATA_CHARLIE` feed is refused by the convert builder as
+  `ORACLE_VARIANT_NOT_MODELLED`, but only after the earlier convert checks pass: Minswap is configured, a pool
+  for the pair is indexed and can fill the debt, and the feeds cover the validity window. That refusal is not
+  one of the three fallback causes, so in that case a `CONVERT_BEFORE_ANTICIPATE` market does **not** pay the
+  loan in advance instead. It reaches the liquidations endpoint as a `REFUSED` row whose reason is
+  `RefusedException` and whose detail starts `RefusedException: ORACLE_VARIANT_NOT_MODELLED: the principal
+  oracle … publishes a PRICE_DATA_CHARLIE feed …` (or `the collateral oracle`), and the node logs it at ERROR
+  on each cycle in which the convert reaches the builder: `building the convert liquidation of <loan> via
+  convert failed: …`. On a cycle whose feeds do not cover the window the row is `CONVERT_FEED_WINDOW` instead,
+  at INFO. A Charli3 loan whose convert stops earlier, with no pool (`NO_MINSWAP_POOL`), a thin pool
+  (`POOL_TOO_THIN`) or convert switched off (`CONVERT_DISABLED`), falls back on a `CONVERT_BEFORE_ANTICIPATE`
+  market and is paid in advance like any other, because pay-in-advance handles Charli3 legs. Preview ships
+  `loans.minswap.pool-address` blank, so on preview a `CONVERT` market records these loans as
+  `NO_MINSWAP_POOL` and a `CONVERT_BEFORE_ANTICIPATE` market pays them in advance. No live mainnet convert
+  loan has a Charli3 leg. Tracked as FAB-228.
+- **Repayment receipts** (unchanged).
+- **An ADA collateral against an ADA principal**, by either route.
+
+**Rollout: nothing to set.** These pairs are live by default behind the switches you already have: the node
+`mode`, each market's `mode`, `action` and `cap`, `LOANS_LIQUIDATION_CONVERT_ENABLED` and the shared margin
+govern them exactly as they govern token → ADA. A `shadow` or `live` node with the default `CONVERT` markets
+now converts ADA-collateral and token → token loans whose pool can fill. One with `ANTICIPATE` or
+`CONVERT_BEFORE_ANTICIPATE` markets now also pays in advance against an ADA collateral. Start in `shadow`
+(§8) if you want to see the decisions first.
 
 ### Worked example — four markets
 
@@ -741,12 +825,17 @@ rebalances.
 Why: the bot fronts the principal of an `ANTICIPATE` market — and of a `CONVERT_BEFORE_ANTICIPATE`
 market whose convert is impossible — from **one** UTxO, which must carry the token *and*
 the ada the transaction needs beside it (the fee ceiling plus about 5.5 ADA of riders — under 10 ADA
-at current parameters), so each such token gets its own
+at current parameters; for an ADA collateral the seized ada pays part of that, so the requirement is the
+larger of 2 ADA and the fee ceiling plus 5.5 ADA less the seized ada), so each such token gets its own
 funded UTxO instead of being scattered or bundled with others. C is never below the 5 ADA the
 transaction builder selects as collateral, nor below the most collateral the ledger can require, so
 a collateral UTxO of the right size is kept ready for the bot's script transactions. And one change
 UTxO keeps your ada in one piece rather than fragmented. An ADA-principal market is fronted from that change,
-so it adds no UTxO of its own. **A token of an `ANTICIPATE` or `CONVERT_BEFORE_ANTICIPATE` market whose
+so it adds no UTxO of its own. **After a pay-in-advance of an ADA collateral the wallet is out of shape**: the
+seized ada comes back ada-only in the change, and the principal tokens left in the funding output come back in
+their own output at its minimum ada. The next pass that has nothing else to do restores the token's 10 ADA
+output; until then a token-collateral pay-in-advance on that market, which needs about 8.1 ADA beside the
+token, would be refused `WALLET_INPUT_TOO_SMALL`. **A token of an `ANTICIPATE` or `CONVERT_BEFORE_ANTICIPATE` market whose
 mode is `DISABLED` is not kept ready**: it goes in the "every other token" UTxO.
 
 **The funds it needs.** The wallet's ada must cover:
@@ -815,13 +904,19 @@ the rest of that check:
 | liquidation | funded from | it must hold, before anything is built |
 |---|---|---|
 | plain | **U**, the largest ada-only UTxO that is not C | the fee ceiling |
-| convert | **U** | the Minswap order plus the fee ceiling: about 6.6 ADA when the collateral is a token; when it is ada, the swapped ada plus 4 ADA plus the fee ceiling. No capital is spent — the swapped ada is the loan's collateral — but U must hold it meanwhile |
+| convert, token collateral | **U** | the Minswap order overhead plus the fee ceiling: about 6.6 ADA. No capital is spent |
+| convert, ada collateral | **no wallet output** when the loan's liquidation fee covers the order overhead, the bot's own outputs and the fee ceiling; otherwise **U** | nothing; or the shortfall plus the fee ceiling — never the swapped ada |
 | anticipate, ADA principal | **U** | the lender payout, the fee ceiling and about 3.5 ADA of riders |
-| anticipate, token principal | **the UTxO holding the most of that token** (no datum, no reference script) | the payout in the token, and the fee ceiling plus about 5.5 ADA of riders beside it |
+| anticipate, token principal, token collateral | **the UTxO holding the most of that token** (no datum, no reference script) | the payout in the token, and the fee ceiling plus 5.5 ADA of riders beside it: about 8.1 ADA |
+| anticipate, token principal, ada collateral | **the same token UTxO** | the payout in the token, and the larger of 2 ADA and (fee ceiling + 5.5 ADA − the seized ada) beside it |
 
-A `CONVERT_BEFORE_ANTICIPATE` market is funded as a convert — from **U** — when it converts, and as an
+A `CONVERT_BEFORE_ANTICIPATE` market is funded as a convert — from **U**, or from no wallet output for an ada collateral whose fee covers the costs — when it converts, and as an
 anticipate when it pays in advance: from the UTxO holding its token for a token principal, from **U** for
 an ADA principal. A missing U does not stop a token-principal fallback, which needs none.
+
+**A convert that spends no wallet output names none**: its row's output is `none` and its `SUBMITTED`
+row carries no "U stays in this check" note, because U was never at risk. Which pairs get which funding is
+in §9, "Which pairs are liquidated, and what each costs".
 
 **C — the ada-only UTxO of exactly the collateral size — is never handed to a liquidation as its
 funding UTxO.** The figures are ceilings checked before the build; the build is the judge of whether

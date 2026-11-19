@@ -20,6 +20,7 @@ error.
 | You enabled the **UI** | restart | untouched |
 | Upgrading to the release that reads **oracle liveness from the index** (FAB-196) | on a node **already on Yaci Store 2.0.7**: pull, restart — nothing else required; a re-sync with the §1.1 steps is optional ([§7](#oracle-liveness-is-read-from-the-index-first-fab-196)). It ships in the 2026-11 release, so from Yaci 0.1.7 **§1.3 comes first** | untouched on Yaci 2.0.7, unless you choose to re-sync; from 0.1.7, ⛔ **wiped** (§1.3) |
 | Upgrading to the release that adds **`CONVERT_BEFORE_ANTICIPATE`** and keeps **U in the check** (FAB-194) | on a node **already on Yaci Store 2.0.7**: pull, restart — nothing else required; it changes how every `shadow` or `live` node funds liquidations from U ([§7](#u-stays-in-the-check-convert_before_anticipate-fab-194)). It ships in the 2026-11 release, so from Yaci 0.1.7 **§1.3 comes first** | untouched on Yaci 2.0.7; from 0.1.7, ⛔ **wiped** (§1.3) |
+| Upgrading to the release that **liquidates every collateral/principal pair** (FAB-215) | on a node **already on Yaci Store 2.0.7**: pull, restart — nothing to set; the rollout is live by default behind your existing switches ([§7](#every-collateral-and-principal-pair-is-liquidated-fab-215)). From an image on Yaci Store 0.1.7, **§1.3 comes first** | untouched on Yaci 2.0.7 |
 | **FluidTokens redeployed the contracts** (new config NFTs), or moved a script the node **indexes** under the same NFTs | §4 — new coordinates **and a full re-sync** | ⛔ **wiped** |
 | FluidTokens replaced **action scripts in place** (same config NFTs — e.g. 2026-10-01, 2026-10-23/26) | §4.8, §4.9 — new image, restart | untouched |
 | You changed `sync-start-*` | §3 — on an existing database this **does nothing** by itself | ⛔ **wiped, or no effect** |
@@ -955,6 +956,46 @@ moved **after** the shipped `sync-start` (mainnet: 2025-05-06) but before your o
 for example on a node whose cursor started later than the shipped value. A pool idle since **before**
 2025-05-06 is in none of the blocks a re-sync replays, so it stays invisible until it moves, re-sync or
 not.
+
+### Every collateral and principal pair is liquidated (FAB-215)
+
+This release makes the bot build liquidations it used to refuse or ignore: a token collateral against a token
+principal by convert (pay-in-advance already built that pair), and an ADA collateral against a token
+principal by either route. Nothing to set, and the database is untouched.
+The route, funding and cost of every pair is one table, in
+[deploying.md §9](deploying.md#which-pairs-are-liquidated-and-what-each-costs); it is not repeated here.
+
+- **Live by default.** The node mode, each market's `mode`, `action` and `cap`,
+  `LOANS_LIQUIDATION_CONVERT_ENABLED` and the shared margin govern the new pairs exactly as they govern
+  token → ADA. A `shadow` node shows what it would do; a `live` node does it.
+- **`CONVERT` markets, and markets you have not listed:** a `shadow` or `live` node now converts ADA-collateral
+  and token → token loans whose Minswap pool can fill the debt. An ADA collateral is paid from the collateral:
+  when the loan's liquidation fee covers the 4 ADA order overhead, the bot's own outputs and the fee ceiling it
+  spends **no wallet output**; otherwise U funds only the shortfall. Older images asked U to hold the swapped
+  ada plus 4 ADA; that is no longer true.
+- **`ANTICIPATE` and `CONVERT_BEFORE_ANTICIPATE` markets:** the bot now also pays in advance against an ADA
+  collateral, funded from the token UTxO of a token principal (a larger requirement for a token collateral, a
+  smaller one for an ADA collateral, whose seized ada pays part of it). After one, the wallet is out of shape
+  and the rebalancer restores the token's 10 ADA output on its next idle pass.
+- **Profitability on convert changed.** The executor's floor (`min-profit-absolute`, then the margin) now counts
+  the 4 ADA Minswap order output the bot fronts, as the convert economics already did. For a token collateral
+  that is net of the loan's own lovelace (+2 ADA on the recorded token → ADA fixture, +3 ADA on token → token),
+  so marginal token converts are slightly rarer.
+- **The readiness page** shows, for an ADA collateral against a token principal, the route, pool verdict, advance
+  and "Action now" a token collateral gets, counting the token output at that shape's floor. Only an ADA
+  principal against an ADA collateral shows `NO ROUTE`. A token principal's anticipate estimate charges the
+  order cost in the principal's units.
+- **A pair no pool can convert.** Markets are keyed by the principal. A STRIKE-collateral, USDM-principal loan
+  meets a nearly empty pool and is refused `POOL_TOO_THIN`; it is liquidated only if the USDM market is
+  `ANTICIPATE` or `CONVERT_BEFORE_ANTICIPATE` with a `cap`, which applies to every USDM-principal loan. The node
+  ships no market change for it; that is your decision.
+- **Still refused.** A Charli3 (`PRICE_DATA_CHARLIE`) oracle leg on the convert route is refused as
+  `ORACLE_VARIANT_NOT_MODELLED` once the convert reaches the builder (Minswap configured, a pool that can fill
+  the debt, feeds covering the window). In that case a `CONVERT_BEFORE_ANTICIPATE` market does not pay it in
+  advance instead (FAB-228). A Charli3 loan with no pool, a thin pool or convert switched off falls back and
+  is paid in advance like any other; on preview, whose pool address ships blank, that is every such loan. See
+  [deploying.md §9](deploying.md#which-pairs-are-liquidated-and-what-each-costs). Repayment receipts, and an
+  ADA collateral against an ADA principal, are refused as before.
 
 ### Yaci Store 2.0.7 (FAB-203)
 

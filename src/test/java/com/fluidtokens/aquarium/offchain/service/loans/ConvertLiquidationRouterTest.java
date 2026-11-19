@@ -164,7 +164,9 @@ class ConvertLiquidationRouterTest {
      * exception cannot be arriving for another reason.
      *
      * <p>Mutant M12 (neuter the executor's catch) is killed by the executor-side pair of this test;
-     * removing this throw and passing {@code null} through is killed HERE.
+     * removing this throw and passing {@code null} through is killed HERE. Since FAB-227 it also pins
+     * the token branch's literal, {@code (the order overhead; the collateral is a token)}, and
+     * mutation R1 is its control.
      */
     @Test
     void aWalletWithNoSufficientUtxoIsRefusedByNameAndSaysWhatTheOrderNeeded() {
@@ -177,6 +179,9 @@ class ConvertLiquidationRouterTest {
         assertTrue(e.getMessage().contains("4000000"),
                 "the operator must be told WHAT the order needed — the Minswap order overhead for a "
                         + "token collateral: " + e.getMessage());
+        assertTrue(e.getMessage().contains("4000000 lovelace (the order overhead; the collateral is a token)"),
+                "the token branch's own words: no other test reads the router's text, so this is what "
+                        + "keeps it from drifting: " + e.getMessage());
         assertTrue(e.getMessage().contains("no nominable wallet utxo"),
                 "and that the shortfall is the wallet's, not the candidate's: " + e.getMessage());
         assertTrue(e.getMessage().contains("reference script"),
@@ -266,13 +271,15 @@ class ConvertLiquidationRouterTest {
     }
 
     /**
-     * FAB-117: ada collateral is refused BY NAME. The convert route builds none (its datum names the NONE
-     * sentinel, and redeemerEquity needs a collateral feed) -- only the PLAIN route liquidates ada collateral --
-     * and it used to die as a NullPointerException
-     * there -- a machinery failure, but saying nothing. Same branch now, with the reason the readiness page shows.
+     * FAB-224: an ada collateral is no longer refused by name. FAB-117 refused it first because the convert route then
+     * needed a collateral oracle ada does not have (it died as a NullPointerException inside redeemerEquity) and the
+     * builder could not build it. An ada collateral is now an ada leg priced with the 1:1 unit feed and paid from the
+     * collateral, so it reaches the same steps as any collateral: this candidate (100 ADA, 50‰) is planned and refused
+     * by the order plan as NOTHING_LEFT_TO_SWAP, and with no pool address configured it is the ordinary no-pool
+     * refusal — neither is the old "ada collateral:" message.
      */
     @Test
-    void anAdaCollateralIsRefusedByNameRatherThanCrashing() {
+    void anAdaCollateralIsPlannedLikeAnyCollateralRatherThanRefusedByName() {
         LiquidationAssessment base = candidate();
         LoanDatum datum = LoanFixtures.loanDatum(FLDT, LoanFixtures.NO_ORACLE, BigInteger.valueOf(20_000_000L),
                 BigInteger.valueOf(100L), LoanFixtures.adaCollateral(), 1_700_000_000_000L,
@@ -285,14 +292,15 @@ class ConvertLiquidationRouterTest {
         LiquidationAssessment adaCollateral = LiquidationAssessment.buildable(bond, loan, "ada collateral",
                 BigInteger.valueOf(20_000_000L), BigInteger.ZERO, false, BigInteger.valueOf(5_000_000L));
 
-        var e = assertThrows(IllegalStateException.class,
+        var planned = assertThrows(ConvertOrderPlan.RefusedException.class,
                 () -> router().buildConvertLiquidation(adaCollateral, loanUtxo(), null, null, null,
                         requirement -> Optional.empty(), ROLE_C, collateralOracle(), "addr_change",
                         1_760_000_000_000L, 1_760_000_120_000L));
-        assertTrue(e.getMessage().startsWith("ada collateral:"), e.getMessage());
+        assertEquals(ConvertOrderPlan.Refusal.NOTHING_LEFT_TO_SWAP, planned.refusal(), planned.getMessage());
+        assertEquals("NOTHING_LEFT_TO_SWAP: collateral 100000000 − equity 96970000 − fee 5000000 = -1970000",
+                planned.getMessage());
+        assertFalse(planned.getMessage().startsWith("ada collateral:"), planned.getMessage());
 
-        // ⛔ And BEFORE the no-pool branches: with no pool address configured it must still be the ada
-        // refusal, never "set this market to action: ANTICIPATE" (pay-in-advance refuses ada too).
         AppConfig.LoansConfiguration noPool = new AppConfig.LoansConfiguration() {
             @Override
             public String getMinswapPoolAddress() {
@@ -301,11 +309,37 @@ class ConvertLiquidationRouterTest {
         };
         ConvertLiquidationRouter unconfigured = new ConvertLiquidationRouter(LoanFixtures.registry(), noPool, null,
                 new FixedPoolResolver(), null, null, LoanFixtures.converters(), LoanFixtures.NETWORK);
-        var first = assertThrows(IllegalStateException.class,
+        var noPoolRefusal = assertThrows(ConvertLiquidationRouter.NoPoolException.class,
                 () -> unconfigured.buildConvertLiquidation(adaCollateral, loanUtxo(), null, null, null,
                         requirement -> Optional.empty(), ROLE_C, collateralOracle(), "addr_change",
                         1_760_000_000_000L, 1_760_000_120_000L));
-        assertTrue(first.getMessage().startsWith("ada collateral:"), first.getMessage());
+        assertFalse(noPoolRefusal.getMessage().startsWith("ada collateral:"), noPoolRefusal.getMessage());
+    }
+
+    /**
+     * FAB-224: the ada-collateral funding rule. Every term is a pre-build ceiling: the order overhead (4,000,000), the
+     * four bot-owned outputs' min-ada (4 × 2,000,000), a small equity's top-up (2,000,000 − equity), and the fee
+     * ceiling — the boundary is exactly {@code slack ≥ feeCeiling}, and below it the ask is the shortfall alone.
+     */
+    @Test
+    void theAdaCollateralWalletShortfallRule() {
+        BigInteger ceiling = BigInteger.valueOf(2_405_077L);
+        assertEquals(Optional.empty(), shortfall(14_405_077L, 0L, ceiling), "slack == feeCeiling: no wallet input");
+        assertEquals(Optional.of(BigInteger.ZERO), shortfall(14_405_076L, 0L, ceiling),
+                "one lovelace under: a wallet input, asked for nothing beyond the fee ceiling");
+        assertEquals(Optional.of(BigInteger.valueOf(3_900_000L)), shortfall(8_100_000L, 0L, ceiling), "1‰ of 8,100 ADA");
+        assertEquals(Optional.of(BigInteger.valueOf(12_000_000L)), shortfall(0L, 0L, ceiling), "a 0‰ bond");
+        assertEquals(Optional.of(BigInteger.valueOf(5_899_999L)), shortfall(8_100_000L, 1L, ceiling),
+                "an equity of 1 lovelace adds a top-up ceiling of 1,999,999");
+        assertEquals(Optional.of(BigInteger.valueOf(3_900_000L)), shortfall(8_100_000L, 2_000_000L, ceiling),
+                "an equity at the ceiling adds no top-up");
+        assertEquals(Optional.empty(), shortfall(324_000_000L, 979_792L, BigInteger.valueOf(45_684_181L)),
+                "40‰ of 8,100 ADA covers everything, a small equity's top-up included");
+    }
+
+    private static Optional<BigInteger> shortfall(long liquidationFee, long equity, BigInteger feeCeiling) {
+        return ConvertLiquidationRouter.adaCollateralWalletShortfall(BigInteger.valueOf(liquidationFee),
+                BigInteger.valueOf(equity), feeCeiling);
     }
 
     // ===== FAB-183: the feed window guard the plain and pay-in-advance routes already had =====

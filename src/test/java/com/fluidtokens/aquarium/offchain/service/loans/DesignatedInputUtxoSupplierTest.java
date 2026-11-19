@@ -136,4 +136,69 @@ class DesignatedInputUtxoSupplierTest {
         assertThrows(IllegalArgumentException.class, () -> DesignatedInputUtxoSupplier.of(DELEGATE, UNPARSEABLE, U));
         assertThrows(NullPointerException.class, () -> DesignatedInputUtxoSupplier.of(DELEGATE, BASE, null));
     }
+
+    // ---- FAB-224: the view with no wallet input at all ---------------------------------------------
+
+    /** Every page of every address with the wallet's payment credential — both stake variants included — is empty. */
+    @Test
+    void withoutAWalletInputEveryAddressOfTheWalletsPaymentCredentialIsEmptyOnEveryPage() {
+        UtxoSupplier view = DesignatedInputUtxoSupplier.withoutWalletInput(DELEGATE, BASE);
+
+        // control: the delegate really does hold the outputs the view must hide
+        assertEquals(5, DELEGATE.getAll(BASE).size(), "control: C, U, a spare, a token output, a script");
+        assertEquals(List.of(AT_ENTERPRISE), DELEGATE.getAll(ENTERPRISE), "control");
+        assertEquals(List.of(AT_OTHER_STAKE), DELEGATE.getAll(OTHER_STAKE), "control");
+
+        for (String sameKey : List.of(BASE, ENTERPRISE, OTHER_STAKE)) {
+            assertEquals(List.of(), view.getAll(sameKey), sameKey + " carries the wallet key and must list nothing");
+            assertEquals(List.of(), view.getPage(sameKey, 100, null, OrderEnum.asc), sameKey + " null page");
+            for (int page = 0; page <= 3; page++) {
+                assertEquals(List.of(), view.getPage(sameKey, 100, page, OrderEnum.asc), sameKey + " page " + page);
+                assertEquals(List.of(), view.getPage(sameKey, 100, page, OrderEnum.desc), sameKey + " page " + page);
+            }
+        }
+
+        // scoped by the wallet CREDENTIAL, so which wallet address names it does not matter
+        UtxoSupplier namedByEnterprise = DesignatedInputUtxoSupplier.withoutWalletInput(DELEGATE, ENTERPRISE);
+        assertEquals(List.of(), namedByEnterprise.getAll(BASE));
+        assertEquals(List.of(), namedByEnterprise.getAll(OTHER_STAKE));
+    }
+
+    /** Without a wallet input, every other address and every {@code getTxOutput} answer as the delegate does. */
+    @Test
+    void withoutAWalletInputOtherAddressesAndEveryTxOutputAreDelegatedUnchanged() {
+        UtxoSupplier view = DesignatedInputUtxoSupplier.withoutWalletInput(DELEGATE, BASE);
+
+        for (String other : List.of(FOREIGN, SAME_BYTES_AS_SCRIPT, UNPARSEABLE, LoanFixtures.loanAddress())) {
+            assertEquals(DELEGATE.getAll(other), view.getAll(other), other);
+            for (int page = 0; page < 2; page++) {
+                assertEquals(DELEGATE.getPage(other, 100, page, OrderEnum.asc),
+                        view.getPage(other, 100, page, OrderEnum.asc), other + " page " + page);
+            }
+        }
+        assertEquals(List.of(AT_FOREIGN), view.getAll(FOREIGN), "control: delegation is not vacuous");
+        assertEquals(List.of(AT_SCRIPT), view.getAll(SAME_BYTES_AS_SCRIPT),
+                "a script credential with the wallet key's bytes is a different credential");
+        assertEquals(List.of(AT_UNPARSEABLE), view.getAll(UNPARSEABLE));
+
+        // out-refs resolve through the view exactly as through the delegate — C above all, which the builder pins
+        // as collateral and CCL resolves by getTxOutput while every wallet listing is empty
+        for (Utxo utxo : List.of(C, U, SPARE, TOKENS, PUBLISHED_SCRIPT, AT_ENTERPRISE, AT_OTHER_STAKE, AT_FOREIGN)) {
+            assertEquals(Optional.of(utxo), view.getTxOutput(utxo.getTxHash(), utxo.getOutputIndex()),
+                    utxo.getTxHash() + "#" + utxo.getOutputIndex());
+        }
+        assertEquals(DELEGATE.getTxOutput("ff".repeat(32), 3), view.getTxOutput("ff".repeat(32), 3));
+        assertFalse(view.getTxOutput("ff".repeat(32), 3).isPresent(), "control: an unknown out-ref is empty");
+    }
+
+    /** A wallet address with no payment credential to scope by is refused exactly as {@code of} refuses it. */
+    @Test
+    void withoutAWalletInputAWalletAddressWithoutAPaymentCredentialIsRefused() {
+        IllegalArgumentException refused = assertThrows(IllegalArgumentException.class,
+                () -> DesignatedInputUtxoSupplier.withoutWalletInput(DELEGATE, UNPARSEABLE));
+        IllegalArgumentException asOf = assertThrows(IllegalArgumentException.class,
+                () -> DesignatedInputUtxoSupplier.of(DELEGATE, UNPARSEABLE, U));
+        assertEquals(asOf.getMessage(), refused.getMessage(), "the same refusal as of(...)");
+        assertThrows(NullPointerException.class, () -> DesignatedInputUtxoSupplier.withoutWalletInput(DELEGATE, null));
+    }
 }

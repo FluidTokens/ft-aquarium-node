@@ -464,7 +464,7 @@ class ConvertLiveDryEvalTest {
         var request = new ConvertTransactionBuilder.Request(loanUtxo, bondUtxo, poolUtxo, entry,
                 configUtxo, lmConfigUtxo, walletUtxos.get(walletUtxos.size() - 1), referenceScripts(registry), plan, claim, FLDT, lenderBond,
                 loan.repaymentReceipts(), orderAddress(registry, bond), botAddress,
-                validFromSlot, validToSlot, roleC);
+                validFromSlot, validToSlot, roleC, AssetType.ada(), null);
 
         return new Built(builder.build(request), universe, oracleScript, plan, equity);
     }

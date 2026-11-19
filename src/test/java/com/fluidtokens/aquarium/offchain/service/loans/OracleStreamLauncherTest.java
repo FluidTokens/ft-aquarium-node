@@ -11,6 +11,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
+import com.fluidtokens.aquarium.offchain.config.BuildInfo;
+import com.fluidtokens.aquarium.offchain.config.BuildInfoAutoConfiguration;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
 import com.fluidtokens.aquarium.offchain.service.StakerService;
@@ -28,6 +30,7 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.beans.factory.support.StaticListableBeanFactory;
+import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.boot.env.YamlPropertySourceLoader;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
@@ -41,6 +44,7 @@ import org.springframework.core.io.ClassPathResource;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Constructor;
+import java.lang.reflect.Method;
 import java.lang.reflect.Parameter;
 import java.net.URI;
 import java.time.Clock;
@@ -415,6 +419,7 @@ class OracleStreamLauncherTest {
                 .withBean(StakerService.class, OracleStreamLauncherTest::staker)
                 .withBean(MeterRegistry.class, SimpleMeterRegistry::new)
                 .withBean(AppConfig.Network.class, () -> network("preview"))
+                .withConfiguration(AutoConfigurations.of(BuildInfoAutoConfiguration.class))
                 .withBean(OracleStreamLauncher.class)
                 .run(context -> {
                     assertNull(context.getStartupFailure(), "the context started");
@@ -471,6 +476,7 @@ class OracleStreamLauncherTest {
                 .withBean(StakerService.class, OracleStreamLauncherTest::staker)
                 .withBean(MeterRegistry.class, SimpleMeterRegistry::new)
                 .withBean(AppConfig.Network.class, () -> network("preview"))
+                .withConfiguration(AutoConfigurations.of(BuildInfoAutoConfiguration.class))
                 .withBean(OracleStreamLauncher.class)
                 .run(context -> {
                     assertNull(context.getStartupFailure(), "the context started");
@@ -556,6 +562,7 @@ class OracleStreamLauncherTest {
                 .withBean(StakerService.class, OracleStreamLauncherTest::staker)
                 .withBean(MeterRegistry.class, SimpleMeterRegistry::new)
                 .withBean(AppConfig.Network.class, () -> network("preview"))
+                .withConfiguration(AutoConfigurations.of(BuildInfoAutoConfiguration.class))
                 .withBean(OracleStreamLauncher.class)
                 .run(context -> {
                     assertNull(context.getStartupFailure(), "the context started");
@@ -799,6 +806,7 @@ class OracleStreamLauncherTest {
                 .withBean(StakerService.class, OracleStreamLauncherTest::staker)
                 .withBean(MeterRegistry.class, SimpleMeterRegistry::new)
                 .withBean(AppConfig.Network.class, () -> network("preview"))
+                .withConfiguration(AutoConfigurations.of(BuildInfoAutoConfiguration.class))
                 .withBean(OracleStreamLauncher.class);
     }
 
@@ -836,8 +844,9 @@ class OracleStreamLauncherTest {
         assertEquals(OracleStreamLauncher.MAINNET_HOST, URI.create(placeholderDefault(baseUrl)).getHost());
         assertEquals(OracleStreamLauncher.PREVIEW_HOST, URI.create(placeholderDefault(previewUrl)).getHost());
 
-        // The injection constructor's own defaults: the url has none a profile could not reach (§4), the flag's is ON,
-        // and the build provenance falls back to "unknown", which sends no header (FAB-179).
+        // The injection constructor's own defaults: the url has none a profile could not reach (§4) and the flag's is ON.
+        // The build provenance comes as a BuildInfo bean (FAB-213), whose default BuildInfoAutoConfiguration.buildInfo
+        // reads the two aquarium.build placeholders, falling back to "unknown", which sends no header (FAB-179).
         List<Constructor<?>> injected = Arrays.stream(OracleStreamLauncher.class.getConstructors())
                 .filter(c -> c.isAnnotationPresent(Autowired.class)).toList();
         assertEquals(1, injected.size(), "exactly one injection constructor");
@@ -848,8 +857,15 @@ class OracleStreamLauncherTest {
                 .map(Value::value)
                 .toList();
         assertEquals(List.of("${loans.oracle.stream.enabled:true}", "${loans.oracle.stream.url:}",
-                "${loans.oracle.source:stream}",
-                "${aquarium.build.commitShort:unknown}", "${aquarium.build.dirty:unknown}"), values);
+                "${loans.oracle.source:stream}"), values);
+        assertTrue(Arrays.stream(constructor.getParameters()).map(Parameter::getType)
+                .anyMatch(BuildInfo.class::equals), "the build provenance as a BuildInfo bean");
+        Method buildInfo = Arrays.stream(BuildInfoAutoConfiguration.class.getMethods())
+                .filter(m -> m.getName().equals("buildInfo")).findFirst()
+                .orElseThrow(() -> new AssertionError("no BuildInfoAutoConfiguration.buildInfo"));
+        assertEquals(List.of("${aquarium.build.commitShort:unknown}", "${aquarium.build.dirty:unknown}"),
+                Arrays.stream(buildInfo.getParameters()).map(p -> p.getAnnotation(Value.class))
+                        .map(v -> v == null ? null : v.value()).toList());
         assertTrue(Arrays.stream(constructor.getParameters()).map(Parameter::getType)
                 .anyMatch(ObjectProvider.class::equals), "FluidOracleClient only through an ObjectProvider");
         assertFalse(Arrays.stream(constructor.getParameters()).map(Parameter::getType)
@@ -918,6 +934,7 @@ class OracleStreamLauncherTest {
                 .withBean(StakerService.class, OracleStreamLauncherTest::staker)
                 .withBean(MeterRegistry.class, SimpleMeterRegistry::new)
                 .withBean(AppConfig.Network.class, () -> network("preview"))
+                .withConfiguration(AutoConfigurations.of(BuildInfoAutoConfiguration.class))
                 .withBean(OracleStreamLauncher.class)
                 .run(context -> {
                     assertNull(context.getStartupFailure(), "the context started");

@@ -165,11 +165,33 @@ public final class WalletRoles {
     /**
      * The lovelace a token output must carry beside the token for a token-principal pay-in-advance: the fee
      * ceiling, the lender output's min-ada ({@link WalletInputSelection#TOKEN_PRINCIPAL_MIN_ADA_CEILING}), the
-     * S-15 collateral rider and the change output's min-ada.
+     * S-15 collateral rider and the change output's min-ada. It is the token-collateral shape's ceiling; an ADA
+     * collateral uses {@link #adaCollateralTokenOutputRequiredAda}.
      */
     public static BigInteger tokenOutputRequiredAda(BigInteger fee) {
         return fee.add(WalletInputSelection.TOKEN_PRINCIPAL_MIN_ADA_CEILING)
                 .add(S15_COLLATERAL_RIDER_CEILING).add(CHANGE_MIN_ADA_CEILING);
+    }
+
+    /**
+     * The lovelace a token output must carry beside the token for a token-principal pay-in-advance of an ADA
+     * collateral (FAB-226).
+     * <p>
+     * The seized ADA ({@code seizedLovelace}: collateral − equity, the fee slice included) is spent by the
+     * transaction before any wallet ADA, so the token output tops up only the shortfall of the ceilings
+     * {@link #tokenOutputRequiredAda} sums.
+     * <p>
+     * The result is floored at 2 ADA: the existing per-output min-ADA ceiling
+     * ({@link WalletInputSelection#TOKEN_PRINCIPAL_MIN_ADA_CEILING}), applied as a conservative floor because the
+     * token output's leftover tokens come back in their own min-ADA output, so a thin wallet is refused here by name
+     * before any build. The builder's change-shape check fires only below that leftover output's own min-ADA, which a
+     * ledger-valid wallet output cannot be.
+     * <p>
+     * A pre-build ceiling, like the others here: the build is the judge.
+     */
+    public static BigInteger adaCollateralTokenOutputRequiredAda(BigInteger fee, BigInteger seizedLovelace) {
+        return tokenOutputRequiredAda(fee).subtract(seizedLovelace)
+                .max(WalletInputSelection.TOKEN_PRINCIPAL_MIN_ADA_CEILING);
     }
 
     /** The quantity of {@code unit} (compared lower-cased) an output holds. Zero if it holds none. */
