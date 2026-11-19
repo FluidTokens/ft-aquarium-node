@@ -43,7 +43,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <h2>What makes it honest</h2>
  * <ul>
- *   <li><b>Real scripts.</b> The deployed applied code, fetched from Koios on 2026-10-01 and pinned
+ *   <li><b>Real scripts.</b> The deployed applied code, fetched from Koios (NIGHT and FLDT on 2026-10-01; STRIKE v1 and USDM v1 on 2026-11-12; USDM v2 on 2026-11-13) and pinned
  *       ({@code mainnet-oracle-script-<hash8>.hex}); each is asserted to hash to the credential its
  *       registry entry withdraws from.</li>
  *   <li><b>Real entries, through production's path.</b> The 2026-10-01 mainnet registry payload is
@@ -58,6 +58,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *   <li><b>Negative controls.</b> A tampered signature and a wrong key position are both refused —
  *       otherwise a rig that evaluated nothing would read as green.</li>
  * </ul>
+ *
+ * <p><b>FAB-244 extension.</b> The same proof now covers the STRIKE v1, USDM v1 and USDM v2 scripts, so
+ * six deployed scripts in all (NIGHT v1/v2, FLDT shared, STRIKE v1, USDM v1, USDM v2). The FAB-215
+ * liquidation pairs' fixtures use the last three: ADA to token uses USDM v2 ({@code df6f292e}), token to
+ * token uses STRIKE v1 ({@code d97da4f3}) and USDM v1 ({@code 3a561e40}). STRIKE v2 has no recorded
+ * script and is not covered; the key-position negative stays NIGHT v2 only (a one-key script).
  *
  * <p>⚠ <b>Scope:</b> the oracle's own withdrawal, which is where a v1/v2 difference could live. The
  * multisig branch checks signatures only; the window and NFT checks are the loan side's
@@ -135,8 +141,11 @@ class MainnetOracleVersionsDryEvalTest {
     }
 
     /**
-     * Each of NIGHT v1, NIGHT v2 (a DIFFERENT script), and FLDT v1/v2 (one SHARED script under two
-     * NFTs), resolved by the NFT a loan would name and accepted by the real deployed oracle script.
+     * Each of NIGHT v1, NIGHT v2 (a DIFFERENT script), FLDT v1/v2 (one SHARED script under two NFTs),
+     * STRIKE v1, USDM v1 and USDM v2, resolved by the NFT a loan would name and accepted by the real
+     * deployed oracle script. (FAB-244: the last three are the scripts the FAB-215 liquidation pairs'
+     * dry-eval tests use as fixtures: ADA to token uses USDM v2, token to token uses STRIKE v1 and
+     * USDM v1. Those tests sign with {@code TestOracleRig}; this one verifies the real signed entries.)
      */
     @ParameterizedTest(name = "{0}")
     @CsvSource({
@@ -144,6 +153,9 @@ class MainnetOracleVersionsDryEvalTest {
             "NIGHT v2, 26e60b2083c14b849e622f8e05dd46ab01a7986fe5d72eeba8680d26, 6f7261636c654e69676874, 756897fd",
             "FLDT v1,  93794f9b7f3dc632cb889c7aec7d334f016f532e64f16141b6895f5b, 6f7261636c65464c44544333, d81a8bea",
             "FLDT v2,  26e60b2083c14b849e622f8e05dd46ab01a7986fe5d72eeba8680d26, 6f7261636c65464c44544333, d81a8bea",
+            "STRIKE v1, 93794f9b7f3dc632cb889c7aec7d334f016f532e64f16141b6895f5b, 6f7261636c65535452494b45, d97da4f3",
+            "USDM v1 , 93794f9b7f3dc632cb889c7aec7d334f016f532e64f16141b6895f5b, 6f7261636c655553444d4333, 3a561e40",
+            "USDM v2 , 26e60b2083c14b849e622f8e05dd46ab01a7986fe5d72eeba8680d26, 6f7261636c655553444d4333, df6f292e",
     })
     void theDeployedOracleScriptAcceptsTheRedeemerThisNodeBuilds(String label, String policy,
                                                                  String oracleAssetName, String hash8) throws Exception {
@@ -164,11 +176,17 @@ class MainnetOracleVersionsDryEvalTest {
                 label + ": ex-units are placeholders, so nothing was evaluated: " + reward.getExUnits());
     }
 
-    /** NEGATIVE CONTROL: one flipped signature byte — the script must refuse it. */
+    /**
+     * NEGATIVE CONTROL: one flipped signature byte — the script must refuse it. Covers NIGHT v2, FLDT v2
+     * and, as of FAB-244, STRIKE v1, USDM v1 and USDM v2.
+     */
     @ParameterizedTest(name = "{0}")
     @CsvSource({
             "NIGHT v2, 26e60b2083c14b849e622f8e05dd46ab01a7986fe5d72eeba8680d26, 6f7261636c654e69676874, 756897fd",
             "FLDT v2,  26e60b2083c14b849e622f8e05dd46ab01a7986fe5d72eeba8680d26, 6f7261636c65464c44544333, d81a8bea",
+            "STRIKE v1, 93794f9b7f3dc632cb889c7aec7d334f016f532e64f16141b6895f5b, 6f7261636c65535452494b45, d97da4f3",
+            "USDM v1 , 93794f9b7f3dc632cb889c7aec7d334f016f532e64f16141b6895f5b, 6f7261636c655553444d4333, 3a561e40",
+            "USDM v2 , 26e60b2083c14b849e622f8e05dd46ab01a7986fe5d72eeba8680d26, 6f7261636c655553444d4333, df6f292e",
     })
     void aTamperedSignatureIsRefused(String label, String policy, String oracleAssetName, String hash8) throws Exception {
         OracleEntry entry = entryNamedBy(policy.trim(), oracleAssetName.trim());
