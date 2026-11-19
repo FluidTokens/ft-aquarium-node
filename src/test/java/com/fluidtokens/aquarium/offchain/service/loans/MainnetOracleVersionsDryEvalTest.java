@@ -43,7 +43,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <h2>What makes it honest</h2>
  * <ul>
- *   <li><b>Real scripts.</b> The deployed applied code, fetched from Koios on 2026-10-01 and pinned
+ *   <li><b>Real scripts.</b> The deployed applied code, fetched from Koios (NIGHT and FLDT on 2026-10-01; STRIKE v1 and USDM v1 on 2026-11-12; USDM v2 on 2026-11-13) and pinned
  *       ({@code mainnet-oracle-script-<hash8>.hex}); each is asserted to hash to the credential its
  *       registry entry withdraws from.</li>
  *   <li><b>Real entries, through production's path.</b> The 2026-10-01 mainnet registry payload is

@@ -1,7 +1,7 @@
 # `mainnet-oracle-script-<hash8>.hex`
 
 The deployed, APPLIED FluidTokens oracle validators on **mainnet**, fetched from Koios
-`script_info` on 2026-10-01 (read-only). The applied parameters (verification keys, threshold,
+`script_info` (read-only): the NIGHT and FLDT files on 2026-10-01, the STRIKE v1 and USDM v1 files on 2026-11-12 and the USDM v2 file on 2026-11-13. The applied parameters (verification keys, threshold,
 Charli3/Orcfax specs) are not published, so the deployed code is the only source.
 
 | file | script hash | registry entries withdrawing from it | Koios size |
